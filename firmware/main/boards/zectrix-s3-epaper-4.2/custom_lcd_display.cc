@@ -1567,7 +1567,12 @@ void CustomLcdDisplay::EPD_DisplayFastBw() {
             line[xb] = ssd2683_fast_bw::EncodeSemanticByte(src[xb]);
         }
         writeBytes(line.data(), bytes_per_row);
-        if ((y % 16) == 15) {
+        // The payload is 30 KB at 40 MHz, about 6 ms of actual SPI time, so
+        // the reported 180 ms transfer was almost entirely this yield: 300
+        // rows yielding every 16 rows is 18 ticks, and a tick is 10 ms.
+        // Yielding every 100 rows keeps the task well inside the watchdog
+        // while cutting most of that cost.
+        if ((y % 100) == 99) {
             vTaskDelay(1);
         }
     }
