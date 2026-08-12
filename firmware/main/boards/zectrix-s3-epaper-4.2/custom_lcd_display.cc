@@ -52,120 +52,20 @@ static constexpr uint8_t kFastBwCdi = 0x30;  // white border, 2 ms blanking
 static constexpr const char *kFastBwTimingName = "ultra-fixed-120Hz-2ms";
 #endif
 
-#if CONFIG_ZECTRIX_EPD_FAST_BW_PLL_SWEEP
-// Diagnostic sweep. Hardware showed BUSY ~14 s regardless of the PLL written
-// before the OTP waveform load, so a single data point cannot distinguish
-// "PLL ignored" from "PLL applied but frame count dominates". Each fast
-// refresh advances one step and logs its own BUSY time; a flat curve across
-// all of these proves the OTP bank owns the timing.
-static constexpr uint8_t kFastBwPllSweep[] = {0x08, 0x07, 0x05, 0x0E, 0x3A, 0x3C};
-static uint8_t g_fast_bw_pll_index = 0;
-#endif
-
 // Consecutive truncated waveforms since the last complete one. Truncation
 // leaves net DC on the pixels, so this bounds how much can accumulate.
 static uint32_t g_fast_bw_truncations_since_complete = 0;
 
-#if CONFIG_ZECTRIX_EPD_FAST_BW_TRUNCATE_SWEEP
-// Only a person looking at the panel can say how short the waveform may be
-// cut, so sweep the deadline across successive interactive refreshes: each
-// one uses real UI content and logs the deadline it ran with.
-static constexpr uint32_t kFastBwTruncSweep[] = {150, 130, 120, 110, 100, 90};
-static uint8_t g_fast_bw_trunc_index = 0;
-#endif
+// Measured on hardware at PLL=0x07: 0x00 23550 ms, 0x0A 22700 ms, 0x19
+// 11500 ms, 0x28 14100 ms, 0x32 14100 ms and the vendor demo's 0x5A 14050 ms.
+// The 25 C section is the shortest waveform the OTP contains.
+static constexpr uint8_t kFastBwTsset =
+    static_cast<uint8_t>(CONFIG_ZECTRIX_EPD_FAST_BW_TSSET);
 
-// The truncation deadline in ms for the next waveform; 0 disables truncation.
-static inline uint32_t EffectiveFastBwTruncateMs() {
-#if CONFIG_ZECTRIX_EPD_FAST_BW_TRUNCATE_SWEEP
-    return kFastBwTruncSweep[g_fast_bw_trunc_index];
-#else
-    return CONFIG_ZECTRIX_EPD_FAST_BW_TRUNCATE_MS;
-#endif
-}
-
-#if CONFIG_ZECTRIX_EPD_FAST_BW_PSR_SWEEP
-// Per the SSD2683 Rev 0.20 command table, the second PSR byte carries LUT_EN
-// in B[7]: 0 auto-loads the LUT from MTP, 1 skips that load and makes the
-// analog settings follow the MCU. Sweeping the second byte is the only
-// documented lever over the waveform source, since the command table has no
-// registers for uploading a LUT. B[6:5] is FOPT, the post-waveform scan.
-// Sweeping the first PSR byte was measured first and moved nothing: 0x2F, 0x0F,
-// 0x3F, 0x6F and 0xAF all landed within 11050-11600 ms.
-static constexpr uint8_t kFastBwPsrSweep[] = {0x69, 0xE9, 0x09, 0x89};
-static uint8_t g_fast_bw_psr_index = 0;
-#endif
-
-// The second PSR byte programmed for the next waveform.
-static inline uint8_t EffectiveFastBwPsr1() {
-#if CONFIG_ZECTRIX_EPD_FAST_BW_PSR_SWEEP
-    return kFastBwPsrSweep[g_fast_bw_psr_index];
-#else
-    return 0x69;
-#endif
-}
-
-#if CONFIG_ZECTRIX_EPD_FAST_BW_TSSET_SWEEP
-// The PLL sweep showed BUSY scales with the scan clock but bottoms out near
-// 14 s, which implies roughly 1700 frames: a four-color waveform. TSSET (0xE6)
-// selects the temperature section of the OTP waveform, and those sections have
-// different frame counts, so this sweep probes whether a shorter section
-// exists at all. 0x5A is the vendor demo's magic value; the rest are plausible
-// temperatures in degrees Celsius.
-static constexpr uint8_t kFastBwTssetSweep[] = {0x5A, 0x19, 0x28, 0x32, 0x0A, 0x00};
-static uint8_t g_fast_bw_tsset_index = 0;
-#endif
-
-// The TSSET value programmed for the next waveform.
-static inline uint8_t EffectiveFastBwTsset() {
-#if CONFIG_ZECTRIX_EPD_FAST_BW_TSSET_SWEEP
-    return kFastBwTssetSweep[g_fast_bw_tsset_index];
-#else
-    // Measured on hardware at PLL=0x07: 0x00 23550 ms, 0x0A 22700 ms,
-    // 0x19 11500 ms, 0x28 14100 ms, 0x32 14100 ms, 0x5A (vendor) 14050 ms.
-    // The 25 C section is the shortest waveform the OTP contains.
-    return static_cast<uint8_t>(CONFIG_ZECTRIX_EPD_FAST_BW_TSSET);
-#endif
-}
-
-// The PLL value actually programmed for the next waveform. Constant unless the
-// diagnostic sweep is enabled.
-static inline uint8_t EffectiveFastBwPll() {
-#if CONFIG_ZECTRIX_EPD_FAST_BW_PLL_SWEEP
-    return kFastBwPllSweep[g_fast_bw_pll_index];
-#else
-    return kFastBwPll;
-#endif
-}
-
-// At most one sweep is active at a time. These two helpers let the boot-time
-// harness drive whichever one it is without knowing which.
-static constexpr int kFastBwSweepLen =
-#if CONFIG_ZECTRIX_EPD_FAST_BW_TRUNCATE_SWEEP
-    static_cast<int>(sizeof(kFastBwTruncSweep) / sizeof(kFastBwTruncSweep[0]));
-#elif CONFIG_ZECTRIX_EPD_FAST_BW_PSR_SWEEP
-    static_cast<int>(sizeof(kFastBwPsrSweep) / sizeof(kFastBwPsrSweep[0]));
-#elif CONFIG_ZECTRIX_EPD_FAST_BW_TSSET_SWEEP
-    static_cast<int>(sizeof(kFastBwTssetSweep) / sizeof(kFastBwTssetSweep[0]));
-#elif CONFIG_ZECTRIX_EPD_FAST_BW_PLL_SWEEP
-    static_cast<int>(sizeof(kFastBwPllSweep) / sizeof(kFastBwPllSweep[0]));
-#else
-    1;
-#endif
-
-static inline void AdvanceFastBwSweep() {
-#if CONFIG_ZECTRIX_EPD_FAST_BW_TRUNCATE_SWEEP
-    g_fast_bw_trunc_index = static_cast<uint8_t>((g_fast_bw_trunc_index + 1) % kFastBwSweepLen);
-#endif
-#if CONFIG_ZECTRIX_EPD_FAST_BW_PSR_SWEEP
-    g_fast_bw_psr_index = static_cast<uint8_t>((g_fast_bw_psr_index + 1) % kFastBwSweepLen);
-#endif
-#if CONFIG_ZECTRIX_EPD_FAST_BW_TSSET_SWEEP
-    g_fast_bw_tsset_index = static_cast<uint8_t>((g_fast_bw_tsset_index + 1) % kFastBwSweepLen);
-#endif
-#if CONFIG_ZECTRIX_EPD_FAST_BW_PLL_SWEEP
-    g_fast_bw_pll_index = static_cast<uint8_t>((g_fast_bw_pll_index + 1) % kFastBwSweepLen);
-#endif
-}
+// PSR byte 2. B[7] is LUT_EN, which only redirects the analog settings and was
+// measured to leave the waveform duration unchanged, so it stays at the
+// MTP-loading default.
+static constexpr uint8_t kFastBwPsr1 = 0x69;
 
 #else
 // Keep the common refresh-loop logging buildable when FAST_BW is disabled.
@@ -392,17 +292,6 @@ CustomLcdDisplay::CustomLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_p
 
     ESP_LOGI(TAG, "EPD init");
     EPD_Init();
-#if CONFIG_ZECTRIX_EPD_SSD2683_MTP_DUMP
-    if (IsFourColorPanel()) {
-        EPD_DumpSsd2683Mtp();
-    }
-#endif
-#if CONFIG_ZECTRIX_EPD_FAST_BW_TSSET_SWEEP_BOOT
-    // Run the whole sweep without needing anyone to press a button: a device
-    // left alone never produces a dirty rect, so the interactive sweep cannot
-    // advance on its own.
-    EPD_SweepFastBwTssetAtBoot();
-#endif
 
     // buffer init
     EPD_Clear();
@@ -740,7 +629,7 @@ void CustomLcdDisplay::refresh_task_loop() {
         if (IsFourColorPanel() && idle_full_refresh_armed_ &&
             TickDeadlineReached(now, idle_full_refresh_deadline_)) {
             idle_full_refresh_armed_ = false;
-            idle_full_refresh_pending_ = true;
+            idle_full_refresh_pending_ = fast_bw_since_full_;
         }
 #endif
         if (urgent_refresh) {
@@ -947,6 +836,7 @@ void CustomLcdDisplay::refresh_task_loop() {
             memcpy(prev_buffer, tx_buf, lcd_spi_data.buffer_len);
             prev_buffer_synced = true;
             partial_since_full = 0;
+            fast_bw_since_full_ = false;
             ESP_LOGW(TAG, "[FULL_COLOR] complete in %u ms",
                      (unsigned)((xTaskGetTickCount() - refresh_started) * portTICK_PERIOD_MS));
         } else if (IsFourColorPanel() && fast_bw) {
@@ -956,6 +846,7 @@ void CustomLcdDisplay::refresh_task_loop() {
                      fast_bw_promoted ? "promoted_dirty_rect" : "requested");
             EPD_InitFastBw();
             EPD_DisplayFastBw();
+            fast_bw_since_full_ = true;
             memcpy(prev_buffer, tx_buf, lcd_spi_data.buffer_len);
             prev_buffer_synced = true;
             // One line per interactive refresh. The rest of the ULTRA_BW
@@ -1187,32 +1078,6 @@ void CustomLcdDisplay::EPD_ReadBytes(uint8_t *buf, size_t len) {
     spi_port_init();
 }
 
-void CustomLcdDisplay::EPD_ReadRegister(uint8_t command, uint8_t *buf, size_t len) {
-    if (buf == nullptr || len == 0) {
-        return;
-    }
-
-    // A read must hold CS low from the command byte through the whole
-    // response; the previous path used EPD_SendCommand, which deasserts CS and
-    // therefore terminated the sequence before a single byte was clocked out.
-    // CS is a plain GPIO here, so it survives the bus reconfiguration needed
-    // to turn the shared SDIN line around.
-    set_dc_0();
-    set_cs_0();
-    SPI_SendByte(command);
-
-    spi_port_rx_init();
-    set_dc_1();
-    spi_transaction_t t;
-    memset(&t, 0, sizeof(t));
-    t.length = 8 * len;
-    t.rx_buffer = buf;
-    esp_err_t ret = spi_device_polling_transmit(spi, &t);
-    set_cs_1();
-    assert(ret == ESP_OK);
-    spi_port_init();
-}
-
 void CustomLcdDisplay::EPD_SendData(uint8_t data) {
     set_dc_1();
     set_cs_0();
@@ -1352,7 +1217,7 @@ void CustomLcdDisplay::EPD_InitFastBw() {
 
     EPD_SendCommand(0x00);  // PSR: LUT source, resolution, scan direction
     EPD_SendData(0x2F);
-    EPD_SendData(EffectiveFastBwPsr1());
+    EPD_SendData(kFastBwPsr1);
 
     EPD_SendCommand(0x01);  // PWR (vendor fast-profile parameters)
     EPD_SendData(0x07);
@@ -1382,7 +1247,7 @@ void CustomLcdDisplay::EPD_InitFastBw() {
     EPD_SendData(0x00);
 
     EPD_SendCommand(0x30);  // PLL: profile-specific scan clock
-    EPD_SendData(EffectiveFastBwPll());
+    EPD_SendData(kFastBwPll);
     EPD_SendCommand(0xE9);
     EPD_SendData(0x01);
 
@@ -1399,7 +1264,7 @@ void CustomLcdDisplay::EPD_InitFastBw() {
     EPD_SendCommand(0xE0);  // CCSET: manual temperature input
     EPD_SendData(0x02);
     EPD_SendCommand(0xE6);  // TSSET: waveform temperature-section selector
-    EPD_SendData(EffectiveFastBwTsset());
+    EPD_SendData(kFastBwTsset);
     EPD_SendCommand(0xA5);  // Load/apply selected OTP waveform
     read_busy();
 
@@ -1410,138 +1275,9 @@ void CustomLcdDisplay::EPD_InitFastBw() {
     // of the bank's. If the waveform duration is still ~14 s after this, the
     // frame *count* comes from the OTP bank and no register can shorten it.
     EPD_SendCommand(0x30);  // PLL: profile-specific scan clock
-    EPD_SendData(EffectiveFastBwPll());
+    EPD_SendData(kFastBwPll);
     EPD_SendCommand(0x50);  // CDI: border + gate/source blanking
     EPD_SendData(kFastBwCdi);
-#endif
-}
-
-void CustomLcdDisplay::EPD_SweepFastBwTssetAtBoot() {
-#if !CONFIG_ZECTRIX_EPD_FAST_BW_TSSET_SWEEP_BOOT
-    return;
-#else
-    if (!IsFourColorPanel()) {
-        return;
-    }
-
-    // Alternate a coarse pattern with its inverse so every waveform actually
-    // has pixels to move; a refresh that changes nothing is not a fair timing
-    // sample.
-    const size_t len = lcd_spi_data.buffer_len;
-    ESP_LOGW(TAG, "[BOOT_SWEEP] BEGIN %d passes", kFastBwSweepLen);
-    for (int pass = 0; pass < kFastBwSweepLen; ++pass) {
-        memset(tx_buf, (pass & 1) ? 0x00 : 0xFF, len);
-        const TickType_t started = xTaskGetTickCount();
-        EPD_InitFastBw();
-        EPD_DisplayFastBw();
-        ESP_LOGW(TAG, "[BOOT_SWEEP] pass=%d total=%u ms", pass,
-                 static_cast<unsigned>((xTaskGetTickCount() - started) * portTICK_PERIOD_MS));
-    }
-    ESP_LOGW(TAG, "[BOOT_SWEEP] END; restoring normal init");
-    memset(tx_buf, WhiteFillByte(), len);
-    EPD_Init();
-#endif
-}
-
-void CustomLcdDisplay::EPD_DumpSsd2683Mtp() {
-#if !CONFIG_ZECTRIX_EPD_SSD2683_MTP_DUMP
-    return;
-#else
-    if (!IsFourColorPanel()) {
-        return;
-    }
-
-    constexpr size_t kRevisionBytes = 3;
-    constexpr size_t kMtpBytes = 3840;
-    constexpr size_t kMtpReadBytes = kMtpBytes + 1;  // RMTP starts with dummy
-
-    constexpr int kPasses = 3;
-
-    uint8_t revision[kRevisionBytes] = {};
-    EPD_ReadRegister(0x70, revision, sizeof(revision));  // REV, read-only
-
-    uint8_t *mtp_read = static_cast<uint8_t *>(
-        heap_caps_malloc(kMtpReadBytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
-    uint8_t *mtp_ref = static_cast<uint8_t *>(heap_caps_malloc(kMtpReadBytes, MALLOC_CAP_INTERNAL));
-    if (mtp_read == nullptr || mtp_ref == nullptr) {
-        ESP_LOGE(TAG, "[SSD2683_MTP] unable to allocate %u-byte buffers",
-                 static_cast<unsigned>(kMtpReadBytes));
-        heap_caps_free(mtp_read);
-        heap_caps_free(mtp_ref);
-        return;
-    }
-
-    // FNV-1a is only an identity fingerprint here, not an integrity/security
-    // primitive. It makes panel-batch comparisons practical in normal logs.
-    auto fingerprint_of = [](const uint8_t *data, size_t n) {
-        uint32_t h = 2166136261U;
-        for (size_t i = 0; i < n; ++i) {
-            h ^= data[i];
-            h *= 16777619U;
-        }
-        return h;
-    };
-
-    // The dump is only worth reverse engineering if it is reproducible. An
-    // 8 MHz read produced data with bit slips, so read several times and
-    // report how many bytes differ between passes. Identical passes mean the
-    // bus is sampling correctly and the contents are real.
-    uint32_t fingerprint = 0;
-    size_t worst_mismatch = 0;
-    for (int pass = 0; pass < kPasses; ++pass) {
-        EPD_ReadRegister(0x92, mtp_read, kMtpReadBytes);  // RMTP, read-only
-        fingerprint = fingerprint_of(mtp_read + 1, kMtpBytes);
-        if (pass == 0) {
-            memcpy(mtp_ref, mtp_read, kMtpReadBytes);
-            ESP_LOGW(TAG, "[SSD2683_MTP] pass=%d dummy=%02X fnv1a32=%08X",
-                     pass, mtp_read[0], static_cast<unsigned>(fingerprint));
-            continue;
-        }
-        // Compare the payload only. The leading dummy byte is not MTP content
-        // and legitimately differs between passes, which made the first
-        // three-pass run report a one-byte difference on otherwise identical
-        // data.
-        size_t mismatch = 0;
-        for (size_t i = 1; i < kMtpReadBytes; ++i) {
-            if (mtp_read[i] != mtp_ref[i]) {
-                mismatch++;
-            }
-        }
-        worst_mismatch = std::max(worst_mismatch, mismatch);
-        ESP_LOGW(TAG, "[SSD2683_MTP] pass=%d dummy=%02X fnv1a32=%08X diff_vs_pass0=%u bytes",
-                 pass, mtp_read[0], static_cast<unsigned>(fingerprint),
-                 static_cast<unsigned>(mismatch));
-    }
-    memcpy(mtp_read, mtp_ref, kMtpReadBytes);
-    fingerprint = fingerprint_of(mtp_read + 1, kMtpBytes);
-    const uint8_t *mtp = mtp_read + 1;
-
-    ESP_LOGW(TAG,
-             "[SSD2683_MTP] REV=%02X:%02X:%02X dummy=%02X bytes=%u fnv1a32=%08X "
-             "read_clock=%u Hz passes=%d worst_diff=%u bytes verdict=%s",
-             revision[0], revision[1], revision[2], mtp_read[0],
-             static_cast<unsigned>(kMtpBytes), static_cast<unsigned>(fingerprint),
-             static_cast<unsigned>(CONFIG_ZECTRIX_EPD_READ_CLOCK_HZ), kPasses,
-             static_cast<unsigned>(worst_mismatch),
-             worst_mismatch == 0 ? "STABLE" : "UNSTABLE_LOWER_READ_CLOCK");
-    ESP_LOGW(TAG, "[SSD2683_MTP] BEGIN read-only hex dump; 16 bytes per line");
-    for (size_t offset = 0; offset < kMtpBytes; offset += 16) {
-        char line[16 * 3 + 1] = {};
-        size_t used = 0;
-        const size_t count = std::min<size_t>(16, kMtpBytes - offset);
-        for (size_t i = 0; i < count; ++i) {
-            const int written = snprintf(line + used, sizeof(line) - used,
-                                         i == 0 ? "%02X" : " %02X", mtp[offset + i]);
-            if (written <= 0) {
-                break;
-            }
-            used += static_cast<size_t>(written);
-        }
-        ESP_LOGW(TAG, "[SSD2683_MTP] %04X: %s", static_cast<unsigned>(offset), line);
-    }
-    ESP_LOGW(TAG, "[SSD2683_MTP] END");
-    heap_caps_free(mtp_read);
-    heap_caps_free(mtp_ref);
 #endif
 }
 
@@ -1580,13 +1316,13 @@ void CustomLcdDisplay::EPD_DisplayFastBw() {
     const TickType_t waveform_started = xTaskGetTickCount();
     ESP_LOGD(TAG,
              "[ULTRA_BW] execute timing=%s PLL=0x%02X CDI=0x%02X transfer=%u ms",
-             kFastBwTimingName, EffectiveFastBwPll(), kFastBwCdi,
+             kFastBwTimingName, kFastBwPll, kFastBwCdi,
              static_cast<unsigned>((waveform_started - transfer_started) * portTICK_PERIOD_MS));
     EPD_SendCommand(0x12);  // DRF: execute the selected fast OTP waveform
     EPD_SendData(0x00);
 
     bool truncated = false;
-    const uint32_t truncate_ms = EffectiveFastBwTruncateMs();
+    const uint32_t truncate_ms = CONFIG_ZECTRIX_EPD_FAST_BW_TRUNCATE_MS;
     // The OTP waveform is a four-color one; its later phases exist to move the
     // yellow and red pigment and contribute nothing to black-and-white
     // content, which is already legible after the first drive. Cut the wait
@@ -1618,14 +1354,7 @@ void CustomLcdDisplay::EPD_DisplayFastBw() {
              static_cast<unsigned>((waveform_finished - waveform_started) * portTICK_PERIOD_MS),
              static_cast<unsigned>(truncate_ms), truncated ? 1 : 0,
              static_cast<unsigned>(g_fast_bw_truncations_since_complete),
-             EffectiveFastBwPsr1(), EffectiveFastBwPll(), EffectiveFastBwTsset());
-    // A cleanup pass is forced to run complete, so it carries no information
-    // about the deadline it nominally had. Letting it step the sweep skipped
-    // values and made the sequence impossible to follow.
-    if (!forced_complete) {
-        AdvanceFastBwSweep();
-    }
-
+             kFastBwPsr1, kFastBwPll, kFastBwTsset);
     if (truncated) {
         // POF does not abort a running refresh: the controller finishes the
         // waveform first and only then acts on it, which put the whole 10 s

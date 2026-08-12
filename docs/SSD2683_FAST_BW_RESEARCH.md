@@ -409,7 +409,7 @@ Shipping configuration, measured on hardware:
 
 | Path                          | Before   | Now      |
 |-------------------------------|----------|----------|
-| Interactive refresh           | 23020 ms | ~550 ms  |
+| Interactive refresh           | 23020 ms | ~470 ms  |
 | Every 6th refresh (complete)  | 23020 ms | 12160 ms |
 | Idle color recovery           | 23020 ms | 23020 ms |
 
@@ -424,10 +424,13 @@ changes got there:
    drive. POF cannot do this: it is queued until the refresh finishes, so an
    earlier attempt saved nothing and merely moved the wait.
 
-120 ms was chosen by looking at the panel. 100 ms washed the image out, and
-below 150 ms the total is dominated by the fixed ~430 ms of init and transfer
-anyway, so shorter cuts buy little while cutting deeper into the strongest
-drive phase.
+The cut is 200 ms. Looking at the panel, 100 ms washed the image out and
+120 ms read well, so 200 ms keeps margin at the same order of magnitude. Below
+150 ms the total is dominated by fixed init cost anyway.
+
+The transfer used to be reported as 180 ms for a 30 KB payload that is about
+6 ms of SPI at 40 MHz; the rest was yielding every 16 of 300 rows at a 10 ms
+tick. Yielding every 100 rows removed most of it.
 
 Truncation breaks the waveform's DC balance, which is what causes permanent
 image sticking, so every 6th refresh runs to completion. An earlier design
@@ -438,6 +441,16 @@ worse than the ghosting it removed.
 The four-color sample interval is 500 ms rather than 12000 ms when FAST_BW is
 enabled. The 12 s figure was sized for the 23 s full-color waveform, and it
 was throttling key presses by up to 12 s before anything happened.
+
+Two scheduling bugs in the recovery path are worth recording. The throttle
+exempted only urgent refreshes, so a recovery whose pending flag had already
+been consumed into a local was discarded permanently, leaving the timer both
+unarmed and unpending. And the timer was armed by every FAST_BW *request*,
+including ones too small to produce a refresh, so an idle device ran a
+full-color waveform every time the status bar clock ticked. The recovery now
+fires only when a FAST_BW refresh actually executed since the last full-color
+one, which is the real precondition: with no fast refresh there are no colors
+replaced and no truncation ghosting to undo.
 
 Per-refresh telemetry sits at DEBUG with a single INFO summary line. The
 secondary USB-Serial-JTAG console blocks the logging task while a host is
@@ -455,20 +468,13 @@ SSD2683 offers no way to load a waveform from the MCU. The remaining route,
 programming the MTP, was considered and declined: it is irreversible, has no
 erase command, and no restorable factory image.
 
-### Diagnostic switches left in place
+### Diagnostic scaffolding has been removed
 
-All default to off. Each was used to produce a measurement in this document
-and is kept so the experiments are repeatable:
-
-* `ZECTRIX_EPD_FAST_BW_PLL_SWEEP` - scan-clock sweep.
-* `ZECTRIX_EPD_FAST_BW_TSSET_SWEEP` - waveform temperature-section sweep.
-* `ZECTRIX_EPD_FAST_BW_TRUNCATE_SWEEP` - truncation-deadline sweep, the one
-  experiment that needs a person watching the panel rather than a log.
-* `ZECTRIX_EPD_FAST_BW_PSR_SWEEP` - PSR second-byte sweep, including LUT_EN.
-* `ZECTRIX_EPD_FAST_BW_TSSET_SWEEP_BOOT` - runs the active sweep at boot,
-  needed because an untouched device never produces a dirty rect.
-* `ZECTRIX_EPD_SSD2683_MTP_DUMP` - three-pass read-only MTP dump with a
-  stability verdict.
+The PLL, TSSET, PSR and truncation sweeps, the boot-time sweep harness and the
+read-only MTP dump were all deleted once they had produced the measurements
+recorded above. They are in the history of this branch if the experiments ever
+need repeating. `firmware/scripts/epd_serial_capture.py` is kept: it is a
+general capture utility, not test scaffolding.
 
 ### Untested ideas, if this is ever picked up again
 

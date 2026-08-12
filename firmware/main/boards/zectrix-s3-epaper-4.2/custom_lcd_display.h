@@ -123,7 +123,6 @@ private:
     uint8_t EPD_RecvData();
     bool read_busy_until(uint32_t timeout_ms);
     void EPD_ReadBytes(uint8_t *buf, size_t len);
-    void EPD_ReadRegister(uint8_t command, uint8_t *buf, size_t len);
     void EPD_PowerOn();
     void EPD_PowerOff();
     void EPD_SendData(uint8_t data);
@@ -137,8 +136,6 @@ private:
     void EPD_TurnOnDisplay();
     void EPD_InitFastBw();
     void EPD_DisplayFastBw();
-    void EPD_DumpSsd2683Mtp();
-    void EPD_SweepFastBwTssetAtBoot();
     void EPD_TurnOnDisplayPart();
     void EPD_SetFullWindowAndCounter(); // ***关键：恢复全屏窗口+计数器***
     bool IsFourColorPanel() const { return panel_type_ == EPD_PANEL_4COLOR_SSD2683; }
@@ -169,6 +166,11 @@ private:
     bool urgent_refresh = false;
     bool force_full_refresh_ = false;
     bool fast_bw_refresh_requested_ = false;
+    // The recovery only has something to restore if a FAST_BW refresh actually
+    // ran. Without this, any UI change small enough to be skipped still armed
+    // the timer, so an idle device ran a full-color waveform every time the
+    // status bar clock ticked.
+    bool fast_bw_since_full_ = false;
     bool idle_full_refresh_pending_ = false;
     bool idle_full_refresh_armed_ = false;
     TickType_t idle_full_refresh_deadline_ = 0;

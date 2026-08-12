@@ -136,32 +136,6 @@ config ZECTRIX_EPD_FAST_BW_TRUNCATE_MAX_STREAK
         it does not actively cancel what the truncated ones left; the
         full-color refresh is what re-normalizes the pixels. Keep this low.
 
-config ZECTRIX_EPD_FAST_BW_TRUNCATE_SWEEP
-    bool "Sweep the truncation deadline across successive fast refreshes"
-    default n
-    depends on ZECTRIX_EPD_FAST_BW
-    help
-        Only a person looking at the panel can judge how short the waveform may
-        be cut, so this ignores the fixed deadline and uses 150, 130, 120,
-        110, 100 then 90 ms on successive interactive refreshes, logging the
-        deadline each one ran with. Six ordinary interactions therefore show
-        the whole range against real UI content. Disable once a value is
-        chosen; 120 ms was selected on hardware, since 100 ms washed the image
-        out.
-
-config ZECTRIX_EPD_FAST_BW_PLL_SWEEP
-    bool "Sweep PLL values across successive fast refreshes (diagnostic)"
-    default n
-    depends on ZECTRIX_EPD_FAST_BW
-    help
-        Ignore the fixed PLL value of the selected timing profile and instead
-        program a different candidate on every fast refresh, logging the
-        resulting waveform BUSY time for each. Six consecutive interactive
-        refreshes therefore produce a full PLL-versus-duration curve in one
-        flashing cycle. If every value yields the same BUSY time, the frame
-        count stored in the OTP waveform bank determines the refresh duration
-        and no register setting can shorten it. Disable for normal builds.
-
 config ZECTRIX_EPD_FAST_BW_TSSET
     int "TSSET (0xE6) waveform temperature section for fast refresh"
     range 0 255
@@ -180,44 +154,6 @@ config ZECTRIX_EPD_FAST_BW_TSSET
         preview; the idle full-color refresh still uses the panel's real
         temperature and cleans that up.
 
-config ZECTRIX_EPD_FAST_BW_TSSET_SWEEP
-    bool "Sweep TSSET values across successive fast refreshes (diagnostic)"
-    default n
-    depends on ZECTRIX_EPD_FAST_BW
-    help
-        Program a different TSSET (0xE6) value on every fast refresh and log
-        the resulting waveform BUSY time. TSSET selects the temperature section
-        of the OTP waveform, and those sections have different frame counts, so
-        this probes whether the OTP contains a shorter waveform at all. The PLL
-        sweep showed the duration bottoming out near 14 s, which corresponds to
-        roughly 1700 frames, i.e. a four-color waveform. If every TSSET value
-        gives the same BUSY time, the OTP holds no shorter waveform and 14 s is
-        the floor without replacing the LUT. Disable for normal builds.
-
-config ZECTRIX_EPD_FAST_BW_PSR_SWEEP
-    bool "Sweep the first PSR byte across successive fast refreshes (diagnostic)"
-    default n
-    depends on ZECTRIX_EPD_FAST_BW
-    help
-        PSR (0x00) is a documented, volatile register whose bits include the
-        selection between an OTP waveform LUT and a LUT loaded from registers.
-        This sweep programs a different first PSR byte on each fast refresh to
-        locate that bit: selecting the register LUT without having uploaded one
-        should collapse the waveform duration, because the controller then runs
-        an empty waveform. Nothing persists, since every refresh begins with a
-        hardware reset. Disable for normal builds.
-
-config ZECTRIX_EPD_FAST_BW_TSSET_SWEEP_BOOT
-    bool "Run the active sweep once at boot"
-    default n
-    depends on ZECTRIX_EPD_FAST_BW_TSSET_SWEEP || ZECTRIX_EPD_FAST_BW_PSR_SWEEP || ZECTRIX_EPD_FAST_BW_PLL_SWEEP
-    help
-        Perform the whole TSSET sweep during display initialization instead of
-        waiting for interactive refreshes. An untouched device never produces a
-        dirty rect, so the interactive sweep cannot advance on its own. The
-        screen alternates black and white once per sweep value, which takes a
-        couple of minutes, then normal initialization resumes.
-
 config ZECTRIX_EPD_READ_CLOCK_HZ
     int "SPI clock for EPD register reads (Hz)"
     range 100000 8000000
@@ -229,16 +165,5 @@ config ZECTRIX_EPD_READ_CLOCK_HZ
         clock and came back as recognisable data corrupted by bit slips, so
         reads now use this separate, lower clock. Lower it further if the dump
         reports UNSTABLE.
-
-config ZECTRIX_EPD_SSD2683_MTP_DUMP
-    bool "Dump SSD2683 revision and read-only MTP waveform data at boot"
-    default n
-    depends on ZECTRIX_EPD_PANEL_4COLOR_SSD2683
-    help
-        Read the three-byte chip revision and all 3840 bytes of MTP through
-        the documented REV (0x70) and RMTP (0x92) commands. A fingerprint and
-        complete hex dump are written to the serial log for waveform reverse
-        engineering. This path never sends the irreversible PGM/APG commands
-        (0x90/0x91). Leave disabled for normal builds because the dump is long.
 
 endmenu
