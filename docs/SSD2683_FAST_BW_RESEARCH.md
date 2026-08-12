@@ -403,24 +403,47 @@ by programming the MTP through `0x90` PGM and `0x91` APG.
 Programming the MTP therefore requires an explicit, informed decision and a
 recovery plan, not just a code path. It is deliberately not implemented here.
 
-## Remaining lower-level experiments
+## Where this ended
 
-The current default is now a genuine second-level timing experiment, but it
-does not yet replace the proprietary OTP LUT with a purpose-built monochrome
-transition table. Hardware BUSY measurements decide the next branch:
+Shipping configuration, measured on hardware:
 
-1. If BUSY falls near 1-3 seconds and the preview is legible, keep ULTRA and
-   characterize black-to-white, white-to-black, and repeated-key ghosting.
-2. If `ULTRA` and `120HZ` have the same BUSY as `VENDOR`, the reserved fast bank
-   is overriding PLL/CDI. Capture MTP and inspect its dynamic timing tables.
-3. If BUSY falls but pixels barely move, the next route is a shorter OTP bank
-   or a vendor-documented volatile LUT-load register, not waveform truncation.
-4. Test PTLW (`0x83`, `PMODE=1`) only as a secondary power/visual experiment;
-   the datasheet says all gates still scan, so a large speed improvement is not
-   expected.
-5. Only after obtaining the exact MTP layout and a vendor waveform file should
-   an external/custom LUT route be considered. MTP programming must remain a
-   separate factory tool with readback, CRC and explicit recovery controls.
+| Path                | Before   | Now      |
+|---------------------|----------|----------|
+| Interactive refresh | 23020 ms | 12160 ms |
+| Idle color recovery | 23020 ms | 23020 ms |
 
-Reset/power truncation of the normal color waveform remains a last-resort
-experiment and is not part of this implementation.
+Interactive refresh nearly halved. Two independent changes got there: routing
+dirty-rect refreshes to FAST_BW instead of demoting them to the full-color
+waveform, and selecting the 25 C OTP section via TSSET, which is the shortest
+waveform the panel contains.
+
+Full-color refresh deliberately keeps its own temperature handling. `EPD_Init`
+hardware-resets the controller and never writes CCSET/TSSET, so it uses the
+internal sensor and adapts to ambient temperature on its own. The reset also
+guarantees the fast path's pinned 25 C never leaks into it.
+
+This is the floor for a configuration-only approach. Sub-second refresh needs
+a monochrome waveform, the panel's MTP holds only four-color ones, and
+SSD2683 offers no way to load a waveform from the MCU. The remaining route,
+programming the MTP, was considered and declined: it is irreversible, has no
+erase command, and no restorable factory image.
+
+### Diagnostic switches left in place
+
+All default to off. Each was used to produce a measurement in this document
+and is kept so the experiments are repeatable:
+
+* `ZECTRIX_EPD_FAST_BW_PLL_SWEEP` - scan-clock sweep.
+* `ZECTRIX_EPD_FAST_BW_TSSET_SWEEP` - waveform temperature-section sweep.
+* `ZECTRIX_EPD_FAST_BW_PSR_SWEEP` - PSR second-byte sweep, including LUT_EN.
+* `ZECTRIX_EPD_FAST_BW_TSSET_SWEEP_BOOT` - runs the active sweep at boot,
+  needed because an untouched device never produces a dirty rect.
+* `ZECTRIX_EPD_SSD2683_MTP_DUMP` - three-pass read-only MTP dump with a
+  stability verdict.
+
+### Untested ideas, if this is ever picked up again
+
+* PTLW (`0x83`) partial window. The datasheet says all gates still scan, so a
+  large gain is unlikely, but it was never measured.
+* An official monochrome waveform table from the panel vendor would make MTP
+  programming a far more reasonable proposition than a reverse-engineered one.
