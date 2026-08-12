@@ -112,6 +112,49 @@ config ZECTRIX_EPD_FAST_BW_PLL_SWEEP
         count stored in the OTP waveform bank determines the refresh duration
         and no register setting can shorten it. Disable for normal builds.
 
+config ZECTRIX_EPD_FAST_BW_TSSET
+    int "TSSET (0xE6) waveform temperature section for fast refresh"
+    range 0 255
+    default 25
+    depends on ZECTRIX_EPD_FAST_BW
+    help
+        Selects which temperature section of the OTP waveform the fast refresh
+        executes. Measured on hardware at PLL=0x07: 0 C took 23550 ms, 10 C
+        22700 ms, 25 C 11500 ms, 40 C 14100 ms, 50 C 14100 ms and the vendor
+        demo's magic 0x5A 14050 ms, so 25 is both the default and the shortest
+        waveform present in OTP.
+
+        This pins the waveform to one temperature rather than following the
+        panel's own sensor. In a cold room the pixels are then under-driven,
+        which shows up as reduced contrast or ghosting in the black-and-white
+        preview; the idle full-color refresh still uses the panel's real
+        temperature and cleans that up.
+
+config ZECTRIX_EPD_FAST_BW_TSSET_SWEEP
+    bool "Sweep TSSET values across successive fast refreshes (diagnostic)"
+    default n
+    depends on ZECTRIX_EPD_FAST_BW
+    help
+        Program a different TSSET (0xE6) value on every fast refresh and log
+        the resulting waveform BUSY time. TSSET selects the temperature section
+        of the OTP waveform, and those sections have different frame counts, so
+        this probes whether the OTP contains a shorter waveform at all. The PLL
+        sweep showed the duration bottoming out near 14 s, which corresponds to
+        roughly 1700 frames, i.e. a four-color waveform. If every TSSET value
+        gives the same BUSY time, the OTP holds no shorter waveform and 14 s is
+        the floor without replacing the LUT. Disable for normal builds.
+
+config ZECTRIX_EPD_FAST_BW_TSSET_SWEEP_BOOT
+    bool "Run the TSSET sweep once at boot"
+    default n
+    depends on ZECTRIX_EPD_FAST_BW_TSSET_SWEEP
+    help
+        Perform the whole TSSET sweep during display initialization instead of
+        waiting for interactive refreshes. An untouched device never produces a
+        dirty rect, so the interactive sweep cannot advance on its own. The
+        screen alternates black and white once per sweep value, which takes a
+        couple of minutes, then normal initialization resumes.
+
 config ZECTRIX_EPD_READ_CLOCK_HZ
     int "SPI clock for EPD register reads (Hz)"
     range 100000 8000000
