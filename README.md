@@ -149,13 +149,32 @@ cd firmware
 idf.py build
 ```
 
-2026-08-12 已通过一次干净全量构建；生成的 `xiaozhi.bin` 为
-`0x2b9670` 字节，最小应用分区剩余 `0x136990` 字节（31%）。连接设备后可执行：
+2026-08-12 已通过一次干净全量构建；生成的应用镜像 `xiaozhi.bin` 为
+`0x2b9670` 字节，最小应用分区剩余 `0x136990` 字节（31%）。连接设备后可让
+ESP-IDF 按 `flash_args` 中的偏移刷写全部镜像：
 
 ```bash
-cd firmware
 idf.py flash monitor
 ```
+
+如果使用只接受“一个 BIN + 一个起始地址”的网页/GUI 刷写器，先生成合并镜像：
+
+```bash
+idf.py merge-bin
+```
+
+然后选择 `firmware/build/merged-binary.bin`，从 `0x0` 写入。不要把
+`firmware/build/xiaozhi.bin` 写到 `0x0`：它只是 OTA/application 镜像，单独刷写
+时的正确偏移是 `0x20000`。两种文件的用途如下：
+
+| 文件 | 用途 | 刷写偏移 |
+| --- | --- | --- |
+| `build/merged-binary.bin` | 首次刷写、救砖、网页/GUI 整包刷写 | `0x0` |
+| `build/xiaozhi.bin` | OTA，或已具备正确 bootloader/分区表时单独更新应用 | `0x20000` |
+
+若设备曾把 `xiaozhi.bin` 错写到 `0x0` 并出现 `Invalid image block`，可执行
+`idf.py erase-flash flash monitor` 恢复；该命令会清除原 NVS。需要保留 NVS 时，
+应先备份后再执行擦除。
 
 根目录辅助命令：
 
