@@ -71,6 +71,12 @@ public:
 
     // Immediate refresh without forcing a full e-paper update.
     void RequestUrgentRefresh() override;
+    // SSD2683 interaction path: use the OTP fast waveform with B/W-only data,
+    // then schedule a standard full-color recovery after the idle timeout.
+    void RequestFastBwRefresh();
+    // The async SSD2683 path snapshots the framebuffer, so navigation can keep
+    // updating/queuing the latest frame while a fast waveform is in progress.
+    bool AllowsInputDuringRefresh() const;
     // Force a full e-paper refresh on the next immediate update.
     void RequestUrgentFullRefresh() override;
 
@@ -88,8 +94,8 @@ private:
     const epd_panel_type_t panel_type_;
     spi_device_handle_t spi = nullptr;
     bool spi_bus_inited = false;
-    uint8_t *buffer      = nullptr;   // 1bpp framebuffer
-    uint8_t *prev_buffer = nullptr;   // optional
+    uint8_t *buffer      = nullptr;   // semantic 2bpp framebuffer
+    uint8_t *prev_buffer = nullptr;   // last requested semantic frame
     uint8_t *tx_buf      = nullptr;   // snapshot buffer for async send (size = buffer_len)
 
     // LVGL (only compiled when HAVE_LVGL is defined)
@@ -115,6 +121,8 @@ private:
     void SPI_SendByte(uint8_t data);
     uint8_t SPI_RecvByte();
     uint8_t EPD_RecvData();
+    bool read_busy_until(uint32_t timeout_ms);
+    void EPD_ReadBytes(uint8_t *buf, size_t len);
     void EPD_PowerOn();
     void EPD_PowerOff();
     void EPD_SendData(uint8_t data);
@@ -126,6 +134,8 @@ private:
     void EPD_SetWindows(uint16_t Xstart, uint16_t Ystart, uint16_t Xend, uint16_t Yend);
     void EPD_SetCursor(uint16_t Xstart, uint16_t Ystart);
     void EPD_TurnOnDisplay();
+    void EPD_InitFastBw();
+    void EPD_DisplayFastBw();
     void EPD_TurnOnDisplayPart();
     void EPD_SetFullWindowAndCounter(); // ***关键：恢复全屏窗口+计数器***
     bool IsFourColorPanel() const { return panel_type_ == EPD_PANEL_4COLOR_SSD2683; }
@@ -155,6 +165,15 @@ private:
 
     bool urgent_refresh = false;
     bool force_full_refresh_ = false;
+    bool fast_bw_refresh_requested_ = false;
+    // The recovery only has something to restore if a FAST_BW refresh actually
+    // ran. Without this, any UI change small enough to be skipped still armed
+    // the timer, so an idle device ran a full-color waveform every time the
+    // status bar clock ticked.
+    bool fast_bw_since_full_ = false;
+    bool idle_full_refresh_pending_ = false;
+    bool idle_full_refresh_armed_ = false;
+    TickType_t idle_full_refresh_deadline_ = 0;
     TickType_t last_sample_tick = 0;
     int sample_interval_ms = 300; // 节流：采样间隔（可调 200~800）
 
@@ -166,6 +185,7 @@ private:
 
     void UpdateDisplayBusyLocked();
     bool CheckRefreshIdleLocked();
+    void ArmIdleFullRefreshLocked(TickType_t now);
 
     // 文本渲染辅助
     void render_text_to_buffer(const char* text, int x, int y, const lv_font_t* font);

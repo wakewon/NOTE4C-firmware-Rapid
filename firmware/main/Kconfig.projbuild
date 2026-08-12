@@ -22,8 +22,8 @@ choice ZECTRIX_EPD_PANEL_TYPE
     depends on BOARD_TYPE_ZECTRIX_S3_EPAPER_4_2
     help
         Select the e-paper panel connected to the board. The 4-color option
-        keeps the existing 1bpp UI framebuffer and converts it to the SSD2683
-        2bpp wire format during refresh.
+        keeps a semantic 2bpp BWRY UI framebuffer and sends the SSD2683 2bpp
+        wire format during refresh. The 1bpp panel build down-converts it.
 
 config ZECTRIX_EPD_PANEL_1BPP
     bool "1bpp black/white EPD"
@@ -40,5 +40,130 @@ config ZECTRIX_EPD_4COLOR_BOOT_TEST_PATTERN
     help
         Show black/white/red/yellow vertical bars once during display
         initialization so a newly connected 4-color panel can be verified.
+
+config ZECTRIX_EPD_FAST_BW
+    bool "Use SSD2683 OTP fast waveform for interactive B/W refresh"
+    default y
+    depends on ZECTRIX_EPD_PANEL_4COLOR_SSD2683
+    help
+        Use the SSD2683 fast-waveform selection sequence published for the
+        400x300 GDEM042F86 controller path. Interactive framebuffer updates
+        are reduced to black/white and use this waveform. A standard color
+        refresh remains available and is automatically run after the idle
+        timeout below. Disable this option if a panel batch does not contain
+        a compatible fast waveform in OTP.
+
+choice ZECTRIX_EPD_FAST_BW_TIMING
+    prompt "SSD2683 B/W preview timing"
+    default ZECTRIX_EPD_FAST_BW_TIMING_ULTRA
+    depends on ZECTRIX_EPD_FAST_BW
+    help
+        Select how aggressively the controller executes the known OTP fast
+        waveform. The vendor profile is the published approximately 12-second
+        mode. The other profiles use documented SSD2683 PLL/CDI controls and
+        are deliberately experimental: they trade settling time and image
+        quality for interactive latency, while the standard full-color path
+        remains unchanged as a recovery path.
+
+config ZECTRIX_EPD_FAST_BW_TIMING_VENDOR
+    bool "Vendor timing: dynamic 12.5 Hz, 20 ms blanking"
+    help
+        Use PLL=0x08 and CDI=0x37 exactly as published by Good Display. This
+        is the conservative fallback, but normally takes about 12 seconds.
+
+config ZECTRIX_EPD_FAST_BW_TIMING_120HZ
+    bool "Experimental: fixed 120 Hz, 20 ms blanking"
+    help
+        Force the documented maximum 120 Hz scan rate while keeping the
+        vendor 20 ms VCOM/data blanking interval. Use this to isolate PLL
+        behavior from the more aggressive blanking change.
+
+config ZECTRIX_EPD_FAST_BW_TIMING_ULTRA
+    bool "ULTRA_BW: fixed 120 Hz, 2 ms blanking"
+    help
+        Force the documented maximum 120 Hz scan rate and minimum documented
+        2 ms VCOM/data blanking interval. This is the default interactive
+        preview experiment. Expect color loss, ghosting, reduced contrast and
+        panel-dependent results; the idle full-color refresh restores the
+        normal controller initialization and waveform.
+
+endchoice
+
+config ZECTRIX_EPD_FAST_BW_IDLE_FULL_SECONDS
+    int "Idle seconds before full-color recovery"
+    range 5 3600
+    default 30
+    depends on ZECTRIX_EPD_FAST_BW
+    help
+        Restart this timer after every interactive FAST_BW request. Once no
+        new request has arrived for this many seconds, perform one standard
+        full-screen four-color refresh to restore colors and reduce ghosting.
+
+config ZECTRIX_EPD_FAST_BW_TRUNCATE_MS
+    int "Cut the fast waveform short after this many ms (0 disables)"
+    range 0 20000
+    default 0
+    depends on ZECTRIX_EPD_FAST_BW
+    help
+        The panel's OTP holds only four-color waveforms. Their later phases
+        move the yellow and red pigment and contribute nothing to
+        black-and-white content, which is already legible after the first
+        drive. Stopping the wait early and powering off turns the roughly
+        11.5 s fast refresh into whatever value is set here.
+
+        This breaks the waveform's DC balance on purpose. Accumulated DC bias
+        is the known cause of permanent image sticking on e-paper, so it is
+        bounded by ZECTRIX_EPD_FAST_BW_TRUNCATE_MAX_STREAK and by the idle
+        full-color recovery. 120 ms was selected on hardware; 100 ms washed
+        the image out, and below 150 ms the total refresh is dominated by the
+        fixed init and transfer cost anyway.
+
+config ZECTRIX_EPD_FAST_BW_TRUNCATE_MAX_STREAK
+    int "Consecutive truncated waveforms before forcing a complete one"
+    range 1 1000
+    default 6
+    depends on ZECTRIX_EPD_FAST_BW
+    help
+        After this many truncated refreshes in a row, the next one runs its
+        waveform to completion. This is the only cleanup step: an idle timer
+        for it turned every isolated key press into a full 11.5 s waveform a
+        few seconds later, which is worse than the ghosting it removed.
+
+        Note what this does and does not achieve. Cutting the panel supply
+        stops further charge being injected, but the net charge already on the
+        pixels stays there, so the DC imbalance is real. A following complete
+        waveform is DC-balanced in itself and therefore adds no more bias, but
+        it does not actively cancel what the truncated ones left; the
+        full-color refresh is what re-normalizes the pixels. Keep this low.
+
+config ZECTRIX_EPD_FAST_BW_TSSET
+    int "TSSET (0xE6) waveform temperature section for fast refresh"
+    range 0 255
+    default 25
+    depends on ZECTRIX_EPD_FAST_BW
+    help
+        Selects which temperature section of the OTP waveform the fast refresh
+        executes. Measured on hardware at PLL=0x07: 0 C took 23550 ms, 10 C
+        22700 ms, 25 C 11500 ms, 40 C 14100 ms, 50 C 14100 ms and the vendor
+        demo's magic 0x5A 14050 ms, so 25 is both the default and the shortest
+        waveform present in OTP.
+
+        This pins the waveform to one temperature rather than following the
+        panel's own sensor. In a cold room the pixels are then under-driven,
+        which shows up as reduced contrast or ghosting in the black-and-white
+        preview; the idle full-color refresh still uses the panel's real
+        temperature and cleans that up.
+
+config ZECTRIX_EPD_READ_CLOCK_HZ
+    int "SPI clock for EPD register reads (Hz)"
+    range 100000 8000000
+    default 1000000
+    depends on ZECTRIX_EPD_PANEL_4COLOR_SSD2683
+    help
+        Controller reads are much slower than writes and use the shared SDIN
+        line turned around. The first MTP dump was taken at the 8 MHz write
+        clock and came back as recognisable data corrupted by bit slips, so
+        reads now use this separate, lower clock. Lower it further if the dump
+        reports UNSTABLE.
 
 endmenu

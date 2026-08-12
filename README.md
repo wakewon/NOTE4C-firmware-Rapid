@@ -117,11 +117,64 @@ http://192.168.4.1
 
 ### 编译
 
+本机已验证的环境为 macOS（Apple Silicon）、ESP-IDF `v6.0`（即
+`6.0.0`）和 Python `3.12`。工程的 `dependencies.lock` 同样锁定 IDF
+`6.0.0`；不要直接改用 `v6.0.2`，其 SPI 私有接口与当前锁定的
+`espressif/esp_cam_sensor 1.5.2` 不兼容。
+
+首次安装环境：
+
 ```bash
+brew install python@3.12 cmake ninja ccache dfu-util
+
+mkdir -p ~/Developer/esp/v6.0
+git clone --branch v6.0 --depth 1 --recursive \
+  https://github.com/espressif/esp-idf.git \
+  ~/Developer/esp/v6.0/esp-idf
+
+export PATH=/opt/homebrew/opt/python@3.12/libexec/bin:$PATH
+export IDF_TOOLS_PATH=~/Developer/esp/v6.0/.espressif
+cd ~/Developer/esp/v6.0/esp-idf
+./install.sh esp32s3
+```
+
+每个新终端先激活环境，再编译：
+
+```bash
+export PATH=/opt/homebrew/opt/python@3.12/libexec/bin:$PATH
+export IDF_TOOLS_PATH=~/Developer/esp/v6.0/.espressif
+source ~/Developer/esp/v6.0/esp-idf/export.sh
+
 cd firmware
-source ~/Documents/esp/v6.0/esp-idf/export.sh
 idf.py build
 ```
+
+2026-08-12 已通过一次干净全量构建；生成的应用镜像 `xiaozhi.bin` 为
+`0x2b97a0` 字节，最小应用分区剩余 `0x136860` 字节（31%）。连接设备后可让
+ESP-IDF 按 `flash_args` 中的偏移刷写全部镜像：
+
+```bash
+idf.py flash monitor
+```
+
+如果使用只接受“一个 BIN + 一个起始地址”的网页/GUI 刷写器，先生成合并镜像：
+
+```bash
+idf.py merge-bin
+```
+
+然后选择 `firmware/build/merged-binary.bin`，从 `0x0` 写入。不要把
+`firmware/build/xiaozhi.bin` 写到 `0x0`：它只是 OTA/application 镜像，单独刷写
+时的正确偏移是 `0x20000`。两种文件的用途如下：
+
+| 文件 | 用途 | 刷写偏移 |
+| --- | --- | --- |
+| `build/merged-binary.bin` | 首次刷写、救砖、网页/GUI 整包刷写 | `0x0` |
+| `build/xiaozhi.bin` | OTA，或已具备正确 bootloader/分区表时单独更新应用 | `0x20000` |
+
+若设备曾把 `xiaozhi.bin` 错写到 `0x0` 并出现 `Invalid image block`，可执行
+`idf.py erase-flash flash monitor` 恢复；该命令会清除原 NVS。需要保留 NVS 时，
+应先备份后再执行擦除。
 
 根目录辅助命令：
 
@@ -139,6 +192,28 @@ ZECTRIX_EPD_PANEL_1BPP            黑白 1bpp 屏
 ```
 
 如果要刷回旧黑白屏，先在 `idf.py menuconfig` 中切到 `1bpp black/white EPD`，再重新构建烧录。RawDraw 主题层会把红/黄语义色降级成黑白可读样式。
+
+### SSD2683 ULTRA_BW 交互预览
+
+Note4C 四色屏默认启用独立的 `ULTRA_BW` 路径。菜单切换、按钮、光标和
+连续 UI 操作都会将语义 framebuffer 临时映射为黑白（红/黄映射为黑），
+并调用 SSD2683/同类面板厂商示例中的 OTP fast-waveform 选择序列。针对实测
+仍需约 12 秒的问题，默认实验时序把厂商的动态 12.5 Hz/20 ms blanking 改为
+芯片手册范围内的固定 120 Hz/2 ms blanking，以画质、对比度和残影换取秒级
+响应；原厂 12 秒时序以及 120 Hz/20 ms 中间档均可在 menuconfig 中回退。连续操作
+期间不会按刷新次数插入四色全刷；最后一次交互后 60 秒无新操作，才执行一次
+原有 `FULL_COLOR` 全局刷新来恢复颜色和清理残影。新的交互会取消并重新计时。
+
+相关配置为 `CONFIG_ZECTRIX_EPD_FAST_BW` 和
+`CONFIG_ZECTRIX_EPD_FAST_BW_TIMING_*`、
+`CONFIG_ZECTRIX_EPD_FAST_BW_IDLE_FULL_SECONDS`。标准四色路径保持独立，若某批次
+面板与极速时序不兼容，可先切回 `TIMING_VENDOR`，或关闭 FAST_BW。驱动还提供
+默认关闭的只读 `CONFIG_ZECTRIX_EPD_SSD2683_MTP_DUMP`，可导出 3840-byte OTP/MTP
+内容用于继续逆向；固件绝不会调用不可逆的 MTP 编程命令。控制器、
+waveform 证据、像素映射、限制与硬件验证步骤见
+[`docs/SSD2683_FAST_BW_RESEARCH.md`](docs/SSD2683_FAST_BW_RESEARCH.md)。120 Hz/2 ms
+按相同 LUT 帧数理论上可把扫描阶段缩短约 9.7 倍，但 1–3 秒仍须在 Note4C 真机
+上以 `[ULTRA_BW] waveform BUSY=` 日志验证，README 不把估算当成实测指标。
 
 ## UI 说明
 
