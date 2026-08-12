@@ -58,6 +58,27 @@ static constexpr uint8_t kFastBwPllSweep[] = {0x08, 0x07, 0x05, 0x0E, 0x3A, 0x3C
 static uint8_t g_fast_bw_pll_index = 0;
 #endif
 
+#if CONFIG_ZECTRIX_EPD_FAST_BW_PSR_SWEEP
+// Per the SSD2683 Rev 0.20 command table, the second PSR byte carries LUT_EN
+// in B[7]: 0 auto-loads the LUT from MTP, 1 skips that load and makes the
+// analog settings follow the MCU. Sweeping the second byte is the only
+// documented lever over the waveform source, since the command table has no
+// registers for uploading a LUT. B[6:5] is FOPT, the post-waveform scan.
+// Sweeping the first PSR byte was measured first and moved nothing: 0x2F, 0x0F,
+// 0x3F, 0x6F and 0xAF all landed within 11050-11600 ms.
+static constexpr uint8_t kFastBwPsrSweep[] = {0x69, 0xE9, 0x09, 0x89};
+static uint8_t g_fast_bw_psr_index = 0;
+#endif
+
+// The second PSR byte programmed for the next waveform.
+static inline uint8_t EffectiveFastBwPsr1() {
+#if CONFIG_ZECTRIX_EPD_FAST_BW_PSR_SWEEP
+    return kFastBwPsrSweep[g_fast_bw_psr_index];
+#else
+    return 0x69;
+#endif
+}
+
 #if CONFIG_ZECTRIX_EPD_FAST_BW_TSSET_SWEEP
 // The PLL sweep showed BUSY scales with the scan clock but bottoms out near
 // 14 s, which implies roughly 1700 frames: a four-color waveform. TSSET (0xE6)
@@ -88,6 +109,31 @@ static inline uint8_t EffectiveFastBwPll() {
     return kFastBwPllSweep[g_fast_bw_pll_index];
 #else
     return kFastBwPll;
+#endif
+}
+
+// At most one sweep is active at a time. These two helpers let the boot-time
+// harness drive whichever one it is without knowing which.
+static constexpr int kFastBwSweepLen =
+#if CONFIG_ZECTRIX_EPD_FAST_BW_PSR_SWEEP
+    static_cast<int>(sizeof(kFastBwPsrSweep) / sizeof(kFastBwPsrSweep[0]));
+#elif CONFIG_ZECTRIX_EPD_FAST_BW_TSSET_SWEEP
+    static_cast<int>(sizeof(kFastBwTssetSweep) / sizeof(kFastBwTssetSweep[0]));
+#elif CONFIG_ZECTRIX_EPD_FAST_BW_PLL_SWEEP
+    static_cast<int>(sizeof(kFastBwPllSweep) / sizeof(kFastBwPllSweep[0]));
+#else
+    1;
+#endif
+
+static inline void AdvanceFastBwSweep() {
+#if CONFIG_ZECTRIX_EPD_FAST_BW_PSR_SWEEP
+    g_fast_bw_psr_index = static_cast<uint8_t>((g_fast_bw_psr_index + 1) % kFastBwSweepLen);
+#endif
+#if CONFIG_ZECTRIX_EPD_FAST_BW_TSSET_SWEEP
+    g_fast_bw_tsset_index = static_cast<uint8_t>((g_fast_bw_tsset_index + 1) % kFastBwSweepLen);
+#endif
+#if CONFIG_ZECTRIX_EPD_FAST_BW_PLL_SWEEP
+    g_fast_bw_pll_index = static_cast<uint8_t>((g_fast_bw_pll_index + 1) % kFastBwSweepLen);
 #endif
 }
 
@@ -1241,9 +1287,9 @@ void CustomLcdDisplay::EPD_InitFastBw() {
     EPD_SendData(0x9C);
     EPD_SendData(0x96);
 
-    EPD_SendCommand(0x00);  // PSR: use OTP/MTP LUT, no final scan
+    EPD_SendCommand(0x00);  // PSR: LUT source, resolution, scan direction
     EPD_SendData(0x2F);
-    EPD_SendData(0x69);
+    EPD_SendData(EffectiveFastBwPsr1());
 
     EPD_SendCommand(0x01);  // PWR (vendor fast-profile parameters)
     EPD_SendData(0x07);
@@ -1319,17 +1365,16 @@ void CustomLcdDisplay::EPD_SweepFastBwTssetAtBoot() {
     // has pixels to move; a refresh that changes nothing is not a fair timing
     // sample.
     const size_t len = lcd_spi_data.buffer_len;
-    const int passes = static_cast<int>(sizeof(kFastBwTssetSweep) / sizeof(kFastBwTssetSweep[0]));
-    ESP_LOGW(TAG, "[TSSET_SWEEP] BEGIN %d passes; PLL fixed at 0x%02X", passes, kFastBwPll);
-    for (int pass = 0; pass < passes; ++pass) {
+    ESP_LOGW(TAG, "[BOOT_SWEEP] BEGIN %d passes", kFastBwSweepLen);
+    for (int pass = 0; pass < kFastBwSweepLen; ++pass) {
         memset(tx_buf, (pass & 1) ? 0x00 : 0xFF, len);
         const TickType_t started = xTaskGetTickCount();
         EPD_InitFastBw();
         EPD_DisplayFastBw();
-        ESP_LOGW(TAG, "[TSSET_SWEEP] pass=%d total=%u ms", pass,
+        ESP_LOGW(TAG, "[BOOT_SWEEP] pass=%d total=%u ms", pass,
                  static_cast<unsigned>((xTaskGetTickCount() - started) * portTICK_PERIOD_MS));
     }
-    ESP_LOGW(TAG, "[TSSET_SWEEP] END; restoring normal init");
+    ESP_LOGW(TAG, "[BOOT_SWEEP] END; restoring normal init");
     memset(tx_buf, WhiteFillByte(), len);
     EPD_Init();
 #endif
@@ -1473,19 +1518,10 @@ void CustomLcdDisplay::EPD_DisplayFastBw() {
     EPD_SendData(0x00);
     read_busy();
     const TickType_t waveform_finished = xTaskGetTickCount();
-    ESP_LOGW(TAG, "[ULTRA_BW] waveform BUSY=%u ms PLL=0x%02X TSSET=0x%02X",
+    ESP_LOGW(TAG, "[ULTRA_BW] waveform BUSY=%u ms PSR1=0x%02X PLL=0x%02X TSSET=0x%02X",
              static_cast<unsigned>((waveform_finished - waveform_started) * portTICK_PERIOD_MS),
-             EffectiveFastBwPll(), EffectiveFastBwTsset());
-#if CONFIG_ZECTRIX_EPD_FAST_BW_TSSET_SWEEP
-    g_fast_bw_tsset_index =
-        static_cast<uint8_t>((g_fast_bw_tsset_index + 1) %
-                             (sizeof(kFastBwTssetSweep) / sizeof(kFastBwTssetSweep[0])));
-#endif
-#if CONFIG_ZECTRIX_EPD_FAST_BW_PLL_SWEEP
-    g_fast_bw_pll_index =
-        static_cast<uint8_t>((g_fast_bw_pll_index + 1) %
-                             (sizeof(kFastBwPllSweep) / sizeof(kFastBwPllSweep[0])));
-#endif
+             EffectiveFastBwPsr1(), EffectiveFastBwPll(), EffectiveFastBwTsset());
+    AdvanceFastBwSweep();
 
     EPD_SendCommand(0x02);  // POF
     EPD_SendData(0x00);

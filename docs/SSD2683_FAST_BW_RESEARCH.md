@@ -363,6 +363,46 @@ The dump performs three passes and reports `diff_vs_pass0` over the payload
 `STABLE` / `UNSTABLE_LOWER_READ_CLOCK` verdict, so a bad read can no longer be
 mistaken for waveform contents.
 
+## SSD2683 has no register path for loading a waveform
+
+The Rev 0.20 datasheet settles this. The complete user command table is:
+
+```
+00 01 02 03 04 06 07 10 12 17 30 40 41 42 43 50 51 61 65 70 80 81 82 83 90 91 92 E0 E3 E4 E6
+```
+
+There is no `0x20`-`0x2F` LUT group and no command anywhere in the table that
+uploads waveform data from the MCU. The feature list states the waveform lives
+in an "Embedded 3840 Bytes MTP", which is exactly the block RMTP returns.
+
+`LUT_EN`, PSR (0x00) second byte B[7], is the only documented lever over the
+LUT source: 0 auto-loads the LUT from MTP, 1 skips the load and makes the
+*analog* settings follow the MCU. It does not redirect the waveform, and
+hardware agrees: with TSSET=0x19 and PLL=0x07, `0x69` (LUT_EN=0) took 11450 ms
+and `0xE9` (LUT_EN=1) took 11600 ms. Sweeping the first PSR byte moved nothing
+either: `0x2F`, `0x0F`, `0x3F`, `0x6F` and `0xAF` all landed within
+11050-11600 ms.
+
+Every volatile avenue is therefore exhausted. The waveform can only be changed
+by programming the MTP through `0x90` PGM and `0x91` APG.
+
+### Why MTP programming is not a drop-in next step
+
+* The command table has PGM and APG but **no erase command**. The current MTP
+  content is dominated by 0xFF, so programming almost certainly only drives
+  bits one way, which means the verified `fnv1a32=084ABC10` dump cannot be
+  written back to undo a mistake.
+* The datasheet documents the *commands*, not the waveform *encoding*. The
+  3840-byte layout is proprietary; the only structure established so far is
+  byte-aligned periodicity at 535 and 88 bytes, plus the per-temperature
+  sections the TSSET sweep exposed.
+* A wrong waveform is burned in permanently and there is no factory image to
+  restore, so the failure mode is a permanently degraded panel rather than a
+  bad refresh.
+
+Programming the MTP therefore requires an explicit, informed decision and a
+recovery plan, not just a code path. It is deliberately not implemented here.
+
 ## Remaining lower-level experiments
 
 The current default is now a genuine second-level timing experiment, but it

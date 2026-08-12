@@ -144,10 +144,23 @@ config ZECTRIX_EPD_FAST_BW_TSSET_SWEEP
         gives the same BUSY time, the OTP holds no shorter waveform and 14 s is
         the floor without replacing the LUT. Disable for normal builds.
 
-config ZECTRIX_EPD_FAST_BW_TSSET_SWEEP_BOOT
-    bool "Run the TSSET sweep once at boot"
+config ZECTRIX_EPD_FAST_BW_PSR_SWEEP
+    bool "Sweep the first PSR byte across successive fast refreshes (diagnostic)"
     default n
-    depends on ZECTRIX_EPD_FAST_BW_TSSET_SWEEP
+    depends on ZECTRIX_EPD_FAST_BW
+    help
+        PSR (0x00) is a documented, volatile register whose bits include the
+        selection between an OTP waveform LUT and a LUT loaded from registers.
+        This sweep programs a different first PSR byte on each fast refresh to
+        locate that bit: selecting the register LUT without having uploaded one
+        should collapse the waveform duration, because the controller then runs
+        an empty waveform. Nothing persists, since every refresh begins with a
+        hardware reset. Disable for normal builds.
+
+config ZECTRIX_EPD_FAST_BW_TSSET_SWEEP_BOOT
+    bool "Run the active sweep once at boot"
+    default n
+    depends on ZECTRIX_EPD_FAST_BW_TSSET_SWEEP || ZECTRIX_EPD_FAST_BW_PSR_SWEEP || ZECTRIX_EPD_FAST_BW_PLL_SWEEP
     help
         Perform the whole TSSET sweep during display initialization instead of
         waiting for interactive refreshes. An untouched device never produces a
