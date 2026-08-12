@@ -259,6 +259,46 @@ Interpretation of that curve:
   routes are a different OTP bank selector or a register-loaded LUT, which
   requires the MTP dump below.
 
+## Hardware result: PLL works, but the frame count is the wall
+
+The sweep produced a genuinely varying curve, so register timing is in effect:
+
+| PLL  | BUSY     |
+|------|----------|
+| 0x07 | 14050 ms |
+| 0x08 | 16850 ms |
+| 0x0E | 16850 ms |
+| 0x05 | 19600 ms |
+
+`0x3A` and `0x3C` were not reached because full-color refreshes interrupted the
+key sequence; they remain untested and cost nothing but more key presses.
+
+The curve is the answer, and it is not encouraging. `0x07` is the documented
+fixed 120 Hz setting, and it still takes 14050 ms, which implies roughly 1700
+waveform frames. That is a four-color waveform, not a monochrome one. The
+reserved `EF/F6/E6/A5` selector is therefore either not switching banks or the
+bank it selects has the same frame count. No register can shorten a waveform
+whose frame count comes from OTP, so `ZECTRIX_EPD_SSD2683_MTP_DUMP` is now
+enabled by default to capture the actual waveform data.
+
+## Most interactive refreshes were never using FAST_BW
+
+The same log showed four of eight refreshes taking 23 s as
+`[FULL_COLOR] reason=explicit_or_strategy`, including a plain page switch. This
+was the dominant cause of the "still slow" impression, and it was a driver bug
+rather than a panel limit.
+
+The refresh loop consumes `fast_bw_refresh_requested_` at the top of each
+iteration. That iteration can still bail out before refreshing when the
+framebuffer has not been re-rendered yet (`diff_bits == 0`) or when the diff is
+below the tiny-diff threshold. The framebuffer change then arrives one
+iteration later as a plain dirty rect with the flag already consumed, and the
+four-color branch sent it to the 23 s full-color waveform.
+
+Such a refresh is now promoted to FAST_BW and re-arms the idle timer, since
+color recovery is owned by that timer by design. The start log distinguishes
+`source=requested` from `source=promoted_dirty_rect`.
+
 ## Remaining lower-level experiments
 
 The current default is now a genuine second-level timing experiment, but it

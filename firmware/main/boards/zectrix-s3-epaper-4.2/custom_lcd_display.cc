@@ -780,11 +780,28 @@ void CustomLcdDisplay::refresh_task_loop() {
 
         // Decide FULL vs PARTIAL
         bool should_full = !prev_buffer_synced || !prev_buffer;
+        bool fast_bw_promoted = false;
         if (!should_full && (force_full || idle_full)) {
             should_full = true;
         }
         if (!should_full && IsFourColorPanel() && !fast_bw) {
+#if CONFIG_ZECTRIX_EPD_FAST_BW
+            // The fast_bw flag is consumed at the top of the loop, but that
+            // iteration can still bail out before refreshing (no diff yet, or
+            // a diff below the tiny-diff threshold) while the framebuffer
+            // change arrives one iteration later as a plain dirty rect. Such a
+            // refresh used to fall through to the 23 s full-color waveform,
+            // which is why interactive updates were still slow. Color recovery
+            // is owned by the idle timer, so promote it to FAST_BW instead and
+            // re-arm that timer.
+            fast_bw = true;
+            fast_bw_promoted = true;
+            xSemaphoreTake(dirty_mutex, portMAX_DELAY);
+            ArmIdleFullRefreshLocked(xTaskGetTickCount());
+            xSemaphoreGive(dirty_mutex);
+#else
             should_full = true;
+#endif
         }
         if (!should_full && !(IsFourColorPanel() && fast_bw) &&
             result.diff_ratio >= kForceFullDiffRatio) {
@@ -819,8 +836,8 @@ void CustomLcdDisplay::refresh_task_loop() {
                      (unsigned)((xTaskGetTickCount() - refresh_started) * portTICK_PERIOD_MS));
         } else if (IsFourColorPanel() && fast_bw) {
             stat_fast_bw++;
-            ESP_LOGW(TAG, "[ULTRA_BW] start timing=%s; colors mapped to black/white",
-                     kFastBwTimingName);
+            ESP_LOGW(TAG, "[ULTRA_BW] start timing=%s source=%s; colors mapped to black/white",
+                     kFastBwTimingName, fast_bw_promoted ? "promoted_dirty_rect" : "requested");
             EPD_InitFastBw();
             EPD_DisplayFastBw();
             memcpy(prev_buffer, tx_buf, lcd_spi_data.buffer_len);
