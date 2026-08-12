@@ -33,6 +33,23 @@ static constexpr int kFourColorSampleIntervalMs = 12000;
 #if CONFIG_ZECTRIX_EPD_FAST_BW
 static constexpr uint32_t kFastBwIdleFullMs =
     CONFIG_ZECTRIX_EPD_FAST_BW_IDLE_FULL_SECONDS * 1000U;
+
+#if CONFIG_ZECTRIX_EPD_FAST_BW_TIMING_VENDOR
+static constexpr uint8_t kFastBwPll = 0x08;  // dynamic, 12.5 Hz
+static constexpr uint8_t kFastBwCdi = 0x37;  // white border, 20 ms blanking
+static constexpr const char *kFastBwTimingName = "vendor-12.5Hz-20ms";
+#elif CONFIG_ZECTRIX_EPD_FAST_BW_TIMING_120HZ
+static constexpr uint8_t kFastBwPll = 0x07;  // fixed, 120 Hz
+static constexpr uint8_t kFastBwCdi = 0x37;  // white border, 20 ms blanking
+static constexpr const char *kFastBwTimingName = "fixed-120Hz-20ms";
+#else
+static constexpr uint8_t kFastBwPll = 0x07;  // fixed, 120 Hz
+static constexpr uint8_t kFastBwCdi = 0x30;  // white border, 2 ms blanking
+static constexpr const char *kFastBwTimingName = "ultra-fixed-120Hz-2ms";
+#endif
+#else
+// Keep the common refresh-loop logging buildable when FAST_BW is disabled.
+static constexpr const char *kFastBwTimingName = "disabled";
 #endif
 
 #ifndef EXAMPLE_LCD_WIDTH
@@ -252,6 +269,11 @@ CustomLcdDisplay::CustomLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_p
 
     ESP_LOGI(TAG, "EPD init");
     EPD_Init();
+#if CONFIG_ZECTRIX_EPD_SSD2683_MTP_DUMP
+    if (IsFourColorPanel()) {
+        EPD_DumpSsd2683Mtp();
+    }
+#endif
 
     // buffer init
     EPD_Clear();
@@ -776,12 +798,13 @@ void CustomLcdDisplay::refresh_task_loop() {
                      (unsigned)((xTaskGetTickCount() - refresh_started) * portTICK_PERIOD_MS));
         } else if (IsFourColorPanel() && fast_bw) {
             stat_fast_bw++;
-            ESP_LOGW(TAG, "[FAST_BW] start; colors mapped to black/white");
+            ESP_LOGW(TAG, "[ULTRA_BW] start timing=%s; colors mapped to black/white",
+                     kFastBwTimingName);
             EPD_InitFastBw();
             EPD_DisplayFastBw();
             memcpy(prev_buffer, tx_buf, lcd_spi_data.buffer_len);
             prev_buffer_synced = true;
-            ESP_LOGW(TAG, "[FAST_BW] complete in %u ms; FULL_COLOR idle timer remains armed",
+            ESP_LOGW(TAG, "[ULTRA_BW] complete in %u ms; FULL_COLOR idle timer remains armed",
                      (unsigned)((xTaskGetTickCount() - refresh_started) * portTICK_PERIOD_MS));
         } else {
             stat_partial++;
@@ -963,6 +986,27 @@ uint8_t CustomLcdDisplay::EPD_RecvData() {
     return data;
 }
 
+void CustomLcdDisplay::EPD_ReadBytes(uint8_t *buf, size_t len) {
+    if (buf == nullptr || len == 0) {
+        return;
+    }
+
+    // Note4C uses the SSD2683 SDIN pin bidirectionally. Switch the ESP32 SPI
+    // bus to input only after the read command has been latched, then keep CS
+    // asserted for the complete sequential response.
+    spi_port_rx_init();
+    set_dc_1();
+    set_cs_0();
+    spi_transaction_t t;
+    memset(&t, 0, sizeof(t));
+    t.length = 8 * len;
+    t.rx_buffer = buf;
+    esp_err_t ret = spi_device_polling_transmit(spi, &t);
+    set_cs_1();
+    assert(ret == ESP_OK);
+    spi_port_init();
+}
+
 void CustomLcdDisplay::EPD_SendData(uint8_t data) {
     set_dc_1();
     set_cs_0();
@@ -1108,8 +1152,12 @@ void CustomLcdDisplay::EPD_InitFastBw() {
     EPD_SendData(0x07);
     EPD_SendData(0xF0);
 
-    EPD_SendCommand(0x50);  // CDI: white border, 20 ms interval
-    EPD_SendData(0x37);
+    // The OTP waveform defines the number and polarity of frames. PLL/CDI
+    // define how long each of those frames takes. ULTRA_BW intentionally uses
+    // the documented maximum scan rate and minimum blanking interval; normal
+    // FULL_COLOR always resets the controller and does not inherit them.
+    EPD_SendCommand(0x50);  // CDI: border + gate/source blanking
+    EPD_SendData(kFastBwCdi);
 
     EPD_SendCommand(0x61);  // TRES: 400x300
     EPD_SendData(static_cast<uint8_t>((Width >> 8) & 0x03));
@@ -1127,8 +1175,8 @@ void CustomLcdDisplay::EPD_InitFastBw() {
     EPD_SendData(0x00);
     EPD_SendData(0x00);
 
-    EPD_SendCommand(0x30);  // PLL: dynamic frame rate enabled
-    EPD_SendData(0x08);
+    EPD_SendCommand(0x30);  // PLL: profile-specific scan clock
+    EPD_SendData(kFastBwPll);
     EPD_SendCommand(0xE9);
     EPD_SendData(0x01);
 
@@ -1151,6 +1199,66 @@ void CustomLcdDisplay::EPD_InitFastBw() {
 #endif
 }
 
+void CustomLcdDisplay::EPD_DumpSsd2683Mtp() {
+#if !CONFIG_ZECTRIX_EPD_SSD2683_MTP_DUMP
+    return;
+#else
+    if (!IsFourColorPanel()) {
+        return;
+    }
+
+    constexpr size_t kRevisionBytes = 3;
+    constexpr size_t kMtpBytes = 3840;
+    constexpr size_t kMtpReadBytes = kMtpBytes + 1;  // RMTP starts with dummy
+
+    uint8_t revision[kRevisionBytes] = {};
+    EPD_SendCommand(0x70);  // REV, documented read-only command
+    EPD_ReadBytes(revision, sizeof(revision));
+
+    uint8_t *mtp_read = static_cast<uint8_t *>(
+        heap_caps_malloc(kMtpReadBytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+    if (mtp_read == nullptr) {
+        ESP_LOGE(TAG, "[SSD2683_MTP] unable to allocate %u-byte DMA buffer",
+                 static_cast<unsigned>(kMtpReadBytes));
+        return;
+    }
+
+    EPD_SendCommand(0x92);  // RMTP, documented read-only command
+    EPD_ReadBytes(mtp_read, kMtpReadBytes);
+    const uint8_t *mtp = mtp_read + 1;
+
+    // FNV-1a is only an identity fingerprint here, not an integrity/security
+    // primitive. It makes panel-batch comparisons practical in normal logs.
+    uint32_t fingerprint = 2166136261U;
+    for (size_t i = 0; i < kMtpBytes; ++i) {
+        fingerprint ^= mtp[i];
+        fingerprint *= 16777619U;
+    }
+
+    ESP_LOGW(TAG,
+             "[SSD2683_MTP] REV=%02X:%02X:%02X dummy=%02X bytes=%u fnv1a32=%08X",
+             revision[0], revision[1], revision[2], mtp_read[0],
+             static_cast<unsigned>(kMtpBytes), static_cast<unsigned>(fingerprint));
+    ESP_LOGW(TAG, "[SSD2683_MTP] BEGIN read-only hex dump; 16 bytes per line");
+    for (size_t offset = 0; offset < kMtpBytes; offset += 16) {
+        char line[16 * 3 + 1] = {};
+        size_t used = 0;
+        const size_t count = std::min<size_t>(16, kMtpBytes - offset);
+        for (size_t i = 0; i < count; ++i) {
+            const int written = snprintf(line + used, sizeof(line) - used,
+                                         i == 0 ? "%02X" : " %02X", mtp[offset + i]);
+            if (written <= 0) {
+                break;
+            }
+            used += static_cast<size_t>(written);
+        }
+        ESP_LOGW(TAG, "[SSD2683_MTP] %04X: %s", static_cast<unsigned>(offset), line);
+    }
+    ESP_LOGW(TAG, "[SSD2683_MTP] END");
+    heap_caps_free(mtp_read);
+#endif
+}
+
 void CustomLcdDisplay::EPD_DisplayFastBw() {
 #if !CONFIG_ZECTRIX_EPD_FAST_BW
     EPD_Display();
@@ -1163,6 +1271,7 @@ void CustomLcdDisplay::EPD_DisplayFastBw() {
 
     const int bytes_per_row = (Width * 2 + 7) >> 3;
     std::vector<uint8_t> line(bytes_per_row);
+    const TickType_t transfer_started = xTaskGetTickCount();
 
     EPD_SendCommand(0x10);  // DTM: target 2bpp pixels, not old/new transitions
     read_busy();
@@ -1177,9 +1286,17 @@ void CustomLcdDisplay::EPD_DisplayFastBw() {
         }
     }
 
+    const TickType_t waveform_started = xTaskGetTickCount();
+    ESP_LOGW(TAG,
+             "[ULTRA_BW] execute timing=%s PLL=0x%02X CDI=0x%02X transfer=%u ms",
+             kFastBwTimingName, kFastBwPll, kFastBwCdi,
+             static_cast<unsigned>((waveform_started - transfer_started) * portTICK_PERIOD_MS));
     EPD_SendCommand(0x12);  // DRF: execute the selected fast OTP waveform
     EPD_SendData(0x00);
     read_busy();
+    const TickType_t waveform_finished = xTaskGetTickCount();
+    ESP_LOGW(TAG, "[ULTRA_BW] waveform BUSY=%u ms",
+             static_cast<unsigned>((waveform_finished - waveform_started) * portTICK_PERIOD_MS));
 
     EPD_SendCommand(0x02);  // POF
     EPD_SendData(0x00);

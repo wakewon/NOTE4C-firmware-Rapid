@@ -150,7 +150,7 @@ idf.py build
 ```
 
 2026-08-12 已通过一次干净全量构建；生成的应用镜像 `xiaozhi.bin` 为
-`0x2b9670` 字节，最小应用分区剩余 `0x136990` 字节（31%）。连接设备后可让
+`0x2b97a0` 字节，最小应用分区剩余 `0x136860` 字节（31%）。连接设备后可让
 ESP-IDF 按 `flash_args` 中的偏移刷写全部镜像：
 
 ```bash
@@ -193,21 +193,27 @@ ZECTRIX_EPD_PANEL_1BPP            黑白 1bpp 屏
 
 如果要刷回旧黑白屏，先在 `idf.py menuconfig` 中切到 `1bpp black/white EPD`，再重新构建烧录。RawDraw 主题层会把红/黄语义色降级成黑白可读样式。
 
-### SSD2683 FAST_BW 交互刷新
+### SSD2683 ULTRA_BW 交互预览
 
-Note4C 四色屏默认启用独立的 `FAST_BW` 路径。菜单切换、按钮、光标和
+Note4C 四色屏默认启用独立的 `ULTRA_BW` 路径。菜单切换、按钮、光标和
 连续 UI 操作都会将语义 framebuffer 临时映射为黑白（红/黄映射为黑），
-并调用 SSD2683/同类面板厂商示例中的 OTP fast-waveform 选择序列。连续操作
+并调用 SSD2683/同类面板厂商示例中的 OTP fast-waveform 选择序列。针对实测
+仍需约 12 秒的问题，默认实验时序把厂商的动态 12.5 Hz/20 ms blanking 改为
+芯片手册范围内的固定 120 Hz/2 ms blanking，以画质、对比度和残影换取秒级
+响应；原厂 12 秒时序以及 120 Hz/20 ms 中间档均可在 menuconfig 中回退。连续操作
 期间不会按刷新次数插入四色全刷；最后一次交互后 60 秒无新操作，才执行一次
 原有 `FULL_COLOR` 全局刷新来恢复颜色和清理残影。新的交互会取消并重新计时。
 
 相关配置为 `CONFIG_ZECTRIX_EPD_FAST_BW` 和
+`CONFIG_ZECTRIX_EPD_FAST_BW_TIMING_*`、
 `CONFIG_ZECTRIX_EPD_FAST_BW_IDLE_FULL_SECONDS`。标准四色路径保持独立，若某批次
-面板与 fast profile 不兼容，可在 `idf.py menuconfig` 中关闭 FAST_BW。控制器、
+面板与极速时序不兼容，可先切回 `TIMING_VENDOR`，或关闭 FAST_BW。驱动还提供
+默认关闭的只读 `CONFIG_ZECTRIX_EPD_SSD2683_MTP_DUMP`，可导出 3840-byte OTP/MTP
+内容用于继续逆向；固件绝不会调用不可逆的 MTP 编程命令。控制器、
 waveform 证据、像素映射、限制与硬件验证步骤见
-[`docs/SSD2683_FAST_BW_RESEARCH.md`](docs/SSD2683_FAST_BW_RESEARCH.md)。公开资料给出的
-同类面板 fast refresh 约为 12 秒，因此 1–3 秒仍是后续需要在真机上验证和继续
-寻找专用 B/W OTP bank 的实验目标，README 不把它作为已实现指标。
+[`docs/SSD2683_FAST_BW_RESEARCH.md`](docs/SSD2683_FAST_BW_RESEARCH.md)。120 Hz/2 ms
+按相同 LUT 帧数理论上可把扫描阶段缩短约 9.7 倍，但 1–3 秒仍须在 Note4C 真机
+上以 `[ULTRA_BW] waveform BUSY=` 日志验证，README 不把估算当成实测指标。
 
 ## UI 说明
 

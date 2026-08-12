@@ -53,6 +53,42 @@ config ZECTRIX_EPD_FAST_BW
         timeout below. Disable this option if a panel batch does not contain
         a compatible fast waveform in OTP.
 
+choice ZECTRIX_EPD_FAST_BW_TIMING
+    prompt "SSD2683 B/W preview timing"
+    default ZECTRIX_EPD_FAST_BW_TIMING_ULTRA
+    depends on ZECTRIX_EPD_FAST_BW
+    help
+        Select how aggressively the controller executes the known OTP fast
+        waveform. The vendor profile is the published approximately 12-second
+        mode. The other profiles use documented SSD2683 PLL/CDI controls and
+        are deliberately experimental: they trade settling time and image
+        quality for interactive latency, while the standard full-color path
+        remains unchanged as a recovery path.
+
+config ZECTRIX_EPD_FAST_BW_TIMING_VENDOR
+    bool "Vendor timing: dynamic 12.5 Hz, 20 ms blanking"
+    help
+        Use PLL=0x08 and CDI=0x37 exactly as published by Good Display. This
+        is the conservative fallback, but normally takes about 12 seconds.
+
+config ZECTRIX_EPD_FAST_BW_TIMING_120HZ
+    bool "Experimental: fixed 120 Hz, 20 ms blanking"
+    help
+        Force the documented maximum 120 Hz scan rate while keeping the
+        vendor 20 ms VCOM/data blanking interval. Use this to isolate PLL
+        behavior from the more aggressive blanking change.
+
+config ZECTRIX_EPD_FAST_BW_TIMING_ULTRA
+    bool "ULTRA_BW: fixed 120 Hz, 2 ms blanking"
+    help
+        Force the documented maximum 120 Hz scan rate and minimum documented
+        2 ms VCOM/data blanking interval. This is the default interactive
+        preview experiment. Expect color loss, ghosting, reduced contrast and
+        panel-dependent results; the idle full-color refresh restores the
+        normal controller initialization and waveform.
+
+endchoice
+
 config ZECTRIX_EPD_FAST_BW_IDLE_FULL_SECONDS
     int "Idle seconds before full-color recovery"
     range 5 3600
@@ -62,5 +98,16 @@ config ZECTRIX_EPD_FAST_BW_IDLE_FULL_SECONDS
         Restart this timer after every interactive FAST_BW request. Once no
         new request has arrived for this many seconds, perform one standard
         full-screen four-color refresh to restore colors and reduce ghosting.
+
+config ZECTRIX_EPD_SSD2683_MTP_DUMP
+    bool "Dump SSD2683 revision and read-only MTP waveform data at boot"
+    default n
+    depends on ZECTRIX_EPD_PANEL_4COLOR_SSD2683
+    help
+        Read the three-byte chip revision and all 3840 bytes of MTP through
+        the documented REV (0x70) and RMTP (0x92) commands. A fingerprint and
+        complete hex dump are written to the serial log for waveform reverse
+        engineering. This path never sends the irreversible PGM/APG commands
+        (0x90/0x91). Leave disabled for normal builds because the dump is long.
 
 endmenu

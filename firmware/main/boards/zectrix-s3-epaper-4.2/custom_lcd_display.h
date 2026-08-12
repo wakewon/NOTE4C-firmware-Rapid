@@ -121,6 +121,7 @@ private:
     void SPI_SendByte(uint8_t data);
     uint8_t SPI_RecvByte();
     uint8_t EPD_RecvData();
+    void EPD_ReadBytes(uint8_t *buf, size_t len);
     void EPD_PowerOn();
     void EPD_PowerOff();
     void EPD_SendData(uint8_t data);
@@ -134,6 +135,7 @@ private:
     void EPD_TurnOnDisplay();
     void EPD_InitFastBw();
     void EPD_DisplayFastBw();
+    void EPD_DumpSsd2683Mtp();
     void EPD_TurnOnDisplayPart();
     void EPD_SetFullWindowAndCounter(); // ***关键：恢复全屏窗口+计数器***
     bool IsFourColorPanel() const { return panel_type_ == EPD_PANEL_4COLOR_SSD2683; }

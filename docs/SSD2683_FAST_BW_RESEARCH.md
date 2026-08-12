@@ -7,12 +7,14 @@ Target: ZecTrix Note4C, 400x300, SSD2683, BWRY (black/white/red/yellow)
 
 The firmware now has two deliberately separate SSD2683 refresh paths:
 
-- `FAST_BW`: every interactive RawDraw update is converted to black/white and
-  driven through the controller-matched OTP fast-waveform selection sequence.
+- `ULTRA_BW`: every interactive RawDraw update is converted to black/white,
+  driven through the controller-matched OTP fast-waveform selection sequence,
+  and executed with experimental fixed-120 Hz / 2 ms controller timing.
 - `FULL_COLOR`: the pre-existing standard 2bpp BWRY refresh remains unchanged
   as the recovery path. It runs once after 60 seconds with no new interactive
   request. Every new interaction cancels/restarts that not-yet-started timer.
 
+The original approximately 12-second vendor timing remains a Kconfig fallback.
 No refresh-count threshold inserts a color refresh during continuous use. The
 implementation does not reset or remove panel power midway through a waveform.
 
@@ -63,6 +65,12 @@ for uploading a replacement 3840-byte waveform LUT. Programming MTP would be a
 panel-specific and potentially irreversible operation, so it is outside the
 safe experiment path.
 
+Unlike SSD1683 monochrome controllers, SSD2683 does not expose a documented
+`0x32` LUT-write command. Copying an SSD1683 transition/LUT implementation into
+this driver would therefore target the wrong command architecture. The public
+SSD2683 DTM format carries only the new 2bpp target state; any old-to-new
+transition handling is inside the selected controller LUT.
+
 ## Evidence-backed fast profile
 
 Good Display publishes a 400x300 four-color SSD2683ZA panel, GDEM042F86, with a
@@ -84,12 +92,45 @@ does not guess neighboring selector values, and never invokes MTP programming.
 The sequence is followed by ordinary DTM/DRF and a complete POF/deep-sleep
 sequence.
 
+The same official fast demo also programs `PLL (0x30) = 0x08` and
+`CDI (0x50) = 0x37`. The datasheet decodes those values as dynamic 12.5 Hz scan
+timing and 20 ms gate/source blanking. This explains why selecting the vendor
+"fast" bank still takes approximately 12 seconds: it is a real but conservative
+four-color waveform, not an interaction-oriented preview mode.
+
 Sources:
 
 - [SSD2683 Rev 0.20 controller PDF](https://v4.cecdn.yun300.cn/100001_1909185148/SSD2683_0.20_proposal.pdf)
 - [Good Display SSD2683 download page](https://www.good-display.com/companyfile/2082.html)
 - [GDEM042F86 official ESP32 sample](https://www.good-display.com/companyfile/2052.html)
 - [GDEM042F86 published 12 s / 20 s timing](https://www.good-display.com/product/1048.html)
+
+## ULTRA_BW timing experiment
+
+The fastest evidence-backed experiment that does not guess reserved commands,
+program MTP, or interrupt an active waveform is to keep the known OTP fast bank
+but compress each frame using documented timing controls:
+
+| Profile | PLL `0x30` | CDI `0x50` | Purpose |
+| --- | --- | --- | --- |
+| Vendor fallback | `0x08` | `0x37` | Dynamic 12.5 Hz, 20 ms blanking; published ~12 s behavior |
+| 120 Hz isolation | `0x07` | `0x37` | Fixed 120 Hz, retain 20 ms blanking |
+| `ULTRA_BW` default | `0x07` | `0x30` | Fixed 120 Hz, minimum documented 2 ms blanking |
+
+For a frame whose switching and blanking phases both occur once, the nominal
+period changes from `80 + 20 = 100 ms` to approximately `8.33 + 2 = 10.33 ms`.
+If the OTP profile is primarily frame-count based, this is a theoretical 9.7x
+scan-stage reduction and could move a 12-second waveform near the requested
+1-3 second range. This is an engineering estimate, not a claimed measured
+result: OTP phases, power sequencing and dynamic-rate behavior can make actual
+hardware timing differ.
+
+Both values are inside the controller's documented selectable range, but the
+panel waveform was not qualified for this settling time. Heavy ghosting, weak
+contrast, uneven transitions, or little visible change are accepted outcomes
+for preview mode. Every later `FULL_COLOR` call performs a hardware reset and
+uses the unchanged normal OTP initialization, so experimental PLL/CDI state is
+not inherited by the recovery refresh.
 
 ## FAST_BW pixel policy
 
@@ -129,15 +170,21 @@ therefore restores red and yellow without rerendering the UI.
 Kconfig controls:
 
 - `CONFIG_ZECTRIX_EPD_FAST_BW` (enabled by default for SSD2683)
+- `CONFIG_ZECTRIX_EPD_FAST_BW_TIMING_ULTRA` (default: fixed 120 Hz / 2 ms)
+- `CONFIG_ZECTRIX_EPD_FAST_BW_TIMING_120HZ` (diagnostic: fixed 120 Hz / 20 ms)
+- `CONFIG_ZECTRIX_EPD_FAST_BW_TIMING_VENDOR` (fallback: published 12 s timing)
 - `CONFIG_ZECTRIX_EPD_FAST_BW_IDLE_FULL_SECONDS` (default `60`)
+- `CONFIG_ZECTRIX_EPD_SSD2683_MTP_DUMP` (disabled by default; read-only reverse-engineering dump)
 
 ## Hardware validation plan
 
 Serial warning logs bracket the actual controller operation:
 
 ```text
-[FAST_BW] start; colors mapped to black/white
-[FAST_BW] complete in N ms; FULL_COLOR idle timer remains armed
+[ULTRA_BW] start timing=ultra-fixed-120Hz-2ms; colors mapped to black/white
+[ULTRA_BW] execute timing=... PLL=0x07 CDI=0x30 transfer=N ms
+[ULTRA_BW] waveform BUSY=N ms
+[ULTRA_BW] complete in N ms; FULL_COLOR idle timer remains armed
 [FULL_COLOR] start reason=fast_bw_idle_timeout
 [FULL_COLOR] complete in N ms
 ```
@@ -145,8 +192,8 @@ Serial warning logs bracket the actual controller operation:
 Validate on the Note4C panel in this order:
 
 1. Boot and confirm the unchanged standard full-color image is correct.
-2. Perform a single menu move. Confirm only black/white is shown and record the
-   `FAST_BW` BUSY duration.
+2. Perform a single menu move. Confirm only black/white is shown and record both
+   the `ULTRA_BW waveform BUSY` and total duration.
 3. Operate buttons continuously for more than one minute. Confirm there is no
    intervening `FULL_COLOR` refresh.
 4. Stop input. At 60 seconds after the final request, confirm one full-color
@@ -155,27 +202,44 @@ Validate on the Note4C panel in this order:
    60 seconds later.
 6. Repeat black-to-white, white-to-black and color-underlay-to-B/W transitions;
    photograph residuals and record temperature and panel/FPC revision.
-7. Disable `CONFIG_ZECTRIX_EPD_FAST_BW` and rebuild if this Note4C panel batch
-   does not contain a compatible fast profile. Standard `FULL_COLOR` remains
-   available independently through `RequestUrgentFullRefresh()`.
+7. If the image is too weak, test `120HZ` to retain 20 ms blanking. If that is
+   still unusable, select `VENDOR` without changing the scheduling behavior.
+8. Disable `CONFIG_ZECTRIX_EPD_FAST_BW` only if this Note4C panel batch does not
+   contain a compatible fast profile. Standard `FULL_COLOR` remains available
+   independently through `RequestUrgentFullRefresh()`.
 
-## Latency limit and next experiment
+## Read-only OTP/MTP reverse-engineering path
 
-The strongest public SSD2683/BWRY evidence currently supports a dedicated OTP
-fast profile, but its published target is about 12 seconds. It is therefore a
-real waveform improvement and a safe first experiment, not yet evidence for a
-1-3 second B/W mode on this exact panel.
+Enable `CONFIG_ZECTRIX_EPD_SSD2683_MTP_DUMP` only for a diagnostic build. At
+boot the driver reads REV (`0x70`) and RMTP (`0x92`), logs the three-byte chip
+revision, a 32-bit fingerprint, and all 3840 MTP bytes. It never sends PGM or
+APG. Convert a captured serial log into the exact binary image with:
 
-If hardware timing remains near 12 seconds, the next safe steps are:
+```bash
+python firmware/scripts/extract_ssd2683_mtp.py monitor.log ssd2683-mtp.bin
+```
 
-1. Read chip revision (`0x70`) and MTP (`0x92`) without programming it, and
-   fingerprint multiple Note4C panel batches.
-2. Ask the panel vendor for the SSD2683 reserved-command map or the selector for
-   a B/W-only OTP bank. Do not brute-force `0xF6` values on an energized panel.
-3. Test PTLW (`0x83`, `PMODE=1`) only as a secondary power/visual experiment;
+The binary is the input needed to compare Note4C panel batches, locate repeated
+temperature/profile tables, and correlate the reserved `EF/F6/E6/A5` selector
+sequence with actual waveform regions. A dump from the user's panel is still
+required before the proprietary layout can be decoded responsibly.
+
+## Remaining lower-level experiments
+
+The current default is now a genuine second-level timing experiment, but it
+does not yet replace the proprietary OTP LUT with a purpose-built monochrome
+transition table. Hardware BUSY measurements decide the next branch:
+
+1. If BUSY falls near 1-3 seconds and the preview is legible, keep ULTRA and
+   characterize black-to-white, white-to-black, and repeated-key ghosting.
+2. If `ULTRA` and `120HZ` have the same BUSY as `VENDOR`, the reserved fast bank
+   is overriding PLL/CDI. Capture MTP and inspect its dynamic timing tables.
+3. If BUSY falls but pixels barely move, the next route is a shorter OTP bank
+   or a vendor-documented volatile LUT-load register, not waveform truncation.
+4. Test PTLW (`0x83`, `PMODE=1`) only as a secondary power/visual experiment;
    the datasheet says all gates still scan, so a large speed improvement is not
    expected.
-4. Only after obtaining the exact MTP layout and a vendor waveform file should
+5. Only after obtaining the exact MTP layout and a vendor waveform file should
    an external/custom LUT route be considered. MTP programming must remain a
    separate factory tool with readback, CRC and explicit recovery controls.
 
