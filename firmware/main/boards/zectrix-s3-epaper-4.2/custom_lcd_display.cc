@@ -1131,7 +1131,11 @@ void CustomLcdDisplay::read_busy() {
                      (unsigned)((now - start) * portTICK_PERIOD_MS));
             break;
         }
-        vTaskDelay(pdMS_TO_TICKS(5));
+        // One tick, not pdMS_TO_TICKS of something below the tick period.
+        // FREERTOS_HZ is 100 here, so pdMS_TO_TICKS(5) rounds to 0 and
+        // vTaskDelay(0) returns without yielding, turning this into a busy
+        // spin that starved IDLE and tripped the task watchdog.
+        vTaskDelay(1);
     }
 }
 
