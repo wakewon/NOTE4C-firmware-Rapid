@@ -112,6 +112,18 @@ config ZECTRIX_EPD_FAST_BW_CLEANUP_MS
         full-color refresh. It is skipped when no truncated refresh happened,
         and it also restores the DC balance the truncated ones skipped.
 
+config ZECTRIX_EPD_FAST_BW_CLEANUP_MIN_STREAK
+    int "Truncated refreshes required before a cleanup pass is worth it"
+    range 1 100
+    default 3
+    depends on ZECTRIX_EPD_FAST_BW
+    help
+        A cleanup pass locks the display for a full waveform, so running one
+        after a single truncated refresh made every isolated key press cost
+        11.5 s a few seconds later. Require this much accumulated ghosting
+        first. Anything below the threshold is still cleaned up by the
+        full-color refresh.
+
 config ZECTRIX_EPD_FAST_BW_TRUNCATE_MS
     int "Cut the fast waveform short after this many ms (0 disables)"
     range 0 20000

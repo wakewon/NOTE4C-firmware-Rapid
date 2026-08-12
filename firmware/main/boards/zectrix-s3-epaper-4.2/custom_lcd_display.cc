@@ -71,7 +71,7 @@ static uint32_t g_fast_bw_truncations_since_complete = 0;
 // Only a person looking at the panel can say how short the waveform may be
 // cut, so sweep the deadline across successive interactive refreshes: each
 // one uses real UI content and logs the deadline it ran with.
-static constexpr uint32_t kFastBwTruncSweep[] = {400, 300, 200, 150, 100, 50};
+static constexpr uint32_t kFastBwTruncSweep[] = {150, 130, 120, 110, 100, 90};
 static uint8_t g_fast_bw_trunc_index = 0;
 #endif
 
@@ -747,9 +747,13 @@ void CustomLcdDisplay::refresh_task_loop() {
         if (IsFourColorPanel() && bw_cleanup_armed_ &&
             TickDeadlineReached(now, bw_cleanup_deadline_)) {
             bw_cleanup_armed_ = false;
-            // Only worth a refresh if truncated waveforms actually left
-            // something to clean up.
-            bw_cleanup_pending_ = g_fast_bw_truncations_since_complete > 0;
+            // A single truncated refresh does not justify locking the display
+            // for 11.5 s; that made every isolated key press cost a full
+            // waveform a few seconds later. Wait until enough ghosting has
+            // actually accumulated. Anything below the threshold is still
+            // cleaned up by the full-color refresh.
+            bw_cleanup_pending_ = g_fast_bw_truncations_since_complete >=
+                                  CONFIG_ZECTRIX_EPD_FAST_BW_CLEANUP_MIN_STREAK;
         }
 #endif
         if (urgent_refresh) {
@@ -837,6 +841,16 @@ void CustomLcdDisplay::refresh_task_loop() {
         // controller work begins the waveform is intentionally not interrupted.
         if (idle_full && fast_bw_refresh_requested_) {
             idle_full = false;
+            fast_bw = true;
+            fast_bw_refresh_requested_ = false;
+            urgent_refresh = false;
+            urgent = true;
+        }
+        // Same courtesy for the cleanup pass: a key press arriving before the
+        // snapshot means the user is still working, so keep the interaction
+        // fast and let the cleanup re-arm from that press instead.
+        if (bw_cleanup && fast_bw_refresh_requested_) {
+            bw_cleanup = false;
             fast_bw = true;
             fast_bw_refresh_requested_ = false;
             urgent_refresh = false;
@@ -1117,7 +1131,7 @@ void CustomLcdDisplay::read_busy() {
                      (unsigned)((now - start) * portTICK_PERIOD_MS));
             break;
         }
-        vTaskDelay(pdMS_TO_TICKS(50));
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
 
