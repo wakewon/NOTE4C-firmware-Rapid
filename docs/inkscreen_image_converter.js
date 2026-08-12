@@ -12,6 +12,13 @@
  * 3. Apply Floyd-Steinberg dithering.
  * 4. Pack pixels into the raw format expected by /upload.
  *
+ * NOTE: for 2bpp colour output, tools/bwry produces visibly better results
+ * (measured palette, Lab colour matching, gamut compression, chroma gating)
+ * for the same 30,000-byte format. See tools/bwry/README.md. This file is kept
+ * because it is byte-for-byte what the device's own upload page does, which
+ * makes it the A/B baseline; tools/bwry/selftest.py asserts that equivalence.
+ * Do not "improve" the algorithm here without updating the firmware page too.
+ *
  * This file has no dependency for the core conversion functions. The optional
  * CLI uses `sharp` only for image decode/resize:
  *

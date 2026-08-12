@@ -64,3 +64,4 @@ server/firmware/
 *.tar.gz
 *.pbm
 .venv-esptool/
+.venv-imgtool/

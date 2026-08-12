@@ -1,0 +1,18 @@
+{
+  "name": "note4c-estimate-v1",
+  "display": "ZECTRIX Note4C 400x300 BWRY (SSD2683)",
+  "source": "estimate",
+  "notes": "Starting estimate for the BWRY ink set. NOT a measurement -- replace it: `bwryctl chart` -> photograph the panel -> `bwryctl calibrate`. Values are media-relative: the panel's own paper white is normalised to neutral 255 per channel, so the profile is independent of ambient level and of the illuminant's cast, and encodes only the relative lightness/hue/chroma of the four inks against their own paper. Derived from typical published E Ink Spectra BWRY reflectance figures (see measured_reflectance).",
+  "measured_reflectance": {
+    "assumed_white_reflectance": 0.35,
+    "assumed_black_reflectance": 0.044,
+    "assumed_contrast_ratio": 8.0,
+    "basis": "typical published figures for 4.2in E Ink Spectra black/white/red/yellow film"
+  },
+  "inks": [
+    { "name": "black",  "device_code": 0, "srgb": [99, 100, 103],  "hex": "#636467" },
+    { "name": "white",  "device_code": 1, "srgb": [255, 255, 255], "hex": "#FFFFFF" },
+    { "name": "yellow", "device_code": 2, "srgb": [201, 178, 82],  "hex": "#C9B252" },
+    { "name": "red",    "device_code": 3, "srgb": [150, 60, 55],   "hex": "#963C37" }
+  ]
+}

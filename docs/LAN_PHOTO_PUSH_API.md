@@ -250,13 +250,36 @@ curl -X POST "http://192.168.110.238/settings" \
 
 ## NAS 定时任务示例
 
-本目录提供了一个可复用转换脚本：
+### 推荐：`tools/bwry`（画质更好）
+
+四色转换推荐用 [`tools/bwry`](../tools/bwry/README.md)。它用实测 palette、Lab 选色、
+色域压缩和 chroma gate，相比下面的 JS 版本明显减少灰墙/天空/肤色暗部上的红黄彩噪。
+输出格式完全一致，仍然是 400×300 2bpp 30000 字节。
+
+```bash
+python3 -m venv .venv-imgtool
+.venv-imgtool/bin/pip install -r tools/bwry/requirements.txt
+
+.venv-imgtool/bin/python tools/bwry/bwryctl.py convert input.jpg daily_400x300_2bpp.bin --preset photo
+```
+
+也可以让它直接推送，省掉下面的 curl：
+
+```bash
+.venv-imgtool/bin/python tools/bwry/bwryctl.py convert input.jpg daily.bin \
+  --preset photo --push http://192.168.110.238
+```
+
+内容类型不同建议换 preset：照片 `photo`、插画海报 `illustration`、截图文档 `text`。
+
+### 兼容：`docs/inkscreen_image_converter.js`
 
 ```text
 docs/inkscreen_image_converter.js
 ```
 
-它抽取自设备管理 HTML 页面中的转换算法，用于把普通图片转换为设备 `/upload` 接口需要的原始 bin。命令行模式依赖 `sharp` 解码和缩放图片：
+它抽取自设备管理 HTML 页面中的转换算法，与设备网页上传的结果逐字节一致，
+需要 1BP 黑白输出或不想引入 Python 依赖时使用。命令行模式依赖 `sharp` 解码和缩放图片：
 
 ```bash
 npm install sharp
