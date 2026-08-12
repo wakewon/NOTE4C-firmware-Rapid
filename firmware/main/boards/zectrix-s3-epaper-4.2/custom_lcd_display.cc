@@ -781,7 +781,13 @@ void CustomLcdDisplay::refresh_task_loop() {
 
         // 周期性采样：按 last_sample_tick 计时，非刷新结束时间
         TickType_t min_ticks = pdMS_TO_TICKS(sample_interval_ms);
-        if (!urgent) {
+        // force_full and idle_full must be exempt, exactly as they are in the
+        // debounce below. Their pending flags were already consumed into the
+        // locals above, so throttling one here discarded it permanently: the
+        // recovery refresh was left both unarmed and unpending, and no
+        // full-color refresh happened again until the next key press re-armed
+        // the timer.
+        if (!urgent && !force_full && !idle_full) {
             TickType_t elapsed = (last_sample_tick == 0) ? min_ticks : (now - last_sample_tick);
             if (elapsed < min_ticks) {
                 stat_skip_throttle++;

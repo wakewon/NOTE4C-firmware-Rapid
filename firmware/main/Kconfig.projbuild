@@ -92,7 +92,7 @@ endchoice
 config ZECTRIX_EPD_FAST_BW_IDLE_FULL_SECONDS
     int "Idle seconds before full-color recovery"
     range 5 3600
-    default 60
+    default 30
     depends on ZECTRIX_EPD_FAST_BW
     help
         Restart this timer after every interactive FAST_BW request. Once no
