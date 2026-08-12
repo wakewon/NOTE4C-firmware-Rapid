@@ -1620,6 +1620,22 @@ void CustomLcdDisplay::EPD_DisplayFastBw() {
              EffectiveFastBwPsr1(), EffectiveFastBwPll(), EffectiveFastBwTsset());
     AdvanceFastBwSweep();
 
+    if (truncated) {
+        // POF does not abort a running refresh: the controller finishes the
+        // waveform first and only then acts on it, which put the whole 10 s
+        // back into POF's own busy wait. Assert reset to stop the driver where
+        // it stands, then cut the panel supply. DSLP is skipped because it
+        // needs a controller that is still running a command queue; the next
+        // EPD_InitFastBw powers up and resets again anyway.
+        // Reset stays asserted while the supply is off so nothing is driven
+        // into an unpowered chip; both init paths begin by powering up and
+        // pulsing reset themselves.
+        set_rst_0();
+        vTaskDelay(pdMS_TO_TICKS(2));
+        EPD_PowerOff();
+        return;
+    }
+
     EPD_SendCommand(0x02);  // POF
     EPD_SendData(0x00);
     read_busy();
