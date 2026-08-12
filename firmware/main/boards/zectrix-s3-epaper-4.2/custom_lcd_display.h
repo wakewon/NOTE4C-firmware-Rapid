@@ -121,6 +121,7 @@ private:
     void SPI_SendByte(uint8_t data);
     uint8_t SPI_RecvByte();
     uint8_t EPD_RecvData();
+    bool read_busy_until(uint32_t timeout_ms);
     void EPD_ReadBytes(uint8_t *buf, size_t len);
     void EPD_ReadRegister(uint8_t command, uint8_t *buf, size_t len);
     void EPD_PowerOn();
@@ -171,6 +172,12 @@ private:
     bool idle_full_refresh_pending_ = false;
     bool idle_full_refresh_armed_ = false;
     TickType_t idle_full_refresh_deadline_ = 0;
+    // Middle rung of the refresh ladder: once the keys stop, one complete
+    // black-and-white waveform cleans up what the truncated ones left behind,
+    // well before the minute-long wait for the full-color refresh.
+    bool bw_cleanup_pending_ = false;
+    bool bw_cleanup_armed_ = false;
+    TickType_t bw_cleanup_deadline_ = 0;
     TickType_t last_sample_tick = 0;
     int sample_interval_ms = 300; // 节流：采样间隔（可调 200~800）
 

@@ -33,6 +33,11 @@ static constexpr int kFourColorSampleIntervalMs = 12000;
 #if CONFIG_ZECTRIX_EPD_FAST_BW
 static constexpr uint32_t kFastBwIdleFullMs =
     CONFIG_ZECTRIX_EPD_FAST_BW_IDLE_FULL_SECONDS * 1000U;
+static constexpr uint32_t kFastBwCleanupMs = CONFIG_ZECTRIX_EPD_FAST_BW_CLEANUP_MS;
+
+// Set for the one refresh that must run its waveform to completion, either
+// because the keys have stopped or because too many truncated ones piled up.
+static bool g_fast_bw_force_complete = false;
 
 #if CONFIG_ZECTRIX_EPD_FAST_BW_TIMING_VENDOR
 static constexpr uint8_t kFastBwPll = 0x08;  // dynamic, 12.5 Hz
@@ -57,6 +62,27 @@ static constexpr const char *kFastBwTimingName = "ultra-fixed-120Hz-2ms";
 static constexpr uint8_t kFastBwPllSweep[] = {0x08, 0x07, 0x05, 0x0E, 0x3A, 0x3C};
 static uint8_t g_fast_bw_pll_index = 0;
 #endif
+
+// Consecutive truncated waveforms since the last complete one. Truncation
+// leaves net DC on the pixels, so this bounds how much can accumulate.
+static uint32_t g_fast_bw_truncations_since_complete = 0;
+
+#if CONFIG_ZECTRIX_EPD_FAST_BW_TRUNCATE_SWEEP
+// Only a person looking at the panel can say how short the waveform may be
+// cut, so sweep the deadline across successive interactive refreshes: each
+// one uses real UI content and logs the deadline it ran with.
+static constexpr uint32_t kFastBwTruncSweep[] = {3000, 2000, 1500, 1000, 700, 400};
+static uint8_t g_fast_bw_trunc_index = 0;
+#endif
+
+// The truncation deadline in ms for the next waveform; 0 disables truncation.
+static inline uint32_t EffectiveFastBwTruncateMs() {
+#if CONFIG_ZECTRIX_EPD_FAST_BW_TRUNCATE_SWEEP
+    return kFastBwTruncSweep[g_fast_bw_trunc_index];
+#else
+    return CONFIG_ZECTRIX_EPD_FAST_BW_TRUNCATE_MS;
+#endif
+}
 
 #if CONFIG_ZECTRIX_EPD_FAST_BW_PSR_SWEEP
 // Per the SSD2683 Rev 0.20 command table, the second PSR byte carries LUT_EN
@@ -115,7 +141,9 @@ static inline uint8_t EffectiveFastBwPll() {
 // At most one sweep is active at a time. These two helpers let the boot-time
 // harness drive whichever one it is without knowing which.
 static constexpr int kFastBwSweepLen =
-#if CONFIG_ZECTRIX_EPD_FAST_BW_PSR_SWEEP
+#if CONFIG_ZECTRIX_EPD_FAST_BW_TRUNCATE_SWEEP
+    static_cast<int>(sizeof(kFastBwTruncSweep) / sizeof(kFastBwTruncSweep[0]));
+#elif CONFIG_ZECTRIX_EPD_FAST_BW_PSR_SWEEP
     static_cast<int>(sizeof(kFastBwPsrSweep) / sizeof(kFastBwPsrSweep[0]));
 #elif CONFIG_ZECTRIX_EPD_FAST_BW_TSSET_SWEEP
     static_cast<int>(sizeof(kFastBwTssetSweep) / sizeof(kFastBwTssetSweep[0]));
@@ -126,6 +154,9 @@ static constexpr int kFastBwSweepLen =
 #endif
 
 static inline void AdvanceFastBwSweep() {
+#if CONFIG_ZECTRIX_EPD_FAST_BW_TRUNCATE_SWEEP
+    g_fast_bw_trunc_index = static_cast<uint8_t>((g_fast_bw_trunc_index + 1) % kFastBwSweepLen);
+#endif
 #if CONFIG_ZECTRIX_EPD_FAST_BW_PSR_SWEEP
     g_fast_bw_psr_index = static_cast<uint8_t>((g_fast_bw_psr_index + 1) % kFastBwSweepLen);
 #endif
@@ -549,6 +580,9 @@ void CustomLcdDisplay::ArmIdleFullRefreshLocked(TickType_t now) {
     idle_full_refresh_deadline_ = now + pdMS_TO_TICKS(kFastBwIdleFullMs);
     idle_full_refresh_armed_ = true;
     idle_full_refresh_pending_ = false;
+    bw_cleanup_deadline_ = now + pdMS_TO_TICKS(kFastBwCleanupMs);
+    bw_cleanup_armed_ = true;
+    bw_cleanup_pending_ = false;
 #else
     (void)now;
 #endif
@@ -700,6 +734,7 @@ void CustomLcdDisplay::refresh_task_loop() {
         bool force_full = false;
         bool fast_bw = false;
         bool idle_full = false;
+        bool bw_cleanup = false;
         Rect r = {0, 0, 0, 0};
 
         xSemaphoreTake(dirty_mutex, portMAX_DELAY);
@@ -708,6 +743,13 @@ void CustomLcdDisplay::refresh_task_loop() {
             TickDeadlineReached(now, idle_full_refresh_deadline_)) {
             idle_full_refresh_armed_ = false;
             idle_full_refresh_pending_ = true;
+        }
+        if (IsFourColorPanel() && bw_cleanup_armed_ &&
+            TickDeadlineReached(now, bw_cleanup_deadline_)) {
+            bw_cleanup_armed_ = false;
+            // Only worth a refresh if truncated waveforms actually left
+            // something to clean up.
+            bw_cleanup_pending_ = g_fast_bw_truncations_since_complete > 0;
         }
 #endif
         if (urgent_refresh) {
@@ -726,7 +768,17 @@ void CustomLcdDisplay::refresh_task_loop() {
             idle_full = true;
             idle_full_refresh_pending_ = false;
         }
+        if (bw_cleanup_pending_) {
+            bw_cleanup = true;
+            bw_cleanup_pending_ = false;
+        }
+        if (bw_cleanup && !force_full && !idle_full) {
+            // The cleanup pass is an ordinary FAST_BW refresh that is not
+            // allowed to truncate.
+            fast_bw = true;
+        }
         if (force_full || idle_full) {
+            bw_cleanup = false;
             // An already-due explicit/recovery FULL_COLOR wins this harvest.
             // A later button event can still cancel it before the snapshot or
             // enqueue another FAST_BW update after controller work has begun.
@@ -799,7 +851,7 @@ void CustomLcdDisplay::refresh_task_loop() {
         FrameDiffResult result = analyze_frame_diff(prev_buffer, tx_buf, Width, Height);
 
         // 快速退出：没有任何变化
-        if (result.diff_bits == 0 && !force_full && !idle_full) {
+        if (result.diff_bits == 0 && !force_full && !idle_full && !bw_cleanup) {
             tiny_diff_streak = 0;
             tiny_diff_accum_bits = 0;
             tiny_diff_first_tick = 0;
@@ -820,7 +872,8 @@ void CustomLcdDisplay::refresh_task_loop() {
 
         // 可选：过滤超小差异（防止抗锯齿/边界振荡导致的无意义刷新）
         // 注意：不立即同步 prev_buffer，避免累计误差；达到阈值后再强制刷新
-        if (!urgent && !force_full && !idle_full && result.diff_ratio < kMinDiffBitRatio) {
+        if (!urgent && !force_full && !idle_full && !bw_cleanup &&
+            result.diff_ratio < kMinDiffBitRatio) {
             if (tiny_diff_streak == 0) {
                 tiny_diff_first_tick = last_sample_tick;
             }
@@ -912,9 +965,13 @@ void CustomLcdDisplay::refresh_task_loop() {
         } else if (IsFourColorPanel() && fast_bw) {
             stat_fast_bw++;
             ESP_LOGW(TAG, "[ULTRA_BW] start timing=%s source=%s; colors mapped to black/white",
-                     kFastBwTimingName, fast_bw_promoted ? "promoted_dirty_rect" : "requested");
+                     kFastBwTimingName,
+                     bw_cleanup ? "bw_cleanup"
+                                : (fast_bw_promoted ? "promoted_dirty_rect" : "requested"));
+            g_fast_bw_force_complete = bw_cleanup;
             EPD_InitFastBw();
             EPD_DisplayFastBw();
+            g_fast_bw_force_complete = false;
             memcpy(prev_buffer, tx_buf, lcd_spi_data.buffer_len);
             prev_buffer_synced = true;
             ESP_LOGW(TAG, "[ULTRA_BW] complete in %u ms; FULL_COLOR idle timer remains armed",
@@ -1062,6 +1119,20 @@ void CustomLcdDisplay::read_busy() {
         }
         vTaskDelay(pdMS_TO_TICKS(50));
     }
+}
+
+bool CustomLcdDisplay::read_busy_until(uint32_t timeout_ms) {
+    const int busy = lcd_spi_data.busy;
+    const TickType_t start = xTaskGetTickCount();
+    const TickType_t limit = pdMS_TO_TICKS(timeout_ms);
+
+    while (gpio_get_level((gpio_num_t)busy) == 0) {
+        if ((xTaskGetTickCount() - start) >= limit) {
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    return true;
 }
 
 // =======================================================
@@ -1516,10 +1587,36 @@ void CustomLcdDisplay::EPD_DisplayFastBw() {
              static_cast<unsigned>((waveform_started - transfer_started) * portTICK_PERIOD_MS));
     EPD_SendCommand(0x12);  // DRF: execute the selected fast OTP waveform
     EPD_SendData(0x00);
-    read_busy();
+
+    bool truncated = false;
+    const uint32_t truncate_ms = EffectiveFastBwTruncateMs();
+    // The OTP waveform is a four-color one; its later phases exist to move the
+    // yellow and red pigment and contribute nothing to black-and-white
+    // content, which is already legible after the first drive. Cut the wait
+    // short and fall through to the normal power-off below.
+    //
+    // This deliberately breaks the waveform's DC balance, and accumulated DC
+    // bias is what causes permanent image sticking on e-paper. Two things
+    // bound it: the idle full-color recovery, and the consecutive-truncation
+    // cap that forces one complete waveform.
+    if (truncate_ms > 0 && !g_fast_bw_force_complete &&
+        g_fast_bw_truncations_since_complete <
+            CONFIG_ZECTRIX_EPD_FAST_BW_TRUNCATE_MAX_STREAK) {
+        truncated = !read_busy_until(truncate_ms);
+    }
+    if (!truncated) {
+        read_busy();
+        g_fast_bw_truncations_since_complete = 0;
+    } else {
+        g_fast_bw_truncations_since_complete++;
+    }
     const TickType_t waveform_finished = xTaskGetTickCount();
-    ESP_LOGW(TAG, "[ULTRA_BW] waveform BUSY=%u ms PSR1=0x%02X PLL=0x%02X TSSET=0x%02X",
+    ESP_LOGW(TAG,
+             "[ULTRA_BW] waveform BUSY=%u ms cut_at=%u ms truncated=%d streak=%u "
+             "PSR1=0x%02X PLL=0x%02X TSSET=0x%02X",
              static_cast<unsigned>((waveform_finished - waveform_started) * portTICK_PERIOD_MS),
+             static_cast<unsigned>(truncate_ms), truncated ? 1 : 0,
+             static_cast<unsigned>(g_fast_bw_truncations_since_complete),
              EffectiveFastBwPsr1(), EffectiveFastBwPll(), EffectiveFastBwTsset());
     AdvanceFastBwSweep();
 

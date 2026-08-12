@@ -99,6 +99,60 @@ config ZECTRIX_EPD_FAST_BW_IDLE_FULL_SECONDS
         new request has arrived for this many seconds, perform one standard
         full-screen four-color refresh to restore colors and reduce ghosting.
 
+config ZECTRIX_EPD_FAST_BW_CLEANUP_MS
+    int "Idle ms before one complete black-and-white waveform"
+    range 500 60000
+    default 3000
+    depends on ZECTRIX_EPD_FAST_BW
+    help
+        Middle rung of the refresh ladder. Truncated waveforms give immediate
+        feedback while keys are being pressed but leave ghosting behind; once
+        input stops for this long, one complete black-and-white waveform runs
+        to clean the image up, well before the minute-long wait for the
+        full-color refresh. It is skipped when no truncated refresh happened,
+        and it also restores the DC balance the truncated ones skipped.
+
+config ZECTRIX_EPD_FAST_BW_TRUNCATE_MS
+    int "Cut the fast waveform short after this many ms (0 disables)"
+    range 0 20000
+    default 0
+    depends on ZECTRIX_EPD_FAST_BW
+    help
+        The panel's OTP holds only four-color waveforms. Their later phases
+        move the yellow and red pigment and contribute nothing to
+        black-and-white content, which is already legible after the first
+        drive. Stopping the wait early and powering off turns the roughly
+        11.5 s fast refresh into whatever value is set here.
+
+        This breaks the waveform's DC balance on purpose. Accumulated DC bias
+        is the known cause of permanent image sticking on e-paper, so it is
+        bounded by ZECTRIX_EPD_FAST_BW_TRUNCATE_MAX_STREAK and by the idle
+        full-color recovery. Start high and lower it only as far as the image
+        stays acceptable.
+
+config ZECTRIX_EPD_FAST_BW_TRUNCATE_MAX_STREAK
+    int "Consecutive truncated waveforms before forcing a complete one"
+    range 1 1000
+    default 20
+    depends on ZECTRIX_EPD_FAST_BW
+    help
+        After this many truncated refreshes in a row, the next one waits for
+        the waveform to finish, which restores the DC balance the truncated
+        ones skipped. Lower is safer for the panel and costs one full-length
+        refresh more often.
+
+config ZECTRIX_EPD_FAST_BW_TRUNCATE_SWEEP
+    bool "Sweep the truncation deadline across successive fast refreshes"
+    default n
+    depends on ZECTRIX_EPD_FAST_BW
+    help
+        Only a person looking at the panel can judge how short the waveform may
+        be cut, so this ignores the fixed deadline and uses 3000, 2000, 1500,
+        1000, 700 then 400 ms on successive interactive refreshes, logging the
+        deadline each one ran with. Six ordinary interactions therefore show
+        the whole range against real UI content. Disable once a value is
+        chosen.
+
 config ZECTRIX_EPD_FAST_BW_PLL_SWEEP
     bool "Sweep PLL values across successive fast refreshes (diagnostic)"
     default y
