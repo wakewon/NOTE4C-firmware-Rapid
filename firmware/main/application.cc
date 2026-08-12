@@ -147,12 +147,12 @@ void Application::Initialize() {
 
     auto* lcd = static_cast<CustomLcdDisplay*>(display);
     rawdraw_ui_manager_ = std::make_unique<ui::RawDrawUiManager>();
-    rawdraw_ui_manager_->Init(lcd, [lcd](const rawdraw::Rect&, bool urgent) {
-        if (urgent) {
-            lcd->RequestUrgentFullRefresh();
-        } else {
-            lcd->RequestUrgentRefresh();
-        }
+    rawdraw_ui_manager_->Init(lcd, [lcd](const rawdraw::Rect&, bool) {
+        // Page changes, cursor movement and button-driven UI changes all use
+        // the same low-latency interaction path on SSD2683. The display driver
+        // owns the one-minute idle timer and performs the eventual full-color
+        // recovery. On a monochrome panel this falls back to urgent refresh.
+        lcd->RequestFastBwRefresh();
     });
 
     if (auto* sr = rawdraw_ui_manager_->GetSettingsRenderer()) {

@@ -432,8 +432,10 @@ void RawDrawUiManager::Init(CustomLcdDisplay* lcd, RefreshCallback refresh_cb) {
 
         if (mutex) xSemaphoreGive(mutex);
 
-        // Trigger initial full refresh
-        TriggerRefresh(true);
+        // Establish a known full-color baseline at boot. Later page changes,
+        // cursor moves and button-driven updates go through the FAST_BW
+        // callback and arm the idle recovery timer.
+        lcd_->RequestUrgentFullRefresh();
     }
 
     ESP_LOGI(kTag, "RawDraw UI Manager initialized: %dx%d, page=%s",
@@ -709,7 +711,9 @@ void RawDrawUiManager::StopLanHttpServer() {
 
 bool RawDrawUiManager::HandleInput(const rawdraw::ButtonEvent& event) {
     const bool navigation_click = IsNavigationClick(event);
-    if (navigation_click && input_refresh_locked_.load(std::memory_order_acquire)) {
+    const bool queue_input_during_refresh = lcd_ && lcd_->AllowsInputDuringRefresh();
+    if (navigation_click && !queue_input_during_refresh &&
+        input_refresh_locked_.load(std::memory_order_acquire)) {
         ESP_LOGI(kTag, "Navigation click ignored until current refresh completes: type=%d", event.type);
         return true;
     }
@@ -829,7 +833,7 @@ bool RawDrawUiManager::HandleInput(const rawdraw::ButtonEvent& event) {
     bool handled = renderer->HandleInput(event);
 
     if (handled) {
-        if (navigation_click) {
+        if (navigation_click && !queue_input_during_refresh) {
             input_refresh_locked_.store(true, std::memory_order_release);
         }
         // Re-render the framebuffer with updated state

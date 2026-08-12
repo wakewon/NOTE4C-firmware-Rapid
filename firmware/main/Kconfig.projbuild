@@ -22,8 +22,8 @@ choice ZECTRIX_EPD_PANEL_TYPE
     depends on BOARD_TYPE_ZECTRIX_S3_EPAPER_4_2
     help
         Select the e-paper panel connected to the board. The 4-color option
-        keeps the existing 1bpp UI framebuffer and converts it to the SSD2683
-        2bpp wire format during refresh.
+        keeps a semantic 2bpp BWRY UI framebuffer and sends the SSD2683 2bpp
+        wire format during refresh. The 1bpp panel build down-converts it.
 
 config ZECTRIX_EPD_PANEL_1BPP
     bool "1bpp black/white EPD"
@@ -40,5 +40,27 @@ config ZECTRIX_EPD_4COLOR_BOOT_TEST_PATTERN
     help
         Show black/white/red/yellow vertical bars once during display
         initialization so a newly connected 4-color panel can be verified.
+
+config ZECTRIX_EPD_FAST_BW
+    bool "Use SSD2683 OTP fast waveform for interactive B/W refresh"
+    default y
+    depends on ZECTRIX_EPD_PANEL_4COLOR_SSD2683
+    help
+        Use the SSD2683 fast-waveform selection sequence published for the
+        400x300 GDEM042F86 controller path. Interactive framebuffer updates
+        are reduced to black/white and use this waveform. A standard color
+        refresh remains available and is automatically run after the idle
+        timeout below. Disable this option if a panel batch does not contain
+        a compatible fast waveform in OTP.
+
+config ZECTRIX_EPD_FAST_BW_IDLE_FULL_SECONDS
+    int "Idle seconds before full-color recovery"
+    range 5 3600
+    default 60
+    depends on ZECTRIX_EPD_FAST_BW
+    help
+        Restart this timer after every interactive FAST_BW request. Once no
+        new request has arrived for this many seconds, perform one standard
+        full-screen four-color refresh to restore colors and reduce ghosting.
 
 endmenu

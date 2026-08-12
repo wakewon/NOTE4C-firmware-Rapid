@@ -15,6 +15,7 @@
 #endif
 #include "settings.h"
 #include "custom_lcd_display.h"
+#include "ssd2683_fast_bw.h"
 #include "rawdraw/rawdraw.h"
 #include "rawdraw/framebuffer.h"
 #include "common/sleep_manager.h"
@@ -29,6 +30,10 @@ LV_FONT_DECLARE(weather_icons_48);   // Weather icons 48px (FontAwesome)
 #define TAG "CustomLcdDisplay"
 static constexpr uint32_t kDisplayKickMs = 1000;
 static constexpr int kFourColorSampleIntervalMs = 12000;
+#if CONFIG_ZECTRIX_EPD_FAST_BW
+static constexpr uint32_t kFastBwIdleFullMs =
+    CONFIG_ZECTRIX_EPD_FAST_BW_IDLE_FULL_SECONDS * 1000U;
+#endif
 
 #ifndef EXAMPLE_LCD_WIDTH
 #define EXAMPLE_LCD_WIDTH  400
@@ -110,6 +115,11 @@ static inline uint8_t Pack2bppRowTo1bppByte(const uint8_t* row_2bpp, int pixel_x
         }
     }
     return out;
+}
+
+static inline bool TickDeadlineReached(TickType_t now, TickType_t deadline) {
+    return ssd2683_fast_bw::DeadlineReached(static_cast<uint32_t>(now),
+                                            static_cast<uint32_t>(deadline));
 }
 
 // =======================================================
@@ -349,12 +359,16 @@ void CustomLcdDisplay::stop_refresh_task() {
 }
 
 void CustomLcdDisplay::UpdateDisplayBusyLocked() {
-    const bool busy = pending || urgent_refresh || force_full_refresh_ || refresh_in_progress;
+    const bool busy = pending || urgent_refresh || force_full_refresh_ ||
+                      fast_bw_refresh_requested_ || idle_full_refresh_pending_ ||
+                      refresh_in_progress;
     sm_set_busy(SleepBusySrc::Display, busy);
 }
 
 bool CustomLcdDisplay::CheckRefreshIdleLocked() {
-    const bool busy = pending || urgent_refresh || force_full_refresh_ || refresh_in_progress;
+    const bool busy = pending || urgent_refresh || force_full_refresh_ ||
+                      fast_bw_refresh_requested_ || idle_full_refresh_pending_ ||
+                      refresh_in_progress;
     if (busy) {
         refresh_busy_seen_ = true;
         return false;
@@ -370,14 +384,30 @@ bool CustomLcdDisplay::IsRefreshPending() {
     if (dirty_mutex) {
         xSemaphoreTake(dirty_mutex, portMAX_DELAY);
     }
-    const bool busy = pending || urgent_refresh || force_full_refresh_ || refresh_in_progress;
+    const bool busy = pending || urgent_refresh || force_full_refresh_ ||
+                      fast_bw_refresh_requested_ || idle_full_refresh_pending_ ||
+                      refresh_in_progress;
     if (dirty_mutex) {
         xSemaphoreGive(dirty_mutex);
     }
     return busy;
 }
 
+bool CustomLcdDisplay::AllowsInputDuringRefresh() const {
+#if CONFIG_ZECTRIX_EPD_FAST_BW
+    return IsFourColorPanel();
+#else
+    return false;
+#endif
+}
+
 void CustomLcdDisplay::RequestUrgentRefresh() {
+#if CONFIG_ZECTRIX_EPD_FAST_BW
+    if (IsFourColorPanel()) {
+        RequestFastBwRefresh();
+        return;
+    }
+#endif
     if (dirty_mutex) {
         xSemaphoreTake(dirty_mutex, portMAX_DELAY);
     }
@@ -396,12 +426,69 @@ void CustomLcdDisplay::RequestUrgentRefresh() {
     }
 }
 
+void CustomLcdDisplay::ArmIdleFullRefreshLocked(TickType_t now) {
+#if CONFIG_ZECTRIX_EPD_FAST_BW
+    idle_full_refresh_deadline_ = now + pdMS_TO_TICKS(kFastBwIdleFullMs);
+    idle_full_refresh_armed_ = true;
+    idle_full_refresh_pending_ = false;
+#else
+    (void)now;
+#endif
+}
+
+void CustomLcdDisplay::RequestFastBwRefresh() {
+#if !CONFIG_ZECTRIX_EPD_FAST_BW
+    RequestUrgentRefresh();
+    return;
+#else
+    if (!IsFourColorPanel()) {
+        // Keep the API usable for the alternate monochrome build without
+        // arming a color-recovery timer that panel does not need.
+        if (dirty_mutex) {
+            xSemaphoreTake(dirty_mutex, portMAX_DELAY);
+        }
+        urgent_refresh = true;
+        refresh_in_progress = true;
+        UpdateDisplayBusyLocked();
+        if (dirty_mutex) {
+            xSemaphoreGive(dirty_mutex);
+        }
+        sm_kick(kDisplayKickMs, "display_fast_bw_fallback");
+        if (refresh_task) {
+            xTaskNotifyGive(refresh_task);
+        }
+        return;
+    }
+
+    if (dirty_mutex) {
+        xSemaphoreTake(dirty_mutex, portMAX_DELAY);
+    }
+    urgent_refresh = true;
+    fast_bw_refresh_requested_ = true;
+    refresh_in_progress = true;
+    ArmIdleFullRefreshLocked(xTaskGetTickCount());
+    const uint32_t kick_ms = (next_kick_ms_ > 0) ? next_kick_ms_ : kFourColorSampleIntervalMs;
+    next_kick_ms_ = 0;
+    UpdateDisplayBusyLocked();
+    if (dirty_mutex) {
+        xSemaphoreGive(dirty_mutex);
+    }
+    sm_kick(kick_ms, "display_fast_bw");
+    if (refresh_task) {
+        xTaskNotifyGive(refresh_task);
+    }
+#endif
+}
+
 void CustomLcdDisplay::RequestUrgentFullRefresh() {
     if (dirty_mutex) {
         xSemaphoreTake(dirty_mutex, portMAX_DELAY);
     }
     urgent_refresh = true;
     force_full_refresh_ = true;
+    fast_bw_refresh_requested_ = false;
+    idle_full_refresh_pending_ = false;
+    idle_full_refresh_armed_ = false;
     refresh_in_progress = true;
     const uint32_t default_kick_ms = IsFourColorPanel() ? (uint32_t)sample_interval_ms : kDisplayKickMs;
     const uint32_t kick_ms = (next_kick_ms_ > 0) ? next_kick_ms_ : default_kick_ms;
@@ -450,6 +537,8 @@ void CustomLcdDisplay::refresh_task_loop() {
     uint32_t stat_refresh = 0;
     uint32_t stat_full = 0;
     uint32_t stat_partial = 0;
+    uint32_t stat_fast_bw = 0;
+    uint32_t stat_idle_full = 0;
     uint32_t stat_urgent = 0;
     uint32_t stat_skip_throttle = 0;
     uint32_t stat_skip_nodiff = 0;
@@ -473,9 +562,10 @@ void CustomLcdDisplay::refresh_task_loop() {
         }
         if ((now_tick - last_stat_tick) >= kStatPeriodTicks) {
             ESP_LOGI(TAG,
-                     "[REFRESH] Stat 3s: refresh=%u (full=%u, partial=%u, urgent=%u), "
+                     "[REFRESH] Stat 3s: refresh=%u (full=%u, partial=%u, fast_bw=%u, idle_full=%u, urgent=%u), "
                      "skip(throttle=%u, nodiff=%u, tiny=%u, tiny_forced=%u)",
                      (unsigned)stat_refresh, (unsigned)stat_full, (unsigned)stat_partial,
+                     (unsigned)stat_fast_bw, (unsigned)stat_idle_full,
                      (unsigned)stat_urgent, (unsigned)stat_skip_throttle,
                      (unsigned)stat_skip_nodiff, (unsigned)stat_skip_tiny,
                      (unsigned)stat_tiny_forced);
@@ -490,9 +580,18 @@ void CustomLcdDisplay::refresh_task_loop() {
 
         bool urgent = false;
         bool force_full = false;
+        bool fast_bw = false;
+        bool idle_full = false;
         Rect r = {0, 0, 0, 0};
 
         xSemaphoreTake(dirty_mutex, portMAX_DELAY);
+#if CONFIG_ZECTRIX_EPD_FAST_BW
+        if (IsFourColorPanel() && idle_full_refresh_armed_ &&
+            TickDeadlineReached(now, idle_full_refresh_deadline_)) {
+            idle_full_refresh_armed_ = false;
+            idle_full_refresh_pending_ = true;
+        }
+#endif
         if (urgent_refresh) {
             urgent = true;
             urgent_refresh = false;
@@ -501,6 +600,20 @@ void CustomLcdDisplay::refresh_task_loop() {
             force_full = true;
             force_full_refresh_ = false;
         }
+        if (fast_bw_refresh_requested_) {
+            fast_bw = true;
+            fast_bw_refresh_requested_ = false;
+        }
+        if (idle_full_refresh_pending_) {
+            idle_full = true;
+            idle_full_refresh_pending_ = false;
+        }
+        if (force_full || idle_full) {
+            // An already-due explicit/recovery FULL_COLOR wins this harvest.
+            // A later button event can still cancel it before the snapshot or
+            // enqueue another FAST_BW update after controller work has begun.
+            fast_bw = false;
+        }
         if (pending && rect_area(dirty) > 0) {
             r = dirty;
             dirty = {0, 0, 0, 0};
@@ -508,7 +621,7 @@ void CustomLcdDisplay::refresh_task_loop() {
             ESP_LOGI(TAG, "[REFRESH] Got dirty rect: x=%d, y=%d, w=%d, h=%d, area=%d",
                      r.x, r.y, r.w, r.h, rect_area(r));
         }
-        if (urgent || rect_area(r) > 0) {
+        if (urgent || force_full || idle_full || fast_bw || rect_area(r) > 0) {
             refresh_in_progress = true;
         }
         UpdateDisplayBusyLocked();
@@ -530,7 +643,8 @@ void CustomLcdDisplay::refresh_task_loop() {
         }
 
         // debounce merge
-        TickType_t debounce_ticks = (urgent || force_full) ? kUrgentDebounceTicks : kDebounceTicks;
+        TickType_t debounce_ticks = (urgent || force_full || idle_full)
+            ? kUrgentDebounceTicks : kDebounceTicks;
         TickType_t t0 = xTaskGetTickCount();
         while (debounce_ticks > 0 && (xTaskGetTickCount() - t0) < debounce_ticks) {
             ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5));
@@ -547,6 +661,18 @@ void CustomLcdDisplay::refresh_task_loop() {
 
         // Take full-frame snapshot into tx_buf under mutex (avoid tearing)
         xSemaphoreTake(dirty_mutex, portMAX_DELAY);
+#if CONFIG_ZECTRIX_EPD_FAST_BW
+        // A user operation that lands just as the idle timer expires cancels
+        // the not-yet-snapshotted recovery refresh and restarts FAST_BW. Once
+        // controller work begins the waveform is intentionally not interrupted.
+        if (idle_full && fast_bw_refresh_requested_) {
+            idle_full = false;
+            fast_bw = true;
+            fast_bw_refresh_requested_ = false;
+            urgent_refresh = false;
+            urgent = true;
+        }
+#endif
         memcpy(tx_buf, buffer, lcd_spi_data.buffer_len);
         xSemaphoreGive(dirty_mutex);
         last_sample_tick = xTaskGetTickCount();
@@ -555,7 +681,7 @@ void CustomLcdDisplay::refresh_task_loop() {
         FrameDiffResult result = analyze_frame_diff(prev_buffer, tx_buf, Width, Height);
 
         // 快速退出：没有任何变化
-        if (result.diff_bits == 0 && !force_full) {
+        if (result.diff_bits == 0 && !force_full && !idle_full) {
             tiny_diff_streak = 0;
             tiny_diff_accum_bits = 0;
             tiny_diff_first_tick = 0;
@@ -563,7 +689,6 @@ void CustomLcdDisplay::refresh_task_loop() {
             maybe_log_stats(last_sample_tick);
             bool fire_idle_cb = false;
             xSemaphoreTake(dirty_mutex, portMAX_DELAY);
-            urgent_refresh = false;
             refresh_in_progress = false;
             UpdateDisplayBusyLocked();
             fire_idle_cb = CheckRefreshIdleLocked();
@@ -577,7 +702,7 @@ void CustomLcdDisplay::refresh_task_loop() {
 
         // 可选：过滤超小差异（防止抗锯齿/边界振荡导致的无意义刷新）
         // 注意：不立即同步 prev_buffer，避免累计误差；达到阈值后再强制刷新
-        if (!urgent && !force_full && result.diff_ratio < kMinDiffBitRatio) {
+        if (!urgent && !force_full && !idle_full && result.diff_ratio < kMinDiffBitRatio) {
             if (tiny_diff_streak == 0) {
                 tiny_diff_first_tick = last_sample_tick;
             }
@@ -612,13 +737,14 @@ void CustomLcdDisplay::refresh_task_loop() {
 
         // Decide FULL vs PARTIAL
         bool should_full = !prev_buffer_synced || !prev_buffer;
-        if (!should_full && force_full) {
+        if (!should_full && (force_full || idle_full)) {
             should_full = true;
         }
-        if (!should_full && IsFourColorPanel()) {
+        if (!should_full && IsFourColorPanel() && !fast_bw) {
             should_full = true;
         }
-        if (!should_full && result.diff_ratio >= kForceFullDiffRatio) {
+        if (!should_full && !(IsFourColorPanel() && fast_bw) &&
+            result.diff_ratio >= kForceFullDiffRatio) {
             should_full = true;
             ESP_LOGI(TAG, "[STRATEGY] diff_ratio>=30%% -> FULL");
         }
@@ -631,8 +757,14 @@ void CustomLcdDisplay::refresh_task_loop() {
             stat_urgent++;
         }
 
+        const TickType_t refresh_started = xTaskGetTickCount();
         if (should_full) {
             stat_full++;
+            if (idle_full) {
+                stat_idle_full++;
+            }
+            ESP_LOGW(TAG, "[FULL_COLOR] start reason=%s",
+                     idle_full ? "fast_bw_idle_timeout" : "explicit_or_strategy");
             ESP_LOGI(TAG, "[REFRESH] Performing FULL refresh");
             EPD_Init();
             EPD_Display();
@@ -640,8 +772,18 @@ void CustomLcdDisplay::refresh_task_loop() {
             memcpy(prev_buffer, tx_buf, lcd_spi_data.buffer_len);
             prev_buffer_synced = true;
             partial_since_full = 0;
-        } else
-        {
+            ESP_LOGW(TAG, "[FULL_COLOR] complete in %u ms",
+                     (unsigned)((xTaskGetTickCount() - refresh_started) * portTICK_PERIOD_MS));
+        } else if (IsFourColorPanel() && fast_bw) {
+            stat_fast_bw++;
+            ESP_LOGW(TAG, "[FAST_BW] start; colors mapped to black/white");
+            EPD_InitFastBw();
+            EPD_DisplayFastBw();
+            memcpy(prev_buffer, tx_buf, lcd_spi_data.buffer_len);
+            prev_buffer_synced = true;
+            ESP_LOGW(TAG, "[FAST_BW] complete in %u ms; FULL_COLOR idle timer remains armed",
+                     (unsigned)((xTaskGetTickCount() - refresh_started) * portTICK_PERIOD_MS));
+        } else {
             stat_partial++;
             ESP_LOGI(TAG, "[REFRESH] Performing PARTIAL refresh");
             EPD_Init();
@@ -929,6 +1071,126 @@ void CustomLcdDisplay::EPD_Init() {
     read_busy();
 }
 
+void CustomLcdDisplay::EPD_InitFastBw() {
+#if !CONFIG_ZECTRIX_EPD_FAST_BW
+    EPD_Init();
+    return;
+#else
+    if (!IsFourColorPanel()) {
+        EPD_Init();
+        return;
+    }
+
+    // Dedicated SSD2683 fast-waveform path. This sequence is taken from the
+    // controller-matched GDEM042F86 400x300 vendor demo. Commands 0xEF, 0xF6
+    // and 0xA5 are vendor-reserved in the public SSD2683 Rev 0.20 command
+    // table, so keep the sequence exact and never use the MTP program commands
+    // (0x90/0x91) here.
+    EPD_PowerOn();
+    vTaskDelay(pdMS_TO_TICKS(20));
+    set_rst_0();
+    vTaskDelay(pdMS_TO_TICKS(40));
+    set_rst_1();
+    vTaskDelay(pdMS_TO_TICKS(50));
+    read_busy();
+
+    EPD_SendCommand(0x06);  // BTST
+    EPD_SendData(0x0F);
+    EPD_SendData(0x8B);
+    EPD_SendData(0x9C);
+    EPD_SendData(0x96);
+
+    EPD_SendCommand(0x00);  // PSR: use OTP/MTP LUT, no final scan
+    EPD_SendData(0x2F);
+    EPD_SendData(0x69);
+
+    EPD_SendCommand(0x01);  // PWR (vendor fast-profile parameters)
+    EPD_SendData(0x07);
+    EPD_SendData(0xF0);
+
+    EPD_SendCommand(0x50);  // CDI: white border, 20 ms interval
+    EPD_SendData(0x37);
+
+    EPD_SendCommand(0x61);  // TRES: 400x300
+    EPD_SendData(static_cast<uint8_t>((Width >> 8) & 0x03));
+    EPD_SendData(static_cast<uint8_t>(Width & 0xFF));
+    EPD_SendData(static_cast<uint8_t>((Height >> 8) & 0x03));
+    EPD_SendData(static_cast<uint8_t>(Height & 0xFF));
+
+    EPD_SendCommand(0x62);  // Vendor waveform timing/profile data
+    EPD_SendData(0x64);
+    EPD_SendData(0x53);
+
+    EPD_SendCommand(0x65);  // GSST
+    EPD_SendData(0x00);
+    EPD_SendData(0x00);
+    EPD_SendData(0x00);
+    EPD_SendData(0x00);
+
+    EPD_SendCommand(0x30);  // PLL: dynamic frame rate enabled
+    EPD_SendData(0x08);
+    EPD_SendCommand(0xE9);
+    EPD_SendData(0x01);
+
+    EPD_SendCommand(0x04);  // PON before selecting the fast OTP profile
+    read_busy();
+
+    EPD_SendCommand(0xEF);  // Enter vendor register bank
+    EPD_SendData(0x01);
+    EPD_SendCommand(0xF6);  // Select vendor fast waveform profile
+    EPD_SendData(0x15);
+    EPD_SendCommand(0xEF);  // Leave vendor register bank
+    EPD_SendData(0x00);
+
+    EPD_SendCommand(0xE0);  // CCSET: manual temperature input
+    EPD_SendData(0x02);
+    EPD_SendCommand(0xE6);  // TSSET: vendor fast-waveform selector value
+    EPD_SendData(0x5A);
+    EPD_SendCommand(0xA5);  // Load/apply selected OTP waveform
+    read_busy();
+#endif
+}
+
+void CustomLcdDisplay::EPD_DisplayFastBw() {
+#if !CONFIG_ZECTRIX_EPD_FAST_BW
+    EPD_Display();
+    return;
+#else
+    if (!IsFourColorPanel()) {
+        EPD_Display();
+        return;
+    }
+
+    const int bytes_per_row = (Width * 2 + 7) >> 3;
+    std::vector<uint8_t> line(bytes_per_row);
+
+    EPD_SendCommand(0x10);  // DTM: target 2bpp pixels, not old/new transitions
+    read_busy();
+    for (int y = 0; y < Height; ++y) {
+        const uint8_t* src = tx_buf + y * bytes_per_row;
+        for (int xb = 0; xb < bytes_per_row; ++xb) {
+            line[xb] = ssd2683_fast_bw::EncodeSemanticByte(src[xb]);
+        }
+        writeBytes(line.data(), bytes_per_row);
+        if ((y % 16) == 15) {
+            vTaskDelay(1);
+        }
+    }
+
+    EPD_SendCommand(0x12);  // DRF: execute the selected fast OTP waveform
+    EPD_SendData(0x00);
+    read_busy();
+
+    EPD_SendCommand(0x02);  // POF
+    EPD_SendData(0x00);
+    read_busy();
+    vTaskDelay(pdMS_TO_TICKS(20));
+    EPD_SendCommand(0x07);  // DSLP
+    EPD_SendData(0xA5);
+    EPD_PowerOff();
+#endif
+}
+
 // =======================================================
 // Framebuffer ops (full refresh)
 // =======================================================
@@ -1093,6 +1355,9 @@ bool CustomLcdDisplay::DisplayRaw4ColorImage(const uint8_t* data, size_t len, in
         pending = false;
         urgent_refresh = false;
         force_full_refresh_ = false;
+        fast_bw_refresh_requested_ = false;
+        idle_full_refresh_pending_ = false;
+        idle_full_refresh_armed_ = false;
         refresh_in_progress = false;
         dirty = {0, 0, 0, 0};
         UpdateDisplayBusyLocked();

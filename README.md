@@ -117,10 +117,44 @@ http://192.168.4.1
 
 ### 编译
 
+本机已验证的环境为 macOS（Apple Silicon）、ESP-IDF `v6.0`（即
+`6.0.0`）和 Python `3.12`。工程的 `dependencies.lock` 同样锁定 IDF
+`6.0.0`；不要直接改用 `v6.0.2`，其 SPI 私有接口与当前锁定的
+`espressif/esp_cam_sensor 1.5.2` 不兼容。
+
+首次安装环境：
+
+```bash
+brew install python@3.12 cmake ninja ccache dfu-util
+
+mkdir -p ~/Developer/esp/v6.0
+git clone --branch v6.0 --depth 1 --recursive \
+  https://github.com/espressif/esp-idf.git \
+  ~/Developer/esp/v6.0/esp-idf
+
+export PATH=/opt/homebrew/opt/python@3.12/libexec/bin:$PATH
+export IDF_TOOLS_PATH=~/Developer/esp/v6.0/.espressif
+cd ~/Developer/esp/v6.0/esp-idf
+./install.sh esp32s3
+```
+
+每个新终端先激活环境，再编译：
+
+```bash
+export PATH=/opt/homebrew/opt/python@3.12/libexec/bin:$PATH
+export IDF_TOOLS_PATH=~/Developer/esp/v6.0/.espressif
+source ~/Developer/esp/v6.0/esp-idf/export.sh
+
+cd firmware
+idf.py build
+```
+
+2026-08-12 已通过一次干净全量构建；生成的 `xiaozhi.bin` 为
+`0x2b9670` 字节，最小应用分区剩余 `0x136990` 字节（31%）。连接设备后可执行：
+
 ```bash
 cd firmware
-source ~/Documents/esp/v6.0/esp-idf/export.sh
-idf.py build
+idf.py flash monitor
 ```
 
 根目录辅助命令：
@@ -139,6 +173,22 @@ ZECTRIX_EPD_PANEL_1BPP            黑白 1bpp 屏
 ```
 
 如果要刷回旧黑白屏，先在 `idf.py menuconfig` 中切到 `1bpp black/white EPD`，再重新构建烧录。RawDraw 主题层会把红/黄语义色降级成黑白可读样式。
+
+### SSD2683 FAST_BW 交互刷新
+
+Note4C 四色屏默认启用独立的 `FAST_BW` 路径。菜单切换、按钮、光标和
+连续 UI 操作都会将语义 framebuffer 临时映射为黑白（红/黄映射为黑），
+并调用 SSD2683/同类面板厂商示例中的 OTP fast-waveform 选择序列。连续操作
+期间不会按刷新次数插入四色全刷；最后一次交互后 60 秒无新操作，才执行一次
+原有 `FULL_COLOR` 全局刷新来恢复颜色和清理残影。新的交互会取消并重新计时。
+
+相关配置为 `CONFIG_ZECTRIX_EPD_FAST_BW` 和
+`CONFIG_ZECTRIX_EPD_FAST_BW_IDLE_FULL_SECONDS`。标准四色路径保持独立，若某批次
+面板与 fast profile 不兼容，可在 `idf.py menuconfig` 中关闭 FAST_BW。控制器、
+waveform 证据、像素映射、限制与硬件验证步骤见
+[`docs/SSD2683_FAST_BW_RESEARCH.md`](docs/SSD2683_FAST_BW_RESEARCH.md)。公开资料给出的
+同类面板 fast refresh 约为 12 秒，因此 1–3 秒仍是后续需要在真机上验证和继续
+寻找专用 B/W OTP bank 的实验目标，README 不把它作为已实现指标。
 
 ## UI 说明
 
