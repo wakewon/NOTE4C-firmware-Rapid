@@ -71,7 +71,7 @@ static uint32_t g_fast_bw_truncations_since_complete = 0;
 // Only a person looking at the panel can say how short the waveform may be
 // cut, so sweep the deadline across successive interactive refreshes: each
 // one uses real UI content and logs the deadline it ran with.
-static constexpr uint32_t kFastBwTruncSweep[] = {3000, 2000, 1500, 1000, 700, 400};
+static constexpr uint32_t kFastBwTruncSweep[] = {400, 300, 200, 150, 100, 50};
 static uint8_t g_fast_bw_trunc_index = 0;
 #endif
 
@@ -1618,7 +1618,12 @@ void CustomLcdDisplay::EPD_DisplayFastBw() {
              static_cast<unsigned>(truncate_ms), truncated ? 1 : 0,
              static_cast<unsigned>(g_fast_bw_truncations_since_complete),
              EffectiveFastBwPsr1(), EffectiveFastBwPll(), EffectiveFastBwTsset());
-    AdvanceFastBwSweep();
+    // A cleanup pass is forced to run complete, so it carries no information
+    // about the deadline it nominally had. Letting it step the sweep skipped
+    // values and made the sequence impossible to follow.
+    if (!g_fast_bw_force_complete) {
+        AdvanceFastBwSweep();
+    }
 
     if (truncated) {
         // POF does not abort a running refresh: the controller finishes the

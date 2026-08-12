@@ -133,13 +133,18 @@ config ZECTRIX_EPD_FAST_BW_TRUNCATE_MS
 config ZECTRIX_EPD_FAST_BW_TRUNCATE_MAX_STREAK
     int "Consecutive truncated waveforms before forcing a complete one"
     range 1 1000
-    default 20
+    default 6
     depends on ZECTRIX_EPD_FAST_BW
     help
-        After this many truncated refreshes in a row, the next one waits for
-        the waveform to finish, which restores the DC balance the truncated
-        ones skipped. Lower is safer for the panel and costs one full-length
-        refresh more often.
+        After this many truncated refreshes in a row, the next one runs its
+        waveform to completion.
+
+        Note what this does and does not achieve. Cutting the panel supply
+        stops further charge being injected, but the net charge already on the
+        pixels stays there, so the DC imbalance is real. A following complete
+        waveform is DC-balanced in itself and therefore adds no more bias, but
+        it does not actively cancel what the truncated ones left; the
+        full-color refresh is what re-normalizes the pixels. Keep this low.
 
 config ZECTRIX_EPD_FAST_BW_TRUNCATE_SWEEP
     bool "Sweep the truncation deadline across successive fast refreshes"
