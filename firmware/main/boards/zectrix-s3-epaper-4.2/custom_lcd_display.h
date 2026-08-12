@@ -122,6 +122,7 @@ private:
     uint8_t SPI_RecvByte();
     uint8_t EPD_RecvData();
     void EPD_ReadBytes(uint8_t *buf, size_t len);
+    void EPD_ReadRegister(uint8_t command, uint8_t *buf, size_t len);
     void EPD_PowerOn();
     void EPD_PowerOff();
     void EPD_SendData(uint8_t data);

@@ -112,6 +112,18 @@ config ZECTRIX_EPD_FAST_BW_PLL_SWEEP
         count stored in the OTP waveform bank determines the refresh duration
         and no register setting can shorten it. Disable for normal builds.
 
+config ZECTRIX_EPD_READ_CLOCK_HZ
+    int "SPI clock for EPD register reads (Hz)"
+    range 100000 8000000
+    default 1000000
+    depends on ZECTRIX_EPD_PANEL_4COLOR_SSD2683
+    help
+        Controller reads are much slower than writes and use the shared SDIN
+        line turned around. The first MTP dump was taken at the 8 MHz write
+        clock and came back as recognisable data corrupted by bit slips, so
+        reads now use this separate, lower clock. Lower it further if the dump
+        reports UNSTABLE.
+
 config ZECTRIX_EPD_SSD2683_MTP_DUMP
     bool "Dump SSD2683 revision and read-only MTP waveform data at boot"
     default n

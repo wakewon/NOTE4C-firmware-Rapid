@@ -955,7 +955,11 @@ void CustomLcdDisplay::spi_port_rx_init() {
 
     spi_device_interface_config_t devcfg = {};
     devcfg.spics_io_num                  = -1;
-    devcfg.clock_speed_hz                = 8 * 1000 * 1000;
+    // Reads are far slower than writes on this controller. The first MTP dump
+    // taken at 8 MHz came back as recognisable data corrupted by bit slips
+    // (the same byte sequence repeated with flipped bits and a byte-phase
+    // shift), so the read clock is now a separate, much lower setting.
+    devcfg.clock_speed_hz                = CONFIG_ZECTRIX_EPD_READ_CLOCK_HZ;
     devcfg.mode                          = 0;
     devcfg.queue_size                    = 7;
 
@@ -1035,6 +1039,32 @@ void CustomLcdDisplay::EPD_ReadBytes(uint8_t *buf, size_t len) {
     spi_port_rx_init();
     set_dc_1();
     set_cs_0();
+    spi_transaction_t t;
+    memset(&t, 0, sizeof(t));
+    t.length = 8 * len;
+    t.rx_buffer = buf;
+    esp_err_t ret = spi_device_polling_transmit(spi, &t);
+    set_cs_1();
+    assert(ret == ESP_OK);
+    spi_port_init();
+}
+
+void CustomLcdDisplay::EPD_ReadRegister(uint8_t command, uint8_t *buf, size_t len) {
+    if (buf == nullptr || len == 0) {
+        return;
+    }
+
+    // A read must hold CS low from the command byte through the whole
+    // response; the previous path used EPD_SendCommand, which deasserts CS and
+    // therefore terminated the sequence before a single byte was clocked out.
+    // CS is a plain GPIO here, so it survives the bus reconfiguration needed
+    // to turn the shared SDIN line around.
+    set_dc_0();
+    set_cs_0();
+    SPI_SendByte(command);
+
+    spi_port_rx_init();
+    set_dc_1();
     spi_transaction_t t;
     memset(&t, 0, sizeof(t));
     t.length = 8 * len;
@@ -1260,34 +1290,71 @@ void CustomLcdDisplay::EPD_DumpSsd2683Mtp() {
     constexpr size_t kMtpBytes = 3840;
     constexpr size_t kMtpReadBytes = kMtpBytes + 1;  // RMTP starts with dummy
 
+    constexpr int kPasses = 3;
+
     uint8_t revision[kRevisionBytes] = {};
-    EPD_SendCommand(0x70);  // REV, documented read-only command
-    EPD_ReadBytes(revision, sizeof(revision));
+    EPD_ReadRegister(0x70, revision, sizeof(revision));  // REV, read-only
 
     uint8_t *mtp_read = static_cast<uint8_t *>(
         heap_caps_malloc(kMtpReadBytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
-    if (mtp_read == nullptr) {
-        ESP_LOGE(TAG, "[SSD2683_MTP] unable to allocate %u-byte DMA buffer",
+    uint8_t *mtp_ref = static_cast<uint8_t *>(heap_caps_malloc(kMtpReadBytes, MALLOC_CAP_INTERNAL));
+    if (mtp_read == nullptr || mtp_ref == nullptr) {
+        ESP_LOGE(TAG, "[SSD2683_MTP] unable to allocate %u-byte buffers",
                  static_cast<unsigned>(kMtpReadBytes));
+        heap_caps_free(mtp_read);
+        heap_caps_free(mtp_ref);
         return;
     }
 
-    EPD_SendCommand(0x92);  // RMTP, documented read-only command
-    EPD_ReadBytes(mtp_read, kMtpReadBytes);
-    const uint8_t *mtp = mtp_read + 1;
-
     // FNV-1a is only an identity fingerprint here, not an integrity/security
     // primitive. It makes panel-batch comparisons practical in normal logs.
-    uint32_t fingerprint = 2166136261U;
-    for (size_t i = 0; i < kMtpBytes; ++i) {
-        fingerprint ^= mtp[i];
-        fingerprint *= 16777619U;
+    auto fingerprint_of = [](const uint8_t *data, size_t n) {
+        uint32_t h = 2166136261U;
+        for (size_t i = 0; i < n; ++i) {
+            h ^= data[i];
+            h *= 16777619U;
+        }
+        return h;
+    };
+
+    // The dump is only worth reverse engineering if it is reproducible. An
+    // 8 MHz read produced data with bit slips, so read several times and
+    // report how many bytes differ between passes. Identical passes mean the
+    // bus is sampling correctly and the contents are real.
+    uint32_t fingerprint = 0;
+    size_t worst_mismatch = 0;
+    for (int pass = 0; pass < kPasses; ++pass) {
+        EPD_ReadRegister(0x92, mtp_read, kMtpReadBytes);  // RMTP, read-only
+        fingerprint = fingerprint_of(mtp_read + 1, kMtpBytes);
+        if (pass == 0) {
+            memcpy(mtp_ref, mtp_read, kMtpReadBytes);
+            ESP_LOGW(TAG, "[SSD2683_MTP] pass=%d dummy=%02X fnv1a32=%08X",
+                     pass, mtp_read[0], static_cast<unsigned>(fingerprint));
+            continue;
+        }
+        size_t mismatch = 0;
+        for (size_t i = 0; i < kMtpReadBytes; ++i) {
+            if (mtp_read[i] != mtp_ref[i]) {
+                mismatch++;
+            }
+        }
+        worst_mismatch = std::max(worst_mismatch, mismatch);
+        ESP_LOGW(TAG, "[SSD2683_MTP] pass=%d dummy=%02X fnv1a32=%08X diff_vs_pass0=%u bytes",
+                 pass, mtp_read[0], static_cast<unsigned>(fingerprint),
+                 static_cast<unsigned>(mismatch));
     }
+    memcpy(mtp_read, mtp_ref, kMtpReadBytes);
+    fingerprint = fingerprint_of(mtp_read + 1, kMtpBytes);
+    const uint8_t *mtp = mtp_read + 1;
 
     ESP_LOGW(TAG,
-             "[SSD2683_MTP] REV=%02X:%02X:%02X dummy=%02X bytes=%u fnv1a32=%08X",
+             "[SSD2683_MTP] REV=%02X:%02X:%02X dummy=%02X bytes=%u fnv1a32=%08X "
+             "read_clock=%u Hz passes=%d worst_diff=%u bytes verdict=%s",
              revision[0], revision[1], revision[2], mtp_read[0],
-             static_cast<unsigned>(kMtpBytes), static_cast<unsigned>(fingerprint));
+             static_cast<unsigned>(kMtpBytes), static_cast<unsigned>(fingerprint),
+             static_cast<unsigned>(CONFIG_ZECTRIX_EPD_READ_CLOCK_HZ), kPasses,
+             static_cast<unsigned>(worst_mismatch),
+             worst_mismatch == 0 ? "STABLE" : "UNSTABLE_LOWER_READ_CLOCK");
     ESP_LOGW(TAG, "[SSD2683_MTP] BEGIN read-only hex dump; 16 bytes per line");
     for (size_t offset = 0; offset < kMtpBytes; offset += 16) {
         char line[16 * 3 + 1] = {};
@@ -1305,6 +1372,7 @@ void CustomLcdDisplay::EPD_DumpSsd2683Mtp() {
     }
     ESP_LOGW(TAG, "[SSD2683_MTP] END");
     heap_caps_free(mtp_read);
+    heap_caps_free(mtp_ref);
 #endif
 }
 

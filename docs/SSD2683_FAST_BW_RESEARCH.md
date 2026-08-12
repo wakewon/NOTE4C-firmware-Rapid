@@ -299,6 +299,33 @@ Such a refresh is now promoted to FAST_BW and re-arms the idle timer, since
 color recovery is owned by that timer by design. The start log distinguishes
 `source=requested` from `source=promoted_dirty_rect`.
 
+## First MTP dump was corrupted by the read clock, not by the panel
+
+`REV=06:01:01`, `dummy=A0`, `fnv1a32=084ABC10`, 3840 bytes extracted cleanly.
+The contents, however, do not survive scrutiny as waveform data:
+
+* 85 % of bytes have six or more bits set, and every bit position reads as one
+  between 68 % and 93 % of the time. A waveform LUT is full of zeros and small
+  repeat counts.
+* The data is nevertheless not noise. The sequence at offset `0x0000`
+  (`FF 3C DF 0F 3C 00 7F FB FD FF 6C FF FF FB 9D 9D`) reappears near `0x0430`
+  (`3C 0F DD 00 7F FB FD FF 2D FF FF FB 9D 9D FF FD`) with a handful of flipped
+  bits and a byte-phase shift.
+
+Recognisable structure plus bit slips means the transfer is sampling wrong, so
+two defects in the read path were fixed:
+
+1. `EPD_SendCommand` deasserts CS, so the command that selects the read was
+   terminated before any byte was clocked out. `EPD_ReadRegister` now holds CS
+   low across the command, the SDIN turnaround and the whole response.
+2. Reads ran at the 8 MHz write clock. `ZECTRIX_EPD_READ_CLOCK_HZ` defaults to
+   1 MHz.
+
+The dump now performs three passes and reports `diff_vs_pass0` plus a
+`STABLE` / `UNSTABLE_LOWER_READ_CLOCK` verdict. Only a STABLE dump is worth
+reverse engineering; if it stays unstable, lower the read clock further before
+drawing any conclusion about the waveform contents.
+
 ## Remaining lower-level experiments
 
 The current default is now a genuine second-level timing experiment, but it
