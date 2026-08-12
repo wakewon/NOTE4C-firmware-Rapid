@@ -224,6 +224,41 @@ temperature/profile tables, and correlate the reserved `EF/F6/E6/A5` selector
 sequence with actual waveform regions. A dump from the user's panel is still
 required before the proprietary layout can be decoded responsibly.
 
+## Hardware result: ULTRA timing did not shorten the waveform
+
+First on-device measurement of the `ultra-fixed-120Hz-2ms` profile:
+
+```
+[ULTRA_BW] execute timing=ultra-fixed-120Hz-2ms PLL=0x07 CDI=0x30 transfer=180 ms
+[ULTRA_BW] waveform BUSY=14050 ms
+[ULTRA_BW] complete in 14710 ms
+```
+
+Framebuffer transfer is no longer relevant at 180 ms; the entire cost is the
+waveform. Raising the scan clock to the documented 120 Hz maximum and cutting
+blanking to 2 ms changed nothing, so the waveform duration is not governed by
+the PLL/CDI values this path was writing.
+
+The most likely cause is command ordering: `0x30` and `0x50` were sent before
+`0xA5`, and `0xA5` loads an OTP waveform bank that carries its own timing
+parameters, overwriting them. Two changes now test this in a single flashing
+cycle:
+
+* PLL and CDI are re-applied *after* `0xA5` so the loaded bank cannot win.
+* `ZECTRIX_EPD_FAST_BW_PLL_SWEEP` programs a different PLL candidate on every
+  fast refresh (`0x08 0x07 0x05 0x0E 0x3A 0x3C`) and logs the resulting BUSY
+  time for each, producing a PLL-versus-duration curve from six consecutive
+  key presses.
+
+Interpretation of that curve:
+
+* BUSY varies with PLL — register timing is now in effect; pick the fastest
+  value that still resolves pixels and disable the sweep.
+* BUSY is flat at ~14 s for every value — the frame *count* in the OTP bank
+  determines the duration and no register can shorten it. The only remaining
+  routes are a different OTP bank selector or a register-loaded LUT, which
+  requires the MTP dump below.
+
 ## Remaining lower-level experiments
 
 The current default is now a genuine second-level timing experiment, but it

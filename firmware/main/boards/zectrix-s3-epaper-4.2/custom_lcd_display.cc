@@ -47,6 +47,27 @@ static constexpr uint8_t kFastBwPll = 0x07;  // fixed, 120 Hz
 static constexpr uint8_t kFastBwCdi = 0x30;  // white border, 2 ms blanking
 static constexpr const char *kFastBwTimingName = "ultra-fixed-120Hz-2ms";
 #endif
+
+#if CONFIG_ZECTRIX_EPD_FAST_BW_PLL_SWEEP
+// Diagnostic sweep. Hardware showed BUSY ~14 s regardless of the PLL written
+// before the OTP waveform load, so a single data point cannot distinguish
+// "PLL ignored" from "PLL applied but frame count dominates". Each fast
+// refresh advances one step and logs its own BUSY time; a flat curve across
+// all of these proves the OTP bank owns the timing.
+static constexpr uint8_t kFastBwPllSweep[] = {0x08, 0x07, 0x05, 0x0E, 0x3A, 0x3C};
+static uint8_t g_fast_bw_pll_index = 0;
+#endif
+
+// The PLL value actually programmed for the next waveform. Constant unless the
+// diagnostic sweep is enabled.
+static inline uint8_t EffectiveFastBwPll() {
+#if CONFIG_ZECTRIX_EPD_FAST_BW_PLL_SWEEP
+    return kFastBwPllSweep[g_fast_bw_pll_index];
+#else
+    return kFastBwPll;
+#endif
+}
+
 #else
 // Keep the common refresh-loop logging buildable when FAST_BW is disabled.
 static constexpr const char *kFastBwTimingName = "disabled";
@@ -1176,7 +1197,7 @@ void CustomLcdDisplay::EPD_InitFastBw() {
     EPD_SendData(0x00);
 
     EPD_SendCommand(0x30);  // PLL: profile-specific scan clock
-    EPD_SendData(kFastBwPll);
+    EPD_SendData(EffectiveFastBwPll());
     EPD_SendCommand(0xE9);
     EPD_SendData(0x01);
 
@@ -1196,6 +1217,17 @@ void CustomLcdDisplay::EPD_InitFastBw() {
     EPD_SendData(0x5A);
     EPD_SendCommand(0xA5);  // Load/apply selected OTP waveform
     read_busy();
+
+    // 0xA5 loads the OTP waveform bank, and that bank carries its own frame
+    // timing. Measured on hardware: PLL/CDI written before 0xA5 had no effect
+    // on the waveform duration (BUSY stayed at ~14 s with PLL=0x07/CDI=0x30).
+    // Re-apply them after the load so the controller keeps our values instead
+    // of the bank's. If the waveform duration is still ~14 s after this, the
+    // frame *count* comes from the OTP bank and no register can shorten it.
+    EPD_SendCommand(0x30);  // PLL: profile-specific scan clock
+    EPD_SendData(EffectiveFastBwPll());
+    EPD_SendCommand(0x50);  // CDI: border + gate/source blanking
+    EPD_SendData(kFastBwCdi);
 #endif
 }
 
@@ -1289,14 +1321,20 @@ void CustomLcdDisplay::EPD_DisplayFastBw() {
     const TickType_t waveform_started = xTaskGetTickCount();
     ESP_LOGW(TAG,
              "[ULTRA_BW] execute timing=%s PLL=0x%02X CDI=0x%02X transfer=%u ms",
-             kFastBwTimingName, kFastBwPll, kFastBwCdi,
+             kFastBwTimingName, EffectiveFastBwPll(), kFastBwCdi,
              static_cast<unsigned>((waveform_started - transfer_started) * portTICK_PERIOD_MS));
     EPD_SendCommand(0x12);  // DRF: execute the selected fast OTP waveform
     EPD_SendData(0x00);
     read_busy();
     const TickType_t waveform_finished = xTaskGetTickCount();
-    ESP_LOGW(TAG, "[ULTRA_BW] waveform BUSY=%u ms",
-             static_cast<unsigned>((waveform_finished - waveform_started) * portTICK_PERIOD_MS));
+    ESP_LOGW(TAG, "[ULTRA_BW] waveform BUSY=%u ms PLL=0x%02X",
+             static_cast<unsigned>((waveform_finished - waveform_started) * portTICK_PERIOD_MS),
+             EffectiveFastBwPll());
+#if CONFIG_ZECTRIX_EPD_FAST_BW_PLL_SWEEP
+    g_fast_bw_pll_index =
+        static_cast<uint8_t>((g_fast_bw_pll_index + 1) %
+                             (sizeof(kFastBwPllSweep) / sizeof(kFastBwPllSweep[0])));
+#endif
 
     EPD_SendCommand(0x02);  // POF
     EPD_SendData(0x00);

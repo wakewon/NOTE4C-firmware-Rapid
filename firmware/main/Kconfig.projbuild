@@ -99,6 +99,19 @@ config ZECTRIX_EPD_FAST_BW_IDLE_FULL_SECONDS
         new request has arrived for this many seconds, perform one standard
         full-screen four-color refresh to restore colors and reduce ghosting.
 
+config ZECTRIX_EPD_FAST_BW_PLL_SWEEP
+    bool "Sweep PLL values across successive fast refreshes (diagnostic)"
+    default y
+    depends on ZECTRIX_EPD_FAST_BW
+    help
+        Ignore the fixed PLL value of the selected timing profile and instead
+        program a different candidate on every fast refresh, logging the
+        resulting waveform BUSY time for each. Six consecutive interactive
+        refreshes therefore produce a full PLL-versus-duration curve in one
+        flashing cycle. If every value yields the same BUSY time, the frame
+        count stored in the OTP waveform bank determines the refresh duration
+        and no register setting can shorten it. Disable for normal builds.
+
 config ZECTRIX_EPD_SSD2683_MTP_DUMP
     bool "Dump SSD2683 revision and read-only MTP waveform data at boot"
     default n
