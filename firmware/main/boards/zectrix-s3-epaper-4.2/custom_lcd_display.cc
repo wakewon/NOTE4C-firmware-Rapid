@@ -30,14 +30,13 @@ LV_FONT_DECLARE(weather_icons_48);   // Weather icons 48px (FontAwesome)
 #define TAG "CustomLcdDisplay"
 static constexpr uint32_t kDisplayKickMs = 1000;
 static constexpr int kFourColorSampleIntervalMs = 12000;
+// The 12 s interval above was sized for the 23 s full-color waveform. A
+// truncated fast refresh takes about 550 ms, and throttling one by 12 s was
+// what made a key press sit for several seconds before anything happened.
+static constexpr int kFourColorFastBwSampleIntervalMs = 500;
 #if CONFIG_ZECTRIX_EPD_FAST_BW
 static constexpr uint32_t kFastBwIdleFullMs =
     CONFIG_ZECTRIX_EPD_FAST_BW_IDLE_FULL_SECONDS * 1000U;
-static constexpr uint32_t kFastBwCleanupMs = CONFIG_ZECTRIX_EPD_FAST_BW_CLEANUP_MS;
-
-// Set for the one refresh that must run its waveform to completion, either
-// because the keys have stopped or because too many truncated ones piled up.
-static bool g_fast_bw_force_complete = false;
 
 #if CONFIG_ZECTRIX_EPD_FAST_BW_TIMING_VENDOR
 static constexpr uint8_t kFastBwPll = 0x08;  // dynamic, 12.5 Hz
@@ -386,6 +385,9 @@ CustomLcdDisplay::CustomLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_p
     last_sample_tick = 0;
     if (IsFourColorPanel()) {
         sample_interval_ms = kFourColorSampleIntervalMs;
+#if CONFIG_ZECTRIX_EPD_FAST_BW
+        sample_interval_ms = kFourColorFastBwSampleIntervalMs;
+#endif
     }
 
     ESP_LOGI(TAG, "EPD init");
@@ -580,9 +582,6 @@ void CustomLcdDisplay::ArmIdleFullRefreshLocked(TickType_t now) {
     idle_full_refresh_deadline_ = now + pdMS_TO_TICKS(kFastBwIdleFullMs);
     idle_full_refresh_armed_ = true;
     idle_full_refresh_pending_ = false;
-    bw_cleanup_deadline_ = now + pdMS_TO_TICKS(kFastBwCleanupMs);
-    bw_cleanup_armed_ = true;
-    bw_cleanup_pending_ = false;
 #else
     (void)now;
 #endif
@@ -734,7 +733,6 @@ void CustomLcdDisplay::refresh_task_loop() {
         bool force_full = false;
         bool fast_bw = false;
         bool idle_full = false;
-        bool bw_cleanup = false;
         Rect r = {0, 0, 0, 0};
 
         xSemaphoreTake(dirty_mutex, portMAX_DELAY);
@@ -743,17 +741,6 @@ void CustomLcdDisplay::refresh_task_loop() {
             TickDeadlineReached(now, idle_full_refresh_deadline_)) {
             idle_full_refresh_armed_ = false;
             idle_full_refresh_pending_ = true;
-        }
-        if (IsFourColorPanel() && bw_cleanup_armed_ &&
-            TickDeadlineReached(now, bw_cleanup_deadline_)) {
-            bw_cleanup_armed_ = false;
-            // A single truncated refresh does not justify locking the display
-            // for 11.5 s; that made every isolated key press cost a full
-            // waveform a few seconds later. Wait until enough ghosting has
-            // actually accumulated. Anything below the threshold is still
-            // cleaned up by the full-color refresh.
-            bw_cleanup_pending_ = g_fast_bw_truncations_since_complete >=
-                                  CONFIG_ZECTRIX_EPD_FAST_BW_CLEANUP_MIN_STREAK;
         }
 #endif
         if (urgent_refresh) {
@@ -772,17 +759,7 @@ void CustomLcdDisplay::refresh_task_loop() {
             idle_full = true;
             idle_full_refresh_pending_ = false;
         }
-        if (bw_cleanup_pending_) {
-            bw_cleanup = true;
-            bw_cleanup_pending_ = false;
-        }
-        if (bw_cleanup && !force_full && !idle_full) {
-            // The cleanup pass is an ordinary FAST_BW refresh that is not
-            // allowed to truncate.
-            fast_bw = true;
-        }
         if (force_full || idle_full) {
-            bw_cleanup = false;
             // An already-due explicit/recovery FULL_COLOR wins this harvest.
             // A later button event can still cancel it before the snapshot or
             // enqueue another FAST_BW update after controller work has begun.
@@ -846,16 +823,6 @@ void CustomLcdDisplay::refresh_task_loop() {
             urgent_refresh = false;
             urgent = true;
         }
-        // Same courtesy for the cleanup pass: a key press arriving before the
-        // snapshot means the user is still working, so keep the interaction
-        // fast and let the cleanup re-arm from that press instead.
-        if (bw_cleanup && fast_bw_refresh_requested_) {
-            bw_cleanup = false;
-            fast_bw = true;
-            fast_bw_refresh_requested_ = false;
-            urgent_refresh = false;
-            urgent = true;
-        }
 #endif
         memcpy(tx_buf, buffer, lcd_spi_data.buffer_len);
         xSemaphoreGive(dirty_mutex);
@@ -865,7 +832,7 @@ void CustomLcdDisplay::refresh_task_loop() {
         FrameDiffResult result = analyze_frame_diff(prev_buffer, tx_buf, Width, Height);
 
         // 快速退出：没有任何变化
-        if (result.diff_bits == 0 && !force_full && !idle_full && !bw_cleanup) {
+        if (result.diff_bits == 0 && !force_full && !idle_full) {
             tiny_diff_streak = 0;
             tiny_diff_accum_bits = 0;
             tiny_diff_first_tick = 0;
@@ -886,7 +853,7 @@ void CustomLcdDisplay::refresh_task_loop() {
 
         // 可选：过滤超小差异（防止抗锯齿/边界振荡导致的无意义刷新）
         // 注意：不立即同步 prev_buffer，避免累计误差；达到阈值后再强制刷新
-        if (!urgent && !force_full && !idle_full && !bw_cleanup &&
+        if (!urgent && !force_full && !idle_full &&
             result.diff_ratio < kMinDiffBitRatio) {
             if (tiny_diff_streak == 0) {
                 tiny_diff_first_tick = last_sample_tick;
@@ -978,17 +945,18 @@ void CustomLcdDisplay::refresh_task_loop() {
                      (unsigned)((xTaskGetTickCount() - refresh_started) * portTICK_PERIOD_MS));
         } else if (IsFourColorPanel() && fast_bw) {
             stat_fast_bw++;
-            ESP_LOGW(TAG, "[ULTRA_BW] start timing=%s source=%s; colors mapped to black/white",
+            ESP_LOGD(TAG, "[ULTRA_BW] start timing=%s source=%s; colors mapped to black/white",
                      kFastBwTimingName,
-                     bw_cleanup ? "bw_cleanup"
-                                : (fast_bw_promoted ? "promoted_dirty_rect" : "requested"));
-            g_fast_bw_force_complete = bw_cleanup;
+                     fast_bw_promoted ? "promoted_dirty_rect" : "requested");
             EPD_InitFastBw();
             EPD_DisplayFastBw();
-            g_fast_bw_force_complete = false;
             memcpy(prev_buffer, tx_buf, lcd_spi_data.buffer_len);
             prev_buffer_synced = true;
-            ESP_LOGW(TAG, "[ULTRA_BW] complete in %u ms; FULL_COLOR idle timer remains armed",
+            // One line per interactive refresh. The rest of the ULTRA_BW
+            // telemetry is at DEBUG: the secondary USB-Serial-JTAG console
+            // blocks the logging task while a host is attached but not
+            // draining, so volume here costs input responsiveness.
+            ESP_LOGI(TAG, "[ULTRA_BW] complete in %u ms",
                      (unsigned)((xTaskGetTickCount() - refresh_started) * portTICK_PERIOD_MS));
         } else {
             stat_partial++;
@@ -1599,7 +1567,7 @@ void CustomLcdDisplay::EPD_DisplayFastBw() {
     }
 
     const TickType_t waveform_started = xTaskGetTickCount();
-    ESP_LOGW(TAG,
+    ESP_LOGD(TAG,
              "[ULTRA_BW] execute timing=%s PLL=0x%02X CDI=0x%02X transfer=%u ms",
              kFastBwTimingName, EffectiveFastBwPll(), kFastBwCdi,
              static_cast<unsigned>((waveform_started - transfer_started) * portTICK_PERIOD_MS));
@@ -1617,9 +1585,13 @@ void CustomLcdDisplay::EPD_DisplayFastBw() {
     // bias is what causes permanent image sticking on e-paper. Two things
     // bound it: the idle full-color recovery, and the consecutive-truncation
     // cap that forces one complete waveform.
-    if (truncate_ms > 0 && !g_fast_bw_force_complete &&
-        g_fast_bw_truncations_since_complete <
-            CONFIG_ZECTRIX_EPD_FAST_BW_TRUNCATE_MAX_STREAK) {
+    // Every TRUNCATE_MAX_STREAK-th refresh runs its waveform to completion,
+    // which is the only cleanup the ladder needs: an idle timer for this
+    // turned every isolated key press into a full waveform seconds later.
+    const bool forced_complete =
+        g_fast_bw_truncations_since_complete >=
+        CONFIG_ZECTRIX_EPD_FAST_BW_TRUNCATE_MAX_STREAK;
+    if (truncate_ms > 0 && !forced_complete) {
         truncated = !read_busy_until(truncate_ms);
     }
     if (!truncated) {
@@ -1629,7 +1601,7 @@ void CustomLcdDisplay::EPD_DisplayFastBw() {
         g_fast_bw_truncations_since_complete++;
     }
     const TickType_t waveform_finished = xTaskGetTickCount();
-    ESP_LOGW(TAG,
+    ESP_LOGD(TAG,
              "[ULTRA_BW] waveform BUSY=%u ms cut_at=%u ms truncated=%d streak=%u "
              "PSR1=0x%02X PLL=0x%02X TSSET=0x%02X",
              static_cast<unsigned>((waveform_finished - waveform_started) * portTICK_PERIOD_MS),
@@ -1639,7 +1611,7 @@ void CustomLcdDisplay::EPD_DisplayFastBw() {
     // A cleanup pass is forced to run complete, so it carries no information
     // about the deadline it nominally had. Letting it step the sweep skipped
     // values and made the sequence impossible to follow.
-    if (!g_fast_bw_force_complete) {
+    if (!forced_complete) {
         AdvanceFastBwSweep();
     }
 

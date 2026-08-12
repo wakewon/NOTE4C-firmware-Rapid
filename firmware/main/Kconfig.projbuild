@@ -99,31 +99,6 @@ config ZECTRIX_EPD_FAST_BW_IDLE_FULL_SECONDS
         new request has arrived for this many seconds, perform one standard
         full-screen four-color refresh to restore colors and reduce ghosting.
 
-config ZECTRIX_EPD_FAST_BW_CLEANUP_MS
-    int "Idle ms before one complete black-and-white waveform"
-    range 500 60000
-    default 3000
-    depends on ZECTRIX_EPD_FAST_BW
-    help
-        Middle rung of the refresh ladder. Truncated waveforms give immediate
-        feedback while keys are being pressed but leave ghosting behind; once
-        input stops for this long, one complete black-and-white waveform runs
-        to clean the image up, well before the minute-long wait for the
-        full-color refresh. It is skipped when no truncated refresh happened,
-        and it also restores the DC balance the truncated ones skipped.
-
-config ZECTRIX_EPD_FAST_BW_CLEANUP_MIN_STREAK
-    int "Truncated refreshes required before a cleanup pass is worth it"
-    range 1 100
-    default 3
-    depends on ZECTRIX_EPD_FAST_BW
-    help
-        A cleanup pass locks the display for a full waveform, so running one
-        after a single truncated refresh made every isolated key press cost
-        11.5 s a few seconds later. Require this much accumulated ghosting
-        first. Anything below the threshold is still cleaned up by the
-        full-color refresh.
-
 config ZECTRIX_EPD_FAST_BW_TRUNCATE_MS
     int "Cut the fast waveform short after this many ms (0 disables)"
     range 0 20000
@@ -139,8 +114,9 @@ config ZECTRIX_EPD_FAST_BW_TRUNCATE_MS
         This breaks the waveform's DC balance on purpose. Accumulated DC bias
         is the known cause of permanent image sticking on e-paper, so it is
         bounded by ZECTRIX_EPD_FAST_BW_TRUNCATE_MAX_STREAK and by the idle
-        full-color recovery. Start high and lower it only as far as the image
-        stays acceptable.
+        full-color recovery. 120 ms was selected on hardware; 100 ms washed
+        the image out, and below 150 ms the total refresh is dominated by the
+        fixed init and transfer cost anyway.
 
 config ZECTRIX_EPD_FAST_BW_TRUNCATE_MAX_STREAK
     int "Consecutive truncated waveforms before forcing a complete one"
@@ -149,7 +125,9 @@ config ZECTRIX_EPD_FAST_BW_TRUNCATE_MAX_STREAK
     depends on ZECTRIX_EPD_FAST_BW
     help
         After this many truncated refreshes in a row, the next one runs its
-        waveform to completion.
+        waveform to completion. This is the only cleanup step: an idle timer
+        for it turned every isolated key press into a full 11.5 s waveform a
+        few seconds later, which is worse than the ghosting it removed.
 
         Note what this does and does not achieve. Cutting the panel supply
         stops further charge being injected, but the net charge already on the
@@ -164,15 +142,16 @@ config ZECTRIX_EPD_FAST_BW_TRUNCATE_SWEEP
     depends on ZECTRIX_EPD_FAST_BW
     help
         Only a person looking at the panel can judge how short the waveform may
-        be cut, so this ignores the fixed deadline and uses 3000, 2000, 1500,
-        1000, 700 then 400 ms on successive interactive refreshes, logging the
+        be cut, so this ignores the fixed deadline and uses 150, 130, 120,
+        110, 100 then 90 ms on successive interactive refreshes, logging the
         deadline each one ran with. Six ordinary interactions therefore show
         the whole range against real UI content. Disable once a value is
-        chosen.
+        chosen; 120 ms was selected on hardware, since 100 ms washed the image
+        out.
 
 config ZECTRIX_EPD_FAST_BW_PLL_SWEEP
     bool "Sweep PLL values across successive fast refreshes (diagnostic)"
-    default y
+    default n
     depends on ZECTRIX_EPD_FAST_BW
     help
         Ignore the fixed PLL value of the selected timing profile and instead

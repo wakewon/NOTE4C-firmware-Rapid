@@ -407,15 +407,42 @@ recovery plan, not just a code path. It is deliberately not implemented here.
 
 Shipping configuration, measured on hardware:
 
-| Path                | Before   | Now      |
-|---------------------|----------|----------|
-| Interactive refresh | 23020 ms | 12160 ms |
-| Idle color recovery | 23020 ms | 23020 ms |
+| Path                          | Before   | Now      |
+|-------------------------------|----------|----------|
+| Interactive refresh           | 23020 ms | ~550 ms  |
+| Every 6th refresh (complete)  | 23020 ms | 12160 ms |
+| Idle color recovery           | 23020 ms | 23020 ms |
 
-Interactive refresh nearly halved. Two independent changes got there: routing
-dirty-rect refreshes to FAST_BW instead of demoting them to the full-color
-waveform, and selecting the 25 C OTP section via TSSET, which is the shortest
-waveform the panel contains.
+Interactive refresh is roughly 40x faster than where this started. Three
+changes got there:
+
+1. Dirty-rect refreshes go to FAST_BW instead of being demoted to the
+   full-color waveform.
+2. TSSET selects the 25 C OTP section, the shortest waveform in the panel.
+3. The waveform is cut short at 120 ms and the controller is stopped with a
+   reset, because black-and-white content is already legible after the first
+   drive. POF cannot do this: it is queued until the refresh finishes, so an
+   earlier attempt saved nothing and merely moved the wait.
+
+120 ms was chosen by looking at the panel. 100 ms washed the image out, and
+below 150 ms the total is dominated by the fixed ~430 ms of init and transfer
+anyway, so shorter cuts buy little while cutting deeper into the strongest
+drive phase.
+
+Truncation breaks the waveform's DC balance, which is what causes permanent
+image sticking, so every 6th refresh runs to completion. An earlier design
+also ran a complete waveform a few seconds after input stopped; it was removed
+because it turned every isolated key press into an 11.5 s wait, which was
+worse than the ghosting it removed.
+
+The four-color sample interval is 500 ms rather than 12000 ms when FAST_BW is
+enabled. The 12 s figure was sized for the 23 s full-color waveform, and it
+was throttling key presses by up to 12 s before anything happened.
+
+Per-refresh telemetry sits at DEBUG with a single INFO summary line. The
+secondary USB-Serial-JTAG console blocks the logging task while a host is
+attached but not draining, so log volume in this path costs input
+responsiveness.
 
 Full-color refresh deliberately keeps its own temperature handling. `EPD_Init`
 hardware-resets the controller and never writes CCSET/TSSET, so it uses the
@@ -435,6 +462,8 @@ and is kept so the experiments are repeatable:
 
 * `ZECTRIX_EPD_FAST_BW_PLL_SWEEP` - scan-clock sweep.
 * `ZECTRIX_EPD_FAST_BW_TSSET_SWEEP` - waveform temperature-section sweep.
+* `ZECTRIX_EPD_FAST_BW_TRUNCATE_SWEEP` - truncation-deadline sweep, the one
+  experiment that needs a person watching the panel rather than a log.
 * `ZECTRIX_EPD_FAST_BW_PSR_SWEEP` - PSR second-byte sweep, including LUT_EN.
 * `ZECTRIX_EPD_FAST_BW_TSSET_SWEEP_BOOT` - runs the active sweep at boot,
   needed because an untouched device never produces a dirty rect.
