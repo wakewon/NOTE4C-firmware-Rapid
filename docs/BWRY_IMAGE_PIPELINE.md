@@ -282,6 +282,8 @@ legacy → 01-cal-lab-fs → 02-linear-error → 03-tone-gamut → 04-chroma-gat
 | `dE ref` | 离朴素比色渲染多远。刻意的色调选择会抬高它，是描述不是评分 |
 | `confetti` | 源图中性区域拿到红/黄墨水的比例。**越低越好，永远** |
 | `anisotropy` | 半色调纹理方向性。worm 抬高它，蓝噪声压向 0 |
+| `colour keep` | 源图视觉上有色的区域，经 HVS 积分后仍有可见色度的加权比例；不要求色相准确 |
+| `native +C` | 严格映射已经能表达的同色相区域，被候选额外增加的平均 C\*；越低越克制 |
 
 ΔE 都在 HVS 滤波之后算 —— 半色调逐像素比对没有意义，两边先过一个近似人眼空间响应的高斯。
 
@@ -291,7 +293,8 @@ legacy → 01-cal-lab-fs → 02-linear-error → 03-tone-gamut → 04-chroma-gat
 
 **已完成并验证：** 实测 palette 框架 + 标定流程、Lab 选色、线性光误差扩散、
 Yule-Nielsen 物理积分模型与可切换补偿、
-四面体色域压缩、chroma gate（含残差衰减）、色调/局部对比度、5 类扩散核 + serpentine、
+四面体色域压缩、选择性 LCh palette 转译与局部 saturation 恢复、
+chroma gate（含残差衰减及 tetra 单次 gate）、色调/局部对比度、5 类扩散核 + serpentine、
 蓝噪声与混合路线、边缘保护、三个 preset、A/B 矩阵与对比页、自检。
 
 **实测标定已完成**（`note4c-measured-v1`，A7M2 RAW），并已成为默认 profile。

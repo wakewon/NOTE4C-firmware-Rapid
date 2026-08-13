@@ -208,6 +208,22 @@ def ab_matrix(profile: str = CAL) -> list[Recipe]:
         "blue-noise screening, isolating texture from the colour-rendering intent.",
         **{"dither.algorithm": "tetra-bluenoise"},
     )
+    selective_hybrid = _tweak(
+        cover, "09k-selective-vintage-hybrid",
+        "Visible-colour-retention grade: palette-native red/yellow is protected, while "
+        "unsupported coloured regions rotate through LCh toward the warm ink arc without "
+        "crossing grey. Lower cusp adaptation avoids the overly deep 09i rendering.",
+        color_style="selective-vintage", color_style_strength=0.84,
+        gamut_intent="selective-vivid", gamut_vivid_strength=0.72,
+        gamut_l_adapt=0.18,
+        **{"dither.blue_noise_amount": 0.25},
+    )
+    selective_tetra = _tweak(
+        selective_hybrid, "09l-selective-vintage-tetra",
+        "Same selective colour translation with corrected tetrahedral blue-noise: the "
+        "chroma gate is applied once, with only a narrow neutral-confetti guard.",
+        **{"dither.algorithm": "tetra-bluenoise", "dither.blue_noise_amount": 0.0},
+    )
 
     recipes = [
         legacy(),
@@ -285,6 +301,8 @@ def ab_matrix(profile: str = CAL) -> list[Recipe]:
         vintage_hybrid,
         vintage_tetra,
         vivid_tetra,
+        selective_hybrid,
+        selective_tetra,
         # -- step 8: blue noise ------------------------------------------------
         _tweak(p, "10-bluenoise", "Ordered void-and-cluster blue noise over optimal ink pairs. "
                "No scan-order artefacts at all; second route from the plan.",

@@ -578,11 +578,15 @@ def tetrahedral_bluenoise(
         neutral = np.zeros_like(weights)
         neutral[..., black_i] = 1.0 - t
         neutral[..., white_i] = t
-        # Area coverage makes even a small openness visible as isolated dots;
-        # steepen the soft gate so its uncertain lower half stays clean while
-        # confidently chromatic regions still reach full coverage.
-        openness = np.clip(np.asarray(gate_open), 0.0, 1.0)[..., None] ** 3
-        weights = neutral + openness * (weights - neutral)
+        # ``target_lab`` has already had its a*/b* multiplied by this gate in
+        # the pipeline. Applying openness again (historically openness**3)
+        # double-gated moderate colours and erased large cyan/green/purple
+        # regions after they had been translated into printable warm hues.
+        # Keep only a short neutral guard: it forbids cancellation dots near a
+        # closed gate, then hands full control to the already-gated target.
+        guard = np.clip((np.asarray(gate_open) - 0.12) / 0.38, 0.0, 1.0)
+        guard = guard * guard * (3.0 - 2.0 * guard)
+        weights = neutral + guard[..., None] * (weights - neutral)
 
     if edge is not None and params.edge_suppress > 0:
         # At contours, prefer one solid ink to a high-frequency screen. This is

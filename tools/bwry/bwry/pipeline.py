@@ -40,7 +40,7 @@ from . import legacy as legacy_mod
 from . import metrics as metrics_mod
 from . import pack as pack_mod
 from .dither import DitherParams, dither
-from .grade import adaptive_grade_amount, apply_palette_grade
+from .grade import adaptive_grade_amount, apply_palette_grade, selective_grade_amount
 from .gamut import GamutHull, map_into_gamut
 from .palette import PaletteProfile
 from .tone import ChromaGate, ToneParams, apply_tone, fit_to_device_range
@@ -159,7 +159,10 @@ class Result:
 
     def metrics(self) -> dict:
         p = self.display_profile
-        m = metrics_mod.evaluate(self.codes, self.target_lab, self.source_lab, p)
+        m = metrics_mod.evaluate(
+            self.codes, self.target_lab, self.source_lab, p,
+            reference_lab=self.reference_lab,
+        )
         # Second fidelity figure against a recipe-independent reference, so the
         # numbers stay comparable across candidates with different tone curves.
         m["hvs_delta_e_vs_reference"] = metrics_mod.hvs_delta_e(self.reference_lab, self.codes, p)
@@ -226,7 +229,12 @@ def convert(
         faithful = map_into_gamut(
             diagnostic_source, hull, intent="hue-preserving", knee=1.0, l_adapt=0.0
         )
-        grade_strength, grade_adaptive_meta = adaptive_grade_amount(
+        controller = (
+            selective_grade_amount
+            if recipe.color_style == "selective-vintage"
+            else adaptive_grade_amount
+        )
+        grade_strength, grade_adaptive_meta = controller(
             diagnostic_source, faithful, max_strength=recipe.color_style_strength
         )
     graded, grade_meta = apply_palette_grade(

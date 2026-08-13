@@ -194,11 +194,15 @@ def _metric_cells(metrics: dict) -> str:
     ref = metrics.get("hvs_delta_e_vs_reference", {})
     sc = metrics.get("spurious_chroma", {})
     ink = metrics.get("ink_usage", {})
+    retain = metrics.get("source_colour_retention", {})
+    excess = metrics.get("native_colour_excess", {})
     return (
         f"<span>dE <b>{de.get('mean', 0):.2f}</b></span>"
         f"<span>dE/ref <b>{ref.get('mean', 0):.2f}</b></span>"
         f"<span>confetti <b>{sc.get('rate_in_neutral', 0) * 100:.2f}%</b></span>"
         f"<span>aniso <b>{metrics.get('texture_anisotropy', 0):.3f}</b></span>"
+        f"<span>colour keep <b>{retain.get('score', 0) * 100:.1f}%</b></span>"
+        f"<span>native +C <b>{excess.get('mean_excess_chroma', 0):.1f}</b></span>"
         f"<span>R <b>{ink.get('red', 0) * 100:.1f}%</b> Y <b>{ink.get('yellow', 0) * 100:.1f}%</b></span>"
     )
 

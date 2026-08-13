@@ -276,6 +276,55 @@ def map_vivid_into_gamut(
     return C.xyz_to_lab(C.yule_nielsen_decode_xyz(out_mix, hull.mixing_n))
 
 
+def map_selective_vivid_into_gamut(
+    lab: np.ndarray,
+    hull: GamutHull,
+    *,
+    strength: float = 0.72,
+    hue_weight: float = 0.10,
+    knee: float = 0.80,
+    l_adapt: float = 0.35,
+) -> np.ndarray:
+    """Recover colour only where a hue-preserving mapping would turn grey.
+
+    This is a local blend of ICC-like colorimetric/perceptual and saturation
+    intents.  If the strict result already retains visible chroma, it passes
+    through unchanged; therefore palette-native reds and yellows are not
+    inflated.  If a visibly coloured input collapses toward the neutral axis,
+    a saturation-intent candidate is blended in just far enough to restore a
+    colour signal, accepting false hue only in the region that otherwise has
+    no colour at all.
+    """
+    source = np.asarray(lab, dtype=np.float64)
+    base = compress_into_gamut(source, hull, knee=knee, l_adapt=l_adapt)
+    if strength <= 0.0:
+        return base
+
+    source_c = C.chroma(source)
+    base_c = C.chroma(base)
+
+    source_colour = np.clip((source_c - 5.0) / 17.0, 0.0, 1.0)
+    source_colour = source_colour * source_colour * (3.0 - 2.0 * source_colour)
+    base_visible = np.clip((base_c - 4.0) / 8.0, 0.0, 1.0)
+    base_visible = base_visible * base_visible * (3.0 - 2.0 * base_visible)
+    recovery = np.clip(strength, 0.0, 1.0) * source_colour * (1.0 - base_visible)
+    if not np.any(recovery > 1e-6):
+        return base
+
+    vivid = map_vivid_into_gamut(
+        source,
+        hull,
+        strength=1.0,
+        hue_weight=hue_weight,
+        knee=knee,
+        l_adapt=l_adapt,
+    )
+    base_mix = C.yule_nielsen_encode_xyz(C.lab_to_xyz(base), hull.mixing_n)
+    vivid_mix = C.yule_nielsen_encode_xyz(C.lab_to_xyz(vivid), hull.mixing_n)
+    out_mix = base_mix + recovery[..., None] * (vivid_mix - base_mix)
+    return C.xyz_to_lab(C.yule_nielsen_decode_xyz(out_mix, hull.mixing_n))
+
+
 def map_into_gamut(
     lab: np.ndarray,
     hull: GamutHull,
@@ -296,7 +345,18 @@ def map_into_gamut(
             knee=knee,
             l_adapt=l_adapt,
         )
-    raise ValueError(f"unknown gamut intent {intent!r}; try 'hue-preserving' or 'vivid'")
+    if intent == "selective-vivid":
+        return map_selective_vivid_into_gamut(
+            lab, hull,
+            strength=vivid_strength,
+            hue_weight=vivid_hue_weight,
+            knee=knee,
+            l_adapt=l_adapt,
+        )
+    raise ValueError(
+        f"unknown gamut intent {intent!r}; try 'hue-preserving', 'vivid' or "
+        "'selective-vivid'"
+    )
 
 
 def gamut_report(hull: GamutHull) -> str:

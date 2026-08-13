@@ -88,6 +88,69 @@ def spurious_chroma(
     }
 
 
+def source_colour_retention(
+    codes: np.ndarray,
+    source_lab: np.ndarray,
+    profile: PaletteProfile,
+    sigma: float = DEFAULT_HVS_SIGMA,
+) -> dict:
+    """How much source-visible colour remains visible after spatial averaging.
+
+    This deliberately scores *presence*, not hue accuracy.  On a red/yellow
+    panel a blue object cannot stay blue, but it should not silently become
+    grey when the chosen rendering intent promises palette translation.
+    """
+    got = hvs_filtered_lab(codes, profile, sigma)
+    src = (
+        ndimage.gaussian_filter(source_lab, sigma=(sigma, sigma, 0), mode="nearest")
+        if sigma > 0 else source_lab
+    )
+    source_c = C.chroma(src)
+    got_c = C.chroma(got)
+    source_weight = np.clip((source_c - 6.0) / 16.0, 0.0, 1.0)
+    source_weight = source_weight * source_weight * (3.0 - 2.0 * source_weight)
+    visible = np.clip((got_c - 3.5) / 7.5, 0.0, 1.0)
+    visible = visible * visible * (3.0 - 2.0 * visible)
+    denom = max(float(source_weight.sum()), 1e-9)
+    lost = (got_c < 3.5).astype(np.float64)
+    return {
+        "score": round(float(np.sum(source_weight * visible) / denom), 4),
+        "lost_area": round(float(np.sum(source_weight * lost) / denom), 4),
+        "source_colour_area": round(float(np.mean(source_weight)), 4),
+        "mean_output_chroma": round(float(np.sum(source_weight * got_c) / denom), 2),
+    }
+
+
+def native_colour_excess(
+    codes: np.ndarray,
+    source_lab: np.ndarray,
+    reference_lab: np.ndarray,
+    profile: PaletteProfile,
+    sigma: float = DEFAULT_HVS_SIGMA,
+) -> dict:
+    """Over-colouring within regions a strict mapping already represents."""
+    got = hvs_filtered_lab(codes, profile, sigma)
+    if sigma > 0:
+        src = ndimage.gaussian_filter(source_lab, sigma=(sigma, sigma, 0), mode="nearest")
+        ref = ndimage.gaussian_filter(reference_lab, sigma=(sigma, sigma, 0), mode="nearest")
+    else:
+        src, ref = source_lab, reference_lab
+    src_lch = C.lab_to_lch(src)
+    ref_lch = C.lab_to_lch(ref)
+    native = np.clip((ref_lch[..., 1] - 5.0) / 10.0, 0.0, 1.0)
+    native *= 1.0 - np.clip(
+        (C.hue_distance(src_lch[..., 2], ref_lch[..., 2]) - 10.0) / 28.0,
+        0.0,
+        1.0,
+    )
+    denom = max(float(native.sum()), 1e-9)
+    excess = np.maximum(C.chroma(got) - ref_lch[..., 1], 0.0)
+    return {
+        "mean_excess_chroma": round(float(np.sum(native * excess) / denom), 3),
+        "native_area": round(float(np.mean(native)), 4),
+    }
+
+
 def texture_anisotropy(codes: np.ndarray, profile: PaletteProfile) -> float:
     """How directional the halftone texture is. Lower is better.
 
@@ -111,10 +174,17 @@ def evaluate(
     source_lab: np.ndarray,
     profile: PaletteProfile,
     sigma: float = DEFAULT_HVS_SIGMA,
+    reference_lab: np.ndarray | None = None,
 ) -> dict:
-    return {
+    out = {
         "hvs_delta_e": hvs_delta_e(target_lab, codes, profile, sigma),
         "ink_usage": ink_usage(codes, profile),
         "spurious_chroma": spurious_chroma(codes, source_lab, profile),
+        "source_colour_retention": source_colour_retention(codes, source_lab, profile, sigma),
         "texture_anisotropy": texture_anisotropy(codes, profile),
     }
+    if reference_lab is not None:
+        out["native_colour_excess"] = native_colour_excess(
+            codes, source_lab, reference_lab, profile, sigma
+        )
+    return out

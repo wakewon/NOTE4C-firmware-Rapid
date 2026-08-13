@@ -24,8 +24,13 @@ from bwry import color as C
 from bwry import pack
 from bwry.bluenoise import void_and_cluster
 from bwry.calibrate import make_chart, homography, mark_centers, sample_patches
-from bwry.gamut import GamutHull, compress_into_gamut, map_vivid_into_gamut
-from bwry.grade import adaptive_grade_amount, apply_palette_grade
+from bwry.gamut import (
+    GamutHull,
+    compress_into_gamut,
+    map_selective_vivid_into_gamut,
+    map_vivid_into_gamut,
+)
+from bwry.grade import adaptive_grade_amount, apply_palette_grade, selective_grade_amount
 from bwry.legacy import legacy_bwry_codes
 from bwry.palette import PaletteProfile
 from bwry.dither import DitherParams, dither
@@ -139,6 +144,23 @@ def test_palette_and_gamut() -> None:
     check("vivid intent does not tint neutral content",
           bool(np.allclose(grey_vivid, grey_base, atol=1e-10)))
 
+    blue_selective = map_selective_vivid_into_gamut(
+        blue, physical_hull, strength=0.72
+    )
+    check("selective vivid recovers colour that strict mapping loses",
+          float(C.chroma(blue_selective).item()) > float(C.chroma(blue_base).item()) + 12.0,
+          f"C* {float(C.chroma(blue_base).item()):.1f} -> "
+          f"{float(C.chroma(blue_selective).item()):.1f}")
+
+    native_red = measured.lab[measured.index_of("red")][None, None, :]
+    native_base = compress_into_gamut(native_red, physical_hull)
+    native_selective = map_selective_vivid_into_gamut(
+        native_red, physical_hull, strength=0.72
+    )
+    check("selective vivid leaves already printable colour alone",
+          float(C.delta_e76(native_base, native_selective).item()) < 0.01,
+          f"dE76={float(C.delta_e76(native_base, native_selective).item()):.4f}")
+
 
 def test_halftone_model() -> None:
     print("halftone optical model")
@@ -197,6 +219,31 @@ def test_halftone_model() -> None:
     check("tetrahedral blue noise preserves optical area coverage",
           tetra_de < 0.3 and abs(tetra_black - 0.5) < 0.01,
           f"dE76={tetra_de:.2f}, black={tetra_black:.3f}")
+
+    # A half-open chroma gate describes a target that has already been faded
+    # toward neutral by ChromaGate.apply().  The tetra sampler must not cube
+    # that openness and erase the remaining colour a second time.
+    mixed_weights = np.full(4, 0.25)
+    mixed_work = mixed_weights @ C.yule_nielsen_encode_xyz(profile.xyz, n)
+    mixed_lab = C.xyz_to_lab(C.yule_nielsen_decode_xyz(mixed_work, n))
+    mixed_target = np.broadcast_to(mixed_lab, (120, 160, 3)).copy()
+    half_gate = np.full(mixed_target.shape[:2], 0.5)
+    mixed_codes = dither(
+        mixed_target,
+        profile,
+        DitherParams(
+            algorithm="tetra-bluenoise", dot_gain_compensation=True,
+            chroma_penalty=0.0,
+        ),
+        gate_open=half_gate,
+    )
+    chromatic_codes = [
+        ink.device_code for ink in profile.inks if C.chroma(ink.lab) >= 12.0
+    ]
+    chromatic_fraction = float(np.mean(np.isin(mixed_codes, chromatic_codes)))
+    check("tetra gate does not attenuate confidently chromatic targets twice",
+          abs(chromatic_fraction - 0.5) < 0.02,
+          f"chromatic coverage={chromatic_fraction:.3f}")
 
 
 def test_tone_lut() -> None:
@@ -273,6 +320,22 @@ def test_palette_grade() -> None:
           float(np.mean(cool_amount)) > 3.0 * float(np.mean(native_amount)),
           f"native={native_meta['mean_effective_strength']}, "
           f"cool={cool_meta['mean_effective_strength']}")
+
+    selective_native, _ = selective_grade_amount(native, native_faithful)
+    selective_cool, _ = selective_grade_amount(cool, cool_faithful)
+    check("selective controller protects already printable colour",
+          float(np.mean(selective_native)) < 0.08,
+          f"mean strength={float(np.mean(selective_native)):.3f}")
+    check("selective controller targets unsupported visible colour",
+          float(np.mean(selective_cool)) > 5.0 * float(np.mean(selective_native)),
+          f"native={float(np.mean(selective_native)):.3f}, "
+          f"cool={float(np.mean(selective_cool)):.3f}")
+
+    half, _ = apply_palette_grade(swatches[:, :2], profile,
+                                  style="selective-vintage", strength=0.5)
+    check("polar selective grade does not cross the grey axis",
+          bool(np.all(C.chroma(half) > 20.0)),
+          f"minimum C*={float(np.min(C.chroma(half))):.1f}")
 
 
 def test_pipeline_outputs() -> None:
