@@ -172,9 +172,39 @@ idf.py merge-bin
 | `build/merged-binary.bin` | 首次刷写、救砖、网页/GUI 整包刷写 | `0x0` |
 | `build/xiaozhi.bin` | OTA，或已具备正确 bootloader/分区表时单独更新应用 | `0x20000` |
 
+**注意 `merge-bin` 不会被 `idf.py build` 自动带上。** 改完代码只跑 `idf.py build`
+的话，`xiaozhi.bin` 是新的、`merged-binary.bin` 还是旧的。刷了旧的合并镜像会得到
+一个看起来能跑、但缺少最近改动的固件。改完代码后两条都要跑：
+
+```bash
+idf.py build && idf.py merge-bin
+```
+
+### 保留配网刷写
+
+`merged-binary.bin` 从 `0x0` 写入约 3 MB，正好盖住 `nvs @ 0x9000`——WiFi 凭据、
+设备密钥和配网状态都在那里，所以整包刷写必然要重新配网。用这个脚本可以避免：
+
+```bash
+python3 firmware/scripts/flash_keep_nvs.py --port /dev/cu.usbmodem1101
+```
+
+它先把 `nvs`（和 `phy_init`）读出来存到 `firmware/build/nvs_backup/`，再刷写，
+最后写回并读回校验。备份失败会直接中止，不会带着失败的备份去刷。
+
+`ota_1 @ 0x410000` 和 `assets @ 0x800000` 在合并镜像覆盖范围之外，本来就不受影响，
+所以相册和资源包不会丢。
+
+其他用法：
+
+```bash
+python3 firmware/scripts/flash_keep_nvs.py --port <PORT> --backup-only   # 只备份
+python3 firmware/scripts/flash_keep_nvs.py --port <PORT> --restore firmware/build/nvs_backup/nvs_<时间戳>.bin
+```
+
 若设备曾把 `xiaozhi.bin` 错写到 `0x0` 并出现 `Invalid image block`，可执行
 `idf.py erase-flash flash monitor` 恢复；该命令会清除原 NVS。需要保留 NVS 时，
-应先备份后再执行擦除。
+先用上面的 `--backup-only` 备份，刷完再 `--restore` 写回。
 
 根目录辅助命令：
 
