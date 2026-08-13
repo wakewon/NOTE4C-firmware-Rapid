@@ -149,6 +149,21 @@ cd firmware
 idf.py build
 ```
 
+上面两个 `export` 都是必需的，缺任何一个 `export.sh` 都会「成功」但不把 `idf.py` 放进 PATH：
+
+- 缺 `IDF_TOOLS_PATH` → 回退去找 `~/.espressif`，那里什么都没有
+- 缺 `PATH=python@3.12` → venv 目录名按当前 `python3` 版本拼（`idf6.0_py3.12_env`），
+  用 3.14 就会去找一个从没创建过的 `idf6.0_py3.14_env`
+
+两种情况报的都是「virtual environment not found」，容易误判成没装。
+
+不想每次记这两行，可以直接用 `firmware/scripts/package.py`——它会自己找到 IDF、
+找到旁边的 `.espressif`、并按已安装的 venv 名字反推该用哪个 Python：
+
+```bash
+python3 firmware/scripts/package.py
+```
+
 2026-08-12 已通过一次干净全量构建；生成的应用镜像 `xiaozhi.bin` 为
 `0x2b97a0` 字节，最小应用分区剩余 `0x136860` 字节（31%）。连接设备后可让
 ESP-IDF 按 `flash_args` 中的偏移刷写全部镜像：
