@@ -472,15 +472,47 @@ void CustomLcdDisplay::ArmIdleFullRefreshLocked(
     TickType_t now, ssd2683_fast_bw::RecoveryMode recovery_mode) {
 #if CONFIG_ZECTRIX_EPD_FAST_BW
     fast_bw_recovery_mode_ = recovery_mode;
-    const uint32_t delay_ms = ssd2683_fast_bw::RecoveryDelayMs(
-        recovery_mode, kFastBwQualityIdleFullMs, kFastBwDeferredIdleFullMs);
-    idle_full_refresh_deadline_ = now + pdMS_TO_TICKS(delay_ms);
+    idle_full_refresh_deadline_ = static_cast<TickType_t>(
+        ssd2683_fast_bw::RecoveryDeadlineFromCompletion(
+            static_cast<uint32_t>(now), recovery_mode,
+            static_cast<uint32_t>(pdMS_TO_TICKS(kFastBwQualityIdleFullMs)),
+            static_cast<uint32_t>(pdMS_TO_TICKS(kFastBwDeferredIdleFullMs))));
     idle_full_refresh_armed_ = true;
     idle_full_refresh_pending_ = false;
 #else
     (void)now;
     (void)recovery_mode;
 #endif
+}
+
+void CustomLcdDisplay::CompleteFastBwRefreshLocked(TickType_t completed_at) {
+#if CONFIG_ZECTRIX_EPD_FAST_BW
+    fast_bw_since_full_ = true;
+    // RequestFastBwRefresh() tentatively resets the idle clock as soon as the
+    // user acts. Rebase it here so a long complete B/W balance waveform does
+    // not consume the entire 10/30 s dwell while BUSY is asserted.
+    ArmIdleFullRefreshLocked(completed_at, fast_bw_recovery_mode_);
+    ESP_LOGW(TAG,
+             "[FULL_COLOR] recovery armed from FAST_BW completion mode=%s delay=%us",
+             fast_bw_recovery_mode_ ==
+                     ssd2683_fast_bw::RecoveryMode::DeferredInteraction
+                 ? "deferred_interaction" : "quality",
+             static_cast<unsigned>(ssd2683_fast_bw::RecoveryDelayMs(
+                 fast_bw_recovery_mode_, kFastBwQualityIdleFullMs,
+                 kFastBwDeferredIdleFullMs) / 1000U));
+#else
+    (void)completed_at;
+#endif
+}
+
+void CustomLcdDisplay::CompleteFullColorRefreshLocked() {
+    fast_bw_since_full_ = false;
+    // A standard waveform clears every kind of FAST_BW debt. Drop both an
+    // armed deadline and a callback that became pending while the controller
+    // was busy; a later queued FAST_BW request will establish a fresh one when
+    // it actually completes.
+    idle_full_refresh_armed_ = false;
+    idle_full_refresh_pending_ = false;
 }
 
 void CustomLcdDisplay::RequestFastBwRefresh(
@@ -515,7 +547,7 @@ void CustomLcdDisplay::RequestFastBwRefresh(
     fast_bw_refresh_requested_ = true;
     refresh_in_progress = true;
     ArmIdleFullRefreshLocked(xTaskGetTickCount(), recovery_mode);
-    ESP_LOGI(TAG, "[ULTRA_BW] request recovery=%s delay=%us",
+    ESP_LOGI(TAG, "[ULTRA_BW] request recovery=%s delay_after_complete=%us",
              recovery_mode == ssd2683_fast_bw::RecoveryMode::DeferredInteraction
                  ? "deferred_interaction" : "quality",
              static_cast<unsigned>(ssd2683_fast_bw::RecoveryDelayMs(
@@ -686,7 +718,10 @@ void CustomLcdDisplay::refresh_task_loop() {
         (void)CheckRefreshIdleLocked();
         xSemaphoreGive(dirty_mutex);
 
-        // 周期性采样：按 last_sample_tick 计时，非刷新结束时间
+        // Sample work no faster than this interval. ``last_sample_tick`` is
+        // also rebased after an actual waveform completes, so background work
+        // cannot start back-to-back merely because the preceding waveform was
+        // longer than the sampling interval.
         TickType_t min_ticks = pdMS_TO_TICKS(sample_interval_ms);
         // force_full and idle_full must be exempt, exactly as they are in the
         // debounce below. Their pending flags were already consumed into the
@@ -876,7 +911,9 @@ void CustomLcdDisplay::refresh_task_loop() {
             memcpy(prev_buffer, tx_buf, lcd_spi_data.buffer_len);
             prev_buffer_synced = true;
             partial_since_full = 0;
-            fast_bw_since_full_ = false;
+            xSemaphoreTake(dirty_mutex, portMAX_DELAY);
+            CompleteFullColorRefreshLocked();
+            xSemaphoreGive(dirty_mutex);
             ESP_LOGW(TAG, "[FULL_COLOR] complete in %u ms",
                      (unsigned)((xTaskGetTickCount() - refresh_started) * portTICK_PERIOD_MS));
         } else if (IsFourColorPanel() && fast_bw) {
@@ -886,9 +923,12 @@ void CustomLcdDisplay::refresh_task_loop() {
                      fast_bw_promoted ? "promoted_dirty_rect" : "requested");
             EPD_InitFastBw();
             EPD_DisplayFastBw();
-            fast_bw_since_full_ = true;
             memcpy(prev_buffer, tx_buf, lcd_spi_data.buffer_len);
             prev_buffer_synced = true;
+            const TickType_t fast_bw_completed = xTaskGetTickCount();
+            xSemaphoreTake(dirty_mutex, portMAX_DELAY);
+            CompleteFastBwRefreshLocked(fast_bw_completed);
+            xSemaphoreGive(dirty_mutex);
             // One line per interactive refresh. The rest of the ULTRA_BW
             // telemetry is at DEBUG: the secondary USB-Serial-JTAG console
             // blocks the logging task while a host is attached but not
@@ -907,6 +947,10 @@ void CustomLcdDisplay::refresh_task_loop() {
             prev_buffer_synced = true;
             partial_since_full++;
         }
+        // Minimum refresh spacing is measured from the previous waveform's
+        // completion. Measuring from its start lets any long waveform consume
+        // the whole interval and makes the next background refresh immediate.
+        last_sample_tick = xTaskGetTickCount();
         xSemaphoreTake(dirty_mutex, portMAX_DELAY);
         refresh_in_progress = false;
         UpdateDisplayBusyLocked();

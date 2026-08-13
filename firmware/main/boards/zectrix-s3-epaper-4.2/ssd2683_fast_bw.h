@@ -16,6 +16,17 @@ constexpr uint32_t RecoveryDelayMs(RecoveryMode mode,
     return mode == RecoveryMode::DeferredInteraction ? deferred_ms : quality_ms;
 }
 
+// Recovery delays describe how long the completed FAST_BW result remains on
+// glass, not how long ago the request was queued. In particular, a periodic
+// complete B/W balance waveform can itself outlast the 10 s quality delay.
+constexpr uint32_t RecoveryDeadlineFromCompletion(uint32_t completed_tick,
+                                                  RecoveryMode mode,
+                                                  uint32_t quality_delay_ticks,
+                                                  uint32_t deferred_delay_ticks) {
+    return completed_tick + RecoveryDelayMs(
+        mode, quality_delay_ticks, deferred_delay_ticks);
+}
+
 // RawDraw and SSD2683 both pack four 2-bit pixels MSB-first. RawDraw uses
 // 00=black, 01=white, 10=yellow, 11=red. FAST_BW keeps white and maps every
 // chromatic/non-white value to black.
@@ -68,6 +79,12 @@ static_assert(RecoveryDelayMs(RecoveryMode::Quality, 10000, 30000) == 10000,
               "quality mode must use its shorter recovery delay");
 static_assert(RecoveryDelayMs(RecoveryMode::DeferredInteraction, 10000, 30000) == 30000,
               "menu interaction must use its deferred recovery delay");
+static_assert(RecoveryDeadlineFromCompletion(14000, RecoveryMode::Quality,
+                                             10000, 30000) == 24000,
+              "quality dwell must start after FAST_BW completes");
+static_assert(RecoveryDeadlineFromCompletion(UINT32_MAX - 4,
+                                             RecoveryMode::Quality, 10, 30) == 5,
+              "completion-based deadline must preserve unsigned tick wrap");
 
 }  // namespace ssd2683_fast_bw
 

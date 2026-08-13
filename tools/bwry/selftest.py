@@ -350,13 +350,22 @@ def test_pipeline_outputs() -> None:
     # conversion and the rendering are talking about the same panel.
     profile_name = "note4c-estimate-v1"
     profile = PaletteProfile.load(profile_name)
-    for recipe in ab_matrix(profile_name):
+    matrix = ab_matrix(profile_name)
+    for recipe in matrix:
         result = convert(rgb, recipe, render_profile=profile)
         ok_size = len(result.payload) == pack.SIZE_2BPP
         ok_codes = bool(result.codes.min() >= 0 and result.codes.max() <= 3)
         ok_round = bool(np.array_equal(pack.unpack_2bpp(result.payload), result.codes))
         check(f"{recipe.name}: 30000 bytes, codes 0..3, round-trips",
               ok_size and ok_codes and ok_round)
+
+    shipping = get_preset("photo", profile_name).to_dict()
+    candidate = next(r for r in matrix if r.name == "09k-selective-vintage-hybrid").to_dict()
+    for recipe_dict in (shipping, candidate):
+        recipe_dict.pop("name")
+        recipe_dict.pop("description")
+    check("photo preset is exactly the selected 09k algorithm",
+          shipping == candidate)
 
     # Average tone: a flat patch must integrate to what was asked for.
     flat = np.full((pack.SCREEN_HEIGHT, pack.SCREEN_WIDTH, 3), 128, dtype=np.uint8)

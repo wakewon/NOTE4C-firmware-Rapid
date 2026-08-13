@@ -96,7 +96,9 @@ config ZECTRIX_EPD_FAST_BW_IDLE_FULL_SECONDS
     depends on ZECTRIX_EPD_FAST_BW
     help
         Used only for menus, cursors and controls where color quality can wait.
-        Restart this timer after every deferred-interaction FAST_BW request.
+        Restart this timer after every deferred-interaction FAST_BW request,
+        then rebase it when that FAST_BW waveform actually completes. This is
+        the minimum time the completed preview remains visible.
 
 config ZECTRIX_EPD_FAST_BW_QUALITY_FULL_SECONDS
     int "Quality-mode idle seconds before full-color recovery"
@@ -105,7 +107,8 @@ config ZECTRIX_EPD_FAST_BW_QUALITY_FULL_SECONDS
     depends on ZECTRIX_EPD_FAST_BW
     help
         Default FAST_BW recovery delay for content where color quality matters,
-        such as manual photo changes. A new request restarts the timer.
+        such as manual photo changes. A new request restarts the timer, and the
+        completed FAST_BW result always remains visible for the full delay.
 
 config ZECTRIX_EPD_FAST_BW_TRUNCATE_MS
     int "Cut the fast waveform short after this many ms (0 disables)"

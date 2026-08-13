@@ -26,7 +26,8 @@ IDEAL = "note4c-ideal"
 # --------------------------------------------------------------------------
 
 
-def photo(profile: str = CAL) -> Recipe:
+def _photo_ab_baseline(profile: str = CAL) -> Recipe:
+    """Natural photo baseline kept stable for the historical A/B ladder."""
     return Recipe(
         name="photo",
         description="Photographs. Moderate S-curve, strong local contrast to buy back the "
@@ -52,6 +53,25 @@ def photo(profile: str = CAL) -> Recipe:
         gamut_knee=0.80,
         gamut_l_adapt=0.35,
     )
+
+
+def photo(profile: str = CAL) -> Recipe:
+    """Shipping photo preset, fixed to the on-panel 09k winner."""
+    recipe = _photo_ab_baseline(profile)
+    recipe.description = (
+        "Photographs. Selectively translates only colour the panel would lose, "
+        "protects palette-native red/yellow, and recovers visible colour with a "
+        "local saturation intent before Yule-Nielsen compensated hybrid diffusion."
+    )
+    recipe.fit = "cover"
+    recipe.color_style = "selective-vintage"
+    recipe.color_style_strength = 0.84
+    recipe.dither.dot_gain_compensation = True
+    recipe.dither.blue_noise_amount = 0.25
+    recipe.gamut_intent = "selective-vivid"
+    recipe.gamut_vivid_strength = 0.72
+    recipe.gamut_l_adapt = 0.18
+    return recipe
 
 
 def illustration(profile: str = CAL) -> Recipe:
@@ -158,7 +178,9 @@ def ab_matrix(profile: str = CAL) -> list[Recipe]:
         local_contrast=0.0, local_detail=0.0, saturation=1.0,
     )
     off_gate = ChromaGate(enabled=False)
-    p = photo(profile)
+    # Keep the research ladder anchored to the pre-09k natural baseline even
+    # though the shipping ``photo`` preset now uses the selected 09k recipe.
+    p = _photo_ab_baseline(profile)
     yn = _tweak(
         p, "09b-sierra2-edge-yn", "Exact 09 pair with measured Yule-Nielsen dot-gain "
         "compensation and physical gamut (n from the profile).",

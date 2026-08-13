@@ -23,6 +23,10 @@ python3 -m venv .venv-imgtool
 .venv-imgtool/bin/python tools/bwry/bwryctl.py convert tmp/Cubes.jpg out.bin --preset photo --preview out.png
 ```
 
+`photo` 已固定为真机选定的 `09k-selective-vintage-hybrid`：4:3 cover、实测
+Yule-Nielsen 补偿、选择性 LCh palette 转译、局部 saturation 恢复，以及带轻量蓝噪声调制的
+Sierra-2 扩散。A/B 矩阵仍保留原来的自然基线，避免历史候选随默认值漂移。
+
 跑一遍 A/B 矩阵并生成对比页：
 
 ```bash

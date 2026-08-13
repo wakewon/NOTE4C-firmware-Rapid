@@ -192,6 +192,8 @@ private:
     bool CheckRefreshIdleLocked();
     void ArmIdleFullRefreshLocked(TickType_t now,
                                   ssd2683_fast_bw::RecoveryMode recovery_mode);
+    void CompleteFastBwRefreshLocked(TickType_t completed_at);
+    void CompleteFullColorRefreshLocked();
 
     // 文本渲染辅助
     void render_text_to_buffer(const char* text, int x, int y, const lv_font_t* font);
