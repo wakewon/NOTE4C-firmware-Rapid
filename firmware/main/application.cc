@@ -51,16 +51,21 @@ int NextSlideshowInterval(int current) {
     return 5;
 }
 
-void UpdateWifiSettingsItem(rawdraw::SettingsRenderer* renderer, bool connected,
+// The three helpers below report whether they actually changed anything, so
+// UpdateStatusBarForUi() can tell a real state transition from an echo of one
+// a button handler already applied.
+bool UpdateWifiSettingsItem(rawdraw::SettingsRenderer* renderer, bool connected,
                             const char* value = nullptr) {
-    if (!renderer) return;
-    renderer->UpdateChecked(kSettingsWifiIndex, connected);
-    renderer->UpdateItem(kSettingsWifiIndex, value ? value : (connected ? "已连接" : "未连接"));
+    if (!renderer) return false;
+    const bool checked_changed = renderer->UpdateChecked(kSettingsWifiIndex, connected);
+    const bool value_changed = renderer->UpdateItem(
+        kSettingsWifiIndex, value ? value : (connected ? "已连接" : "未连接"));
+    return checked_changed || value_changed;
 }
 
-void UpdateHttpServerSettingsItem(rawdraw::SettingsRenderer* renderer, bool running,
+bool UpdateHttpServerSettingsItem(rawdraw::SettingsRenderer* renderer, bool running,
                                   const std::string& ip_address = "") {
-    if (!renderer) return;
+    if (!renderer) return false;
     std::string value;
     if (running && !ip_address.empty()) {
         value = "http://" + ip_address;
@@ -69,13 +74,15 @@ void UpdateHttpServerSettingsItem(rawdraw::SettingsRenderer* renderer, bool runn
     } else {
         value = running ? "已开启" : "已关闭";
     }
-    renderer->UpdateChecked(kSettingsHttpServerIndex, running);
-    renderer->UpdateItem(kSettingsHttpServerIndex, value);
+    const bool checked_changed = renderer->UpdateChecked(kSettingsHttpServerIndex, running);
+    const bool value_changed = renderer->UpdateItem(kSettingsHttpServerIndex, value);
+    return checked_changed || value_changed;
 }
 
-void UpdateLanIpSettingsItem(rawdraw::SettingsRenderer* renderer, const std::string& ip_address) {
-    if (!renderer) return;
-    renderer->UpdateItem(kSettingsLanIpIndex, ip_address.empty() ? "未获取" : ip_address);
+bool UpdateLanIpSettingsItem(rawdraw::SettingsRenderer* renderer, const std::string& ip_address) {
+    if (!renderer) return false;
+    return renderer->UpdateItem(kSettingsLanIpIndex,
+                                ip_address.empty() ? "未获取" : ip_address);
 }
 
 void StartSntpClockSyncOnce() {
@@ -373,6 +380,7 @@ void Application::Initialize() {
 }
 
 void Application::OnUpClick() {
+    InputScope scope(*this);
     ESP_LOGI(kTag, "UP click");
     Board::GetInstance().FlashActivityLed();
     if (rawdraw_ui_manager_) {
@@ -381,6 +389,7 @@ void Application::OnUpClick() {
 }
 
 void Application::OnDownClick() {
+    InputScope scope(*this);
     ESP_LOGI(kTag, "DOWN click");
     Board::GetInstance().FlashActivityLed();
     if (rawdraw_ui_manager_) {
@@ -389,6 +398,7 @@ void Application::OnDownClick() {
 }
 
 void Application::OnUpLongPress() {
+    InputScope scope(*this);
     ESP_LOGI(kTag, "UP long press");
     NoteButtonActivity();
     if (rawdraw_ui_manager_ &&
@@ -399,6 +409,7 @@ void Application::OnUpLongPress() {
 }
 
 void Application::OnDownLongPress() {
+    InputScope scope(*this);
     ESP_LOGI(kTag, "DOWN long press");
     NoteButtonActivity();
     if (rawdraw_ui_manager_) {
@@ -408,12 +419,14 @@ void Application::OnDownLongPress() {
 }
 
 void Application::OnWifiConfigComboLongPress() {
+    InputScope scope(*this);
     ESP_LOGI(kTag, "UP+DOWN long press");
     NoteButtonActivity();
     EnterWifiConfigMode();
 }
 
 void Application::OnBootClick() {
+    InputScope scope(*this);
     ESP_LOGI(kTag, "BOOT click");
     Board::GetInstance().FlashActivityLed();
     if (rawdraw_ui_manager_) {
@@ -422,6 +435,7 @@ void Application::OnBootClick() {
 }
 
 void Application::OnBootLongPress() {
+    InputScope scope(*this);
     ESP_LOGI(kTag, "BOOT long press");
     NoteButtonActivity();
     if (WifiManager::GetInstance().IsConfigMode()) {
@@ -597,16 +611,26 @@ void Application::UpdateStatusBarForUi() {
         data.server_connected = http_server_running;
         data.battery_level = battery_level;
         data.battery_charging = charging;
-        rawdraw_ui_manager_->UpdateStatusBar(data);
-        UpdateWifiSettingsItem(rawdraw_ui_manager_->GetSettingsRenderer(), wifi_connected);
+        bool dirty = rawdraw_ui_manager_->UpdateStatusBar(data);
+        auto* sr = rawdraw_ui_manager_->GetSettingsRenderer();
+        // Evaluate every helper before OR-ing: || would short-circuit and skip
+        // the remaining state pushes as soon as one reported a change.
+        dirty |= UpdateWifiSettingsItem(sr, wifi_connected);
         const std::string lan_ip = wifi_connected ? WifiManager::GetInstance().GetIpAddress() : "";
-        UpdateLanIpSettingsItem(rawdraw_ui_manager_->GetSettingsRenderer(), lan_ip);
-        UpdateHttpServerSettingsItem(rawdraw_ui_manager_->GetSettingsRenderer(),
-                                     rawdraw_ui_manager_->IsLanHttpServerRunning(),
-                                     rawdraw_ui_manager_->IsLanHttpServerRunning()
-                                         ? lan_ip
-                                         : "");
-        rawdraw_ui_manager_->RequestActivePageRefresh();
+        dirty |= UpdateLanIpSettingsItem(sr, lan_ip);
+        dirty |= UpdateHttpServerSettingsItem(sr,
+                                              rawdraw_ui_manager_->IsLanHttpServerRunning(),
+                                              rawdraw_ui_manager_->IsLanHttpServerRunning()
+                                                  ? lan_ip
+                                                  : "");
+        // Two independent reasons to stay quiet, both needed:
+        //   - inside a button handler, that handler repaints on its way out;
+        //   - nothing rendered actually changed, so a repaint would be a
+        //     pixel-identical frame (repeat Scanning/Connecting events, or a
+        //     battery poll that landed on the same percentage).
+        if (dirty && !InInputScope()) {
+            rawdraw_ui_manager_->RequestActivePageRefresh();
+        }
     }
     return;
 }

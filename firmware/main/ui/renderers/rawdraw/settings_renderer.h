@@ -61,8 +61,11 @@ public:
 
     // Data interface
     void SetItems(const std::vector<SettingsItemDef>& items);
-    void UpdateItem(int index, const std::string& value);
-    void UpdateChecked(int index, bool checked);
+    // Both return whether the stored value actually changed. Callers use that
+    // to decide whether a repaint is owed at all: an async event that merely
+    // restates what a button handler already applied is not worth a refresh.
+    bool UpdateItem(int index, const std::string& value);
+    bool UpdateChecked(int index, bool checked);
     int GetItemCount() const { return static_cast<int>(items_.size()); }
     int GetSelectedIndex() const { return selected_index_; }
 

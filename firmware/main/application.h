@@ -38,6 +38,7 @@ public:
 
     AudioService& GetAudioService() { return audio_service_; }
     ui::RawDrawUiManager* GetRawDrawUiManager() { return rawdraw_ui_manager_.get(); }
+
     void UpdateStatusBarForUi();
     void OnUpClick();
     void OnDownClick();
@@ -62,6 +63,38 @@ private:
     void EnterManualSleep();
     void NoteButtonActivity();
     void EnterWifiConfigMode();
+
+    // Held for the duration of a button handler. Every path reachable from one
+    // ends by rendering the resulting state and refreshing it with the menu's
+    // FAST_BW intent, so anything that runs underneath must not also queue a
+    // background redraw -- that would repaint identical content a second time,
+    // and RequestActivePageRefresh() escalates it to FULL_COLOR, preempting the
+    // FAST_BW the handler chose.
+    //
+    // A flag rather than a parameter because the culprits are nested: calling
+    // WifiManager::StopStation() from the Wi-Fi settings toggle raises
+    // WifiEvent::Disconnected *synchronously*, so the network-event handler
+    // runs inside the button handler, before it has finished applying the new
+    // values -- it sees a genuine state change and cannot be filtered out by
+    // comparing values alone.
+    class InputScope {
+    public:
+        explicit InputScope(Application& app) : app_(app) {
+            app_.input_scope_depth_.fetch_add(1, std::memory_order_acq_rel);
+        }
+        ~InputScope() { app_.input_scope_depth_.fetch_sub(1, std::memory_order_acq_rel); }
+        InputScope(const InputScope&) = delete;
+        InputScope& operator=(const InputScope&) = delete;
+
+    private:
+        Application& app_;
+    };
+
+    bool InInputScope() const {
+        return input_scope_depth_.load(std::memory_order_acquire) > 0;
+    }
+
+    std::atomic<int> input_scope_depth_{0};
 };
 
 #endif  // _APPLICATION_H_

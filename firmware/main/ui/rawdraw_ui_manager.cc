@@ -1453,7 +1453,7 @@ bool RawDrawUiManager::AdvanceGallerySlideshow() {
 // Status bar updates
 // ============================================================
 
-void RawDrawUiManager::UpdateStatusBar(const RawDrawStatusBarData& data) {
+bool RawDrawUiManager::UpdateStatusBar(const RawDrawStatusBarData& data) {
     std::lock_guard<std::mutex> lock(ui_state_mutex_);
     const bool changed = status_bar_data_.wifi_connected != data.wifi_connected ||
                          status_bar_data_.server_connected != data.server_connected ||
@@ -1485,6 +1485,7 @@ void RawDrawUiManager::UpdateStatusBar(const RawDrawStatusBarData& data) {
                  status_bar_data_.page_title.c_str(),
                  status_bar_data_.central_text.c_str());
     }
+    return changed;
 }
 
 void RawDrawUiManager::ArmClockRefreshTimer() {

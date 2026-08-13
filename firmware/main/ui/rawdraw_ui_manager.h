@@ -230,7 +230,10 @@ public:
      * Does NOT trigger a render — call RenderAll() or HandleInput()
      * to display the changes.
      */
-    void UpdateStatusBar(const RawDrawStatusBarData& data);
+    // Returns whether any rendered field actually changed. Callers that only
+    // push state (network events, periodic polls) use this to avoid ordering a
+    // refresh for a frame that would come out pixel-identical.
+    bool UpdateStatusBar(const RawDrawStatusBarData& data);
 
     /**
      * @brief Get current status bar data (non-const copy)

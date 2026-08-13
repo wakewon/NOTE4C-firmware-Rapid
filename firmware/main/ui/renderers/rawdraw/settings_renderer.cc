@@ -1077,18 +1077,24 @@ void SettingsRenderer::SetItems(const std::vector<SettingsItemDef>& items) {
     needs_full_refresh_ = true;
 }
 
-void SettingsRenderer::UpdateItem(int index, const std::string& value) {
+bool SettingsRenderer::UpdateItem(int index, const std::string& value) {
     if (index >= 0 && index < static_cast<int>(items_.size())) {
+        const bool changed = items_[index].value != value;
         items_[index].value = value;
         needs_full_refresh_ = true;
+        return changed;
     }
+    return false;
 }
 
-void SettingsRenderer::UpdateChecked(int index, bool checked) {
+bool SettingsRenderer::UpdateChecked(int index, bool checked) {
     if (index >= 0 && index < static_cast<int>(items_.size())) {
+        const bool changed = items_[index].checked != checked;
         items_[index].checked = checked;
         needs_full_refresh_ = true;
+        return changed;
     }
+    return false;
 }
 
 void SettingsRenderer::ShowOtaDialog(const std::vector<std::string>& versions,
