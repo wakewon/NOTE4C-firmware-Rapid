@@ -31,7 +31,8 @@ public:
     int GetCurrentPhotoHeight() const { return current_photo_height_; }
 
 private:
-    void LoadPhotoData(int index);
+    bool LoadPhotoData(int index);
+    bool SelectLoadableFrom(int start, int direction, bool wrap);
     void ClampSelection();
     void DrawMetadataModal(uint8_t* fb, int width, int height);
 

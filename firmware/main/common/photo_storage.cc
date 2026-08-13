@@ -20,6 +20,7 @@
 #include <time.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <mutex>
 
 static const char* kTag = "PhotoStorage";
 
@@ -42,6 +43,11 @@ static const char* kIndexFile = "/spiffs/photos.idx";
 static PhotoInfo s_photos[PHOTO_MAX_PHOTOS];
 static int s_photo_count = 0;
 static bool s_initialized = false;
+// HTTP upload/delete handlers and the UI task access the index concurrently.
+// Serialize the in-memory index and its files as one transaction so a render
+// never observes a half-shifted list after deletion. Recursive is intentional:
+// public helpers lazily call photo_storage_init().
+static std::recursive_mutex s_storage_mutex;
 
 static int save_index(void);
 static int write_meta_file(const PhotoInfo* info);
@@ -83,6 +89,22 @@ static void apply_default_metadata(PhotoInfo* info) {
     if (info->body[0] == '\0') {
         strlcpy(info->body, "暂无文案", sizeof(info->body));
     }
+}
+
+static bool photo_file_available(const PhotoInfo& info) {
+    if (info.id[0] == '\0' || info.path[0] == '\0' || info.file_size == 0) {
+        return false;
+    }
+    struct stat st = {};
+    return stat(info.path, &st) == 0 &&
+           static_cast<uint64_t>(st.st_size) == static_cast<uint64_t>(info.file_size);
+}
+
+static void remove_meta_for_id(const char* id) {
+    if (!id || id[0] == '\0') return;
+    char meta_path[PHOTO_MAX_PATH];
+    snprintf(meta_path, sizeof(meta_path), "%s/%s.meta", kPhotoDir, id);
+    remove(meta_path);
 }
 
 static bool load_meta_file(const char* meta_path, PhotoInfo* out_info) {
@@ -185,6 +207,11 @@ static int rebuild_index_from_meta_files(void) {
 
         if (info.path[0] == '\0') {
             snprintf(info.path, sizeof(info.path), "%s/%s.bin", kPhotoDir, info.id);
+        }
+        if (!photo_file_available(info)) {
+            ESP_LOGW(kTag, "Dropping stale photo metadata without image: %s", info.id);
+            remove(meta_path);
+            continue;
         }
         s_photos[s_photo_count++] = info;
     }
@@ -308,22 +335,35 @@ static int load_index(void) {
     }
 
     s_photo_count = 0;
+    bool index_changed = false;
     for (int i = 0; i < count; i++) {
-        if (fread(&s_photos[i], sizeof(PhotoInfo), 1, f) == 1) {
-            // Validate record
-            if (s_photos[i].id[0] != '\0' && s_photos[i].path[0] != '\0') {
-                apply_default_metadata(&s_photos[i]);
-                s_photo_count++;
-            }
+        PhotoInfo info = {};
+        if (fread(&info, sizeof(PhotoInfo), 1, f) != 1) {
+            index_changed = true;
+            continue;
         }
+        if (info.id[0] == '\0' || info.path[0] == '\0' ||
+            !photo_file_available(info)) {
+            ESP_LOGW(kTag, "Pruning unavailable photo from index: %s",
+                     info.id[0] ? info.id : "<invalid>");
+            remove_meta_for_id(info.id);
+            index_changed = true;
+            continue;
+        }
+        apply_default_metadata(&info);
+        s_photos[s_photo_count++] = info;
     }
 
     fclose(f);
+    if (index_changed) {
+        save_index();
+    }
     ESP_LOGI(kTag, "Loaded %d photos from index", s_photo_count);
     return 0;
 }
 
 int photo_storage_init(void) {
+    std::lock_guard<std::recursive_mutex> lock(s_storage_mutex);
     if (s_initialized) {
         ESP_LOGW(kTag, "Already initialized");
         return 0;
@@ -363,6 +403,7 @@ int photo_storage_init(void) {
 }
 
 int photo_save(const PhotoInfo *info, const uint8_t *data_1bpp) {
+    std::lock_guard<std::recursive_mutex> lock(s_storage_mutex);
     if (!s_initialized) {
         if (photo_storage_init() != 0) {
             return -1;
@@ -430,6 +471,7 @@ int photo_save(const PhotoInfo *info, const uint8_t *data_1bpp) {
 }
 
 int photo_load(const char *id, uint8_t *out_buffer, uint32_t max_size) {
+    std::lock_guard<std::recursive_mutex> lock(s_storage_mutex);
     if (!s_initialized || !id || !out_buffer) {
         return -1;
     }
@@ -464,6 +506,7 @@ int photo_load(const char *id, uint8_t *out_buffer, uint32_t max_size) {
 }
 
 int photo_list(PhotoInfo *out_list, int max_count) {
+    std::lock_guard<std::recursive_mutex> lock(s_storage_mutex);
     if (!s_initialized || !out_list || max_count <= 0) {
         return 0;
     }
@@ -476,6 +519,7 @@ int photo_list(PhotoInfo *out_list, int max_count) {
 }
 
 int photo_delete(const char *id) {
+    std::lock_guard<std::recursive_mutex> lock(s_storage_mutex);
     if (!s_initialized || !id) {
         return -1;
     }
@@ -517,6 +561,7 @@ int photo_delete(const char *id) {
 }
 
 int photo_get_count(void) {
+    std::lock_guard<std::recursive_mutex> lock(s_storage_mutex);
     if (!s_initialized) {
         if (photo_storage_init() != 0) {
             return 0;
@@ -526,6 +571,7 @@ int photo_get_count(void) {
 }
 
 int photo_get_by_index(int index, PhotoInfo *out) {
+    std::lock_guard<std::recursive_mutex> lock(s_storage_mutex);
     if (!s_initialized) {
         if (photo_storage_init() != 0) {
             return -1;
@@ -538,7 +584,23 @@ int photo_get_by_index(int index, PhotoInfo *out) {
     return 0;
 }
 
+int photo_get_by_id(const char *id, PhotoInfo *out) {
+    std::lock_guard<std::recursive_mutex> lock(s_storage_mutex);
+    if (!s_initialized) {
+        if (photo_storage_init() != 0) return -1;
+    }
+    if (!id || !out) return -1;
+    for (int i = 0; i < s_photo_count; ++i) {
+        if (strcmp(s_photos[i].id, id) == 0) {
+            memcpy(out, &s_photos[i], sizeof(PhotoInfo));
+            return 0;
+        }
+    }
+    return -1;
+}
+
 bool photo_exists(const char *id) {
+    std::lock_guard<std::recursive_mutex> lock(s_storage_mutex);
     if (!s_initialized || !id) {
         return false;
     }
@@ -551,6 +613,7 @@ bool photo_exists(const char *id) {
 }
 
 int photo_update_info(const char *id, const PhotoInfo *updates) {
+    std::lock_guard<std::recursive_mutex> lock(s_storage_mutex);
     if (!s_initialized) {
         if (photo_storage_init() != 0) return -1;
     }
@@ -573,6 +636,7 @@ int photo_update_info(const char *id, const PhotoInfo *updates) {
 }
 
 int photo_move(const char *id, int delta) {
+    std::lock_guard<std::recursive_mutex> lock(s_storage_mutex);
     if (!s_initialized) {
         if (photo_storage_init() != 0) return -1;
     }

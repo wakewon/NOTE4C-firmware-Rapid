@@ -147,12 +147,21 @@ void Application::Initialize() {
 
     auto* lcd = static_cast<CustomLcdDisplay*>(display);
     rawdraw_ui_manager_ = std::make_unique<ui::RawDrawUiManager>();
-    rawdraw_ui_manager_->Init(lcd, [lcd](const rawdraw::Rect&, bool) {
-        // Page changes, cursor movement and button-driven UI changes all use
-        // the same low-latency interaction path on SSD2683. The display driver
-        // owns the one-minute idle timer and performs the eventual full-color
-        // recovery. On a monochrome panel this falls back to urgent refresh.
-        lcd->RequestFastBwRefresh();
+    rawdraw_ui_manager_->Init(lcd, [lcd](const rawdraw::Rect&, ui::RefreshIntent intent) {
+        if (intent != ui::RefreshIntent::FullColor) {
+            // Buttons, menus and cursor movement keep the low-latency path.
+            // Photo/content changes recover after 10 s; menu-only operations
+            // deliberately defer the same recovery to 30 s.
+            const auto recovery_mode =
+                intent == ui::RefreshIntent::FastBwDeferredInteraction
+                    ? ssd2683_fast_bw::RecoveryMode::DeferredInteraction
+                    : ssd2683_fast_bw::RecoveryMode::Quality;
+            lcd->RequestFastBwRefresh(recovery_mode);
+        } else {
+            // Background state changes have no interactive latency target.
+            // Render them correctly once instead of FAST_BW plus a recovery.
+            lcd->RequestUrgentFullRefresh();
+        }
     });
 
     if (auto* sr = rawdraw_ui_manager_->GetSettingsRenderer()) {
@@ -430,9 +439,11 @@ void Application::OnBootLongPress() {
 
 void Application::NoteButtonActivity() {
     Board::GetInstance().FlashActivityLed();
-    if (rawdraw_ui_manager_) {
-        rawdraw_ui_manager_->RequestActivePageRefresh();
-    }
+    // The actual button handler renders the resulting UI state with its
+    // explicit FAST_BW intent. Queueing an additional background redraw here
+    // used to turn long presses into a same-content automatic refresh and,
+    // after refresh intents were separated, would immediately override the
+    // 10/30-second interaction policy with FULL_COLOR.
 }
 
 void Application::EnterWifiConfigMode() {

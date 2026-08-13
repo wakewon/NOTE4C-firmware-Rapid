@@ -90,14 +90,22 @@ config ZECTRIX_EPD_FAST_BW_TIMING_ULTRA
 endchoice
 
 config ZECTRIX_EPD_FAST_BW_IDLE_FULL_SECONDS
-    int "Idle seconds before full-color recovery"
+    int "Deferred-interaction idle seconds before full-color recovery"
     range 5 3600
     default 30
     depends on ZECTRIX_EPD_FAST_BW
     help
-        Restart this timer after every interactive FAST_BW request. Once no
-        new request has arrived for this many seconds, perform one standard
-        full-screen four-color refresh to restore colors and reduce ghosting.
+        Used only for menus, cursors and controls where color quality can wait.
+        Restart this timer after every deferred-interaction FAST_BW request.
+
+config ZECTRIX_EPD_FAST_BW_QUALITY_FULL_SECONDS
+    int "Quality-mode idle seconds before full-color recovery"
+    range 1 3600
+    default 10
+    depends on ZECTRIX_EPD_FAST_BW
+    help
+        Default FAST_BW recovery delay for content where color quality matters,
+        such as manual photo changes. A new request restarts the timer.
 
 config ZECTRIX_EPD_FAST_BW_TRUNCATE_MS
     int "Cut the fast waveform short after this many ms (0 disables)"

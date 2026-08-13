@@ -169,6 +169,7 @@ public:
             return;
         }
         display_->ShowFactoryTestPage();
+        ESP_LOGI(kTag, "[FULL_COLOR] request source=factory_test");
         display_->RequestUrgentFullRefresh();
         FactoryTestService::Instance().StartFlow();
     }

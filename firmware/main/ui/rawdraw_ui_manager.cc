@@ -6,6 +6,7 @@
 #include "rawdraw_ui_manager.h"
 // Include LVGL-containing header FIRST so font_engine.h detects LVGL types
 #include "boards/zectrix-s3-epaper-4.2/custom_lcd_display.h"
+#include "common/photo_storage.h"
 #include "rawdraw/style.h"
 #include "rawdraw/rawdraw.h"
 #include "rawdraw/theme.h"
@@ -294,14 +295,8 @@ RawDrawUiManager::RawDrawUiManager()
                 RequestActivePageRefresh();
             }
         });
-    ap_transfer_server_->SetImageReceivedCallback([this](const char*) {
-        if (photo_gallery_renderer_) {
-            photo_gallery_renderer_->RefreshPhotoList();
-            const int count = photo_gallery_renderer_->GetPhotoCount();
-            if (count > 0) {
-                photo_gallery_renderer_->SetSelectedIndex(count - 1);
-            }
-        }
+    ap_transfer_server_->SetImageReceivedCallback([this](const char* photo_id) {
+        QueueGalleryStorageSync(photo_id);
     });
     ap_transfer_server_->SetSettingsChangedCallback([this](int slideshow_interval_minutes) {
         SetGallerySlideshowIntervalMinutes(slideshow_interval_minutes);
@@ -311,9 +306,7 @@ RawDrawUiManager::RawDrawUiManager()
         RequestActivePageRefresh();
     });
     ap_transfer_server_->SetPhotosChangedCallback([this]() {
-        if (photo_gallery_renderer_) {
-            photo_gallery_renderer_->RefreshPhotoList();
-        }
+        QueueGalleryStorageSync();
     });
     ap_transfer_server_->SetShowPhotoCallback([this](const std::string& photo_id) {
         return ShowPhotoById(photo_id);
@@ -435,6 +428,7 @@ void RawDrawUiManager::Init(CustomLcdDisplay* lcd, RefreshCallback refresh_cb) {
         // Establish a known full-color baseline at boot. Later page changes,
         // cursor moves and button-driven updates go through the FAST_BW
         // callback and arm the idle recovery timer.
+        ESP_LOGI(kTag, "[FULL_COLOR] request source=boot_baseline");
         lcd_->RequestUrgentFullRefresh();
     }
 
@@ -458,7 +452,7 @@ void RawDrawUiManager::SetRawDrawTheme(rawdraw::ThemeId theme_id) {
     }
     MarkAllRenderersFullRefresh();
     full_refresh_pending_ = true;
-    RefreshActivePage(true);
+    RefreshActivePage(RefreshIntent::FastBwDeferredInteraction);
 }
 
 rawdraw::ThemeId RawDrawUiManager::GetRawDrawTheme() const {
@@ -512,7 +506,7 @@ void RawDrawUiManager::SwitchPage(RawDrawPageId page) {
         if (mutex) xSemaphoreGive(mutex);
 
         if (!TryDisplayCurrentPhotoRaw4Color()) {
-            TriggerRefresh(true);
+            TriggerRefresh(RefreshIntent::FastBwDeferredInteraction);
         }
     }
 
@@ -574,7 +568,7 @@ bool RawDrawUiManager::IsDisplayRefreshPending() const {
     return lcd_ != nullptr && const_cast<CustomLcdDisplay*>(lcd_)->IsRefreshPending();
 }
 
-void RawDrawUiManager::RefreshActivePage(bool urgent) {
+void RawDrawUiManager::RefreshActivePage(RefreshIntent intent) {
     auto* fb = lcd_ ? lcd_->GetFramebuffer() : nullptr;
     if (!fb) return;
 
@@ -585,11 +579,12 @@ void RawDrawUiManager::RefreshActivePage(bool urgent) {
     if (mutex) xSemaphoreGive(mutex);
 
     if (!TryDisplayCurrentPhotoRaw4Color()) {
-        TriggerRefresh(urgent);
+        TriggerRefresh(intent);
     }
 }
 
-void RawDrawUiManager::RefreshActivePageRect(const rawdraw::Rect& rect, bool urgent) {
+void RawDrawUiManager::RefreshActivePageRect(const rawdraw::Rect& rect,
+                                             RefreshIntent intent) {
     auto* fb = lcd_ ? lcd_->GetFramebuffer() : nullptr;
     if (!fb) return;
 
@@ -599,7 +594,7 @@ void RawDrawUiManager::RefreshActivePageRect(const rawdraw::Rect& rect, bool urg
     RenderAll(fb, width_, height_);
     if (mutex) xSemaphoreGive(mutex);
 
-    RefreshRect(rect, urgent);
+    RefreshRect(rect, intent);
 }
 
 bool RawDrawUiManager::TryDisplayCurrentPhotoRaw4Color() {
@@ -802,7 +797,8 @@ bool RawDrawUiManager::HandleInput(const rawdraw::ButtonEvent& event) {
         }
         if (fb) {
             if (mutex) xSemaphoreGive(mutex);
-            RefreshRect(GetQuickSwitchBounds(), false);
+            RefreshRect(GetQuickSwitchBounds(),
+                        RefreshIntent::FastBwDeferredInteraction);
         } else if (mutex) {
             xSemaphoreGive(mutex);
         }
@@ -822,7 +818,8 @@ bool RawDrawUiManager::HandleInput(const rawdraw::ButtonEvent& event) {
             }
             if (mutex) xSemaphoreGive(mutex);
             if (quick_switch_open_ || had_quick_switch_backing) {
-                RefreshRect(GetQuickSwitchBounds(), false);
+                RefreshRect(GetQuickSwitchBounds(),
+                            RefreshIntent::FastBwDeferredInteraction);
             }
         } else if (mutex) {
             xSemaphoreGive(mutex);
@@ -834,6 +831,12 @@ bool RawDrawUiManager::HandleInput(const rawdraw::ButtonEvent& event) {
     if (!renderer) {
         return false;
     }
+
+    const bool gallery_fullscreen_before =
+        current_page_ == RawDrawPageId::Gallery && photo_gallery_renderer_ &&
+        photo_gallery_renderer_->IsFullscreenMode();
+    const bool gallery_dialog_before =
+        gallery_fullscreen_before && photo_gallery_renderer_->IsDeleteDialogOpen();
 
     // Route event to active page renderer
     bool handled = renderer->HandleInput(event);
@@ -862,7 +865,18 @@ bool RawDrawUiManager::HandleInput(const rawdraw::ButtonEvent& event) {
             if (mutex) xSemaphoreGive(mutex);
 
             if (!TryDisplayCurrentPhotoRaw4Color()) {
-                TriggerRefresh(false);
+                const bool gallery_fullscreen_after =
+                    current_page_ == RawDrawPageId::Gallery &&
+                    photo_gallery_renderer_->IsFullscreenMode();
+                const bool gallery_dialog_after =
+                    gallery_fullscreen_after &&
+                    photo_gallery_renderer_->IsDeleteDialogOpen();
+                const bool photo_quality_operation =
+                    (gallery_fullscreen_before || gallery_fullscreen_after) &&
+                    !gallery_dialog_before && !gallery_dialog_after;
+                TriggerRefresh(photo_quality_operation
+                    ? RefreshIntent::FastBwQuality
+                    : RefreshIntent::FastBwDeferredInteraction);
             }
         }
     }
@@ -1277,7 +1291,7 @@ void RawDrawUiManager::RedrawQuickSwitchOnly(uint8_t* fb) {
     DrawQuickSwitchOverlay(fb, width_, height_);
 }
 
-void RawDrawUiManager::RefreshRect(const rawdraw::Rect& rect, bool urgent) {
+void RawDrawUiManager::RefreshRect(const rawdraw::Rect& rect, RefreshIntent intent) {
     if (!lcd_ || !refresh_cb_) return;
     rawdraw::Rect refresh_rect = rawdraw::align_x8(rawdraw::clamp_rect(
         {rect.x - 4, rect.y - 4, rect.w + 12, rect.h + 12}, width_, height_));
@@ -1287,14 +1301,14 @@ void RawDrawUiManager::RefreshRect(const rawdraw::Rect& rect, bool urgent) {
         xSemaphoreGive(mutex);
         mutex = nullptr;
     }
-    refresh_cb_(refresh_rect, urgent);
+    refresh_cb_(refresh_rect, intent);
 }
 
 // ============================================================
 // Refresh
 // ============================================================
 
-void RawDrawUiManager::TriggerRefresh(bool urgent) {
+void RawDrawUiManager::TriggerRefresh(RefreshIntent intent) {
     if (!lcd_) return;
 
     // Use the framebuffer's dirty tracking
@@ -1312,7 +1326,7 @@ void RawDrawUiManager::TriggerRefresh(bool urgent) {
         if (mutex) xSemaphoreGive(mutex);
         mutex = nullptr;
 
-        refresh_cb_(full_rect, urgent);
+        refresh_cb_(full_rect, intent);
     }
 
     if (mutex) xSemaphoreGive(mutex);
@@ -1336,17 +1350,21 @@ bool RawDrawUiManager::ShowPhotoById(const std::string& photo_id) {
     if (!photo_gallery_renderer_ || photo_id.empty()) {
         return false;
     }
-    photo_gallery_renderer_->RefreshPhotoList();
-    if (!photo_gallery_renderer_->SetSelectedById(photo_id.c_str())) {
+    PhotoInfo info = {};
+    if (photo_get_by_id(photo_id.c_str(), &info) != 0) {
         ESP_LOGW(kTag, "ShowPhotoById failed: id=%s not found", photo_id.c_str());
         return false;
     }
-    photo_gallery_renderer_->EnterFullscreenMode();
-    SwitchPage(RawDrawPageId::Gallery);
-    // SwitchPage is a no-op when the web request changes a photo while the
-    // gallery is already active, so reset explicitly for every /photo/show.
-    ResetGallerySlideshowTimer();
-    ESP_LOGI(kTag, "Show photo fullscreen from HTTP: id=%s", photo_id.c_str());
+
+    {
+        std::lock_guard<std::mutex> lock(gallery_storage_sync_mutex_);
+        gallery_preferred_photo_id_ = photo_id;
+        gallery_show_photo_id_ = photo_id;
+    }
+    gallery_storage_sync_pending_.store(true, std::memory_order_release);
+    // The HTTP task only validates and queues the request. Renderer state and
+    // its cached image buffer are exclusively mutated by the UI loop.
+    ESP_LOGI(kTag, "Queued HTTP photo show on UI task: id=%s", photo_id.c_str());
     return true;
 }
 
@@ -1389,6 +1407,17 @@ void RawDrawUiManager::ResetGallerySlideshowTimer() {
     ArmGallerySlideshowTimer();
 }
 
+void RawDrawUiManager::QueueGalleryStorageSync(const char* preferred_photo_id) {
+    if (preferred_photo_id && preferred_photo_id[0] != '\0') {
+        std::lock_guard<std::mutex> lock(gallery_storage_sync_mutex_);
+        gallery_preferred_photo_id_ = preferred_photo_id;
+    }
+    // HTTP handlers run outside the UI loop. Only publish immutable intent
+    // here; renderer vectors and cached photo buffers are updated by
+    // PumpClockRefresh() on the UI task.
+    gallery_storage_sync_pending_.store(true, std::memory_order_release);
+}
+
 void RawDrawUiManager::OnGallerySlideshowTimer(void* arg) {
     auto* self = static_cast<RawDrawUiManager*>(arg);
     if (self == nullptr) return;
@@ -1416,7 +1445,7 @@ bool RawDrawUiManager::AdvanceGallerySlideshow() {
         return false;
     }
     ESP_LOGI(kTag, "Gallery fullscreen slideshow advanced");
-    RefreshActivePage(false);
+    RefreshActivePage(RefreshIntent::FullColor);
     return true;
 }
 
@@ -1501,14 +1530,59 @@ void RawDrawUiManager::OnTransientRefreshTimer(void* arg) {
 }
 
 void RawDrawUiManager::PumpClockRefresh() {
+    bool gallery_page_changed = false;
+    RefreshIntent gallery_refresh_intent = RefreshIntent::FullColor;
+    if (gallery_storage_sync_pending_.exchange(false, std::memory_order_acq_rel)) {
+        std::string preferred_id;
+        std::string show_id;
+        {
+            std::lock_guard<std::mutex> lock(gallery_storage_sync_mutex_);
+            preferred_id.swap(gallery_preferred_photo_id_);
+            show_id.swap(gallery_show_photo_id_);
+        }
+        if (photo_gallery_renderer_) {
+            photo_gallery_renderer_->RefreshPhotoList(
+                preferred_id.empty() ? nullptr : preferred_id.c_str());
+        }
+        if (photo_detail_renderer_) {
+            photo_detail_renderer_->RefreshPhotoList();
+        }
+        gallery_page_changed = current_page_ == RawDrawPageId::Gallery ||
+                               current_page_ == RawDrawPageId::PhotoDetail;
+        if (!show_id.empty() && photo_gallery_renderer_) {
+            if (current_page_ != RawDrawPageId::Gallery) {
+                SetCurrentPageWithoutRender(RawDrawPageId::Gallery);
+                if (page_switch_cb_) {
+                    page_switch_cb_(RawDrawPageId::Gallery);
+                }
+            }
+            if (photo_gallery_renderer_->SetSelectedById(show_id.c_str()) &&
+                photo_gallery_renderer_->EnterFullscreenMode()) {
+                gallery_page_changed = true;
+                gallery_refresh_intent = RefreshIntent::FastBwQuality;
+                ESP_LOGI(kTag, "Show photo fullscreen from HTTP: id=%s", show_id.c_str());
+            } else {
+                ESP_LOGW(kTag, "Queued photo disappeared or became unreadable: id=%s",
+                         show_id.c_str());
+            }
+        }
+        if (current_page_ == RawDrawPageId::Gallery) {
+            // A newly uploaded photo or deletion fallback starts a fresh dwell
+            // and cancels an already-fired slideshow callback.
+            ResetGallerySlideshowTimer();
+        }
+    }
     const bool page_pending = active_page_refresh_pending_.exchange(false, std::memory_order_acq_rel);
     const bool transient_pending = transient_refresh_pending_.exchange(false, std::memory_order_acq_rel);
     const bool slideshow_pending = gallery_slideshow_pending_.exchange(false, std::memory_order_acq_rel);
     if (slideshow_pending) {
         AdvanceGallerySlideshow();
     }
-    if (page_pending || transient_pending) {
-        RefreshActivePage(false);
+    if (page_pending || transient_pending || gallery_page_changed) {
+        const RefreshIntent intent = (page_pending || transient_pending)
+            ? RefreshIntent::FullColor
+            : gallery_refresh_intent;
+        RefreshActivePage(intent);
     }
 
     if (!kEnableMinuteClockRefresh) {
@@ -1536,7 +1610,7 @@ void RawDrawUiManager::PumpClockRefresh() {
         // instead of a full refresh (EPD_Display) that causes visible flashing.
         RenderAll(fb, width_, height_);
         if (mutex) xSemaphoreGive(mutex);
-        TriggerRefresh(false);
+        TriggerRefresh(RefreshIntent::FullColor);
     }
 
     last_clock_minute_key_ = minute_key;
@@ -1660,7 +1734,7 @@ void RawDrawUiManager::SetSettingsItems(const std::vector<rawdraw::SettingsItemD
 
                 if (mutex) xSemaphoreGive(mutex);
 
-                TriggerRefresh(false);
+                TriggerRefresh(RefreshIntent::FullColor);
             }
         }
     }
@@ -1707,7 +1781,7 @@ void RawDrawUiManager::UpdateWifiStatus(const rawdraw::WifiStatus& status) {
 
                 if (mutex) xSemaphoreGive(mutex);
 
-                TriggerRefresh(false);
+                TriggerRefresh(RefreshIntent::FullColor);
             }
         }
     }
@@ -1745,7 +1819,7 @@ void RawDrawUiManager::SetLifeBarVisible(bool visible) {
                 rawdraw::Clear(fb, width_, height_);
                 RenderAll(fb, width_, height_);
                 if (mutex) xSemaphoreGive(mutex);
-                TriggerRefresh(false);
+                TriggerRefresh(RefreshIntent::FullColor);
             }
         }
     }
@@ -1784,7 +1858,7 @@ void RawDrawUiManager::VoiceWakeupTrigger(bool network_available) {
 
         if (mutex) xSemaphoreGive(mutex);
 
-        TriggerRefresh(false);
+        TriggerRefresh(RefreshIntent::FullColor);
     }
 }
 
@@ -1800,7 +1874,7 @@ void RawDrawUiManager::VoiceWakeupDone() {
 
         if (mutex) xSemaphoreGive(mutex);
 
-        TriggerRefresh(false);
+        TriggerRefresh(RefreshIntent::FullColor);
     }
 }
 

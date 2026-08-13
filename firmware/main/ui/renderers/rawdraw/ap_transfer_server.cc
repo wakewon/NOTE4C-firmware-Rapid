@@ -27,6 +27,7 @@
 #include <new>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace rawdraw {
 
@@ -752,10 +753,10 @@ esp_err_t ApTransferServer::PhotosHandler(httpd_req_t* req) {
     }
     cJSON_AddItemToObject(root, "photos", photos);
 
-    const int count = photo_get_count();
-    for (int i = 0; i < count && i < PHOTO_MAX_PHOTOS; ++i) {
-        PhotoInfo info = {};
-        if (photo_get_by_index(i, &info) != 0) continue;
+    std::vector<PhotoInfo> snapshot(PHOTO_MAX_PHOTOS);
+    const int count = photo_list(snapshot.data(), static_cast<int>(snapshot.size()));
+    for (int i = 0; i < count; ++i) {
+        const PhotoInfo& info = snapshot[i];
         cJSON* item = cJSON_CreateObject();
         if (!item) continue;
         cJSON_AddStringToObject(item, "id", info.id);
@@ -796,6 +797,13 @@ esp_err_t ApTransferServer::PhotoHandler(httpd_req_t* req) {
 
     if (req->method == HTTP_DELETE) {
         const bool deleted = photo_delete(id) == 0;
+        auto* self = static_cast<ApTransferServer*>(req->user_ctx);
+        if (deleted && self && self->photos_changed_callback_) {
+            // Keep the device-side gallery in lockstep with the storage index.
+            // Previously DELETE updated SPIFFS only, leaving the renderer with
+            // a stale id that the next slideshow tick tried to open.
+            self->photos_changed_callback_();
+        }
         httpd_resp_set_type(req, "application/json");
         httpd_resp_set_hdr(req, "Connection", "close");
         esp_err_t ret = httpd_resp_send(req, deleted ? "{\"success\":true}" : "{\"success\":false}",
@@ -806,15 +814,8 @@ esp_err_t ApTransferServer::PhotoHandler(httpd_req_t* req) {
     }
 
     PhotoInfo info = {};
-    bool found = false;
-    const int count = photo_get_count();
-    for (int i = 0; i < count && i < PHOTO_MAX_PHOTOS; ++i) {
-        if (photo_get_by_index(i, &info) == 0 && strcmp(info.id, id) == 0) {
-            found = true;
-            break;
-        }
-    }
-    if (!found || info.file_size == 0 || info.file_size > kImage2bppSize) {
+    if (photo_get_by_id(id, &info) != 0 ||
+        info.file_size == 0 || info.file_size > kImage2bppSize) {
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Not found");
         return ESP_FAIL;
     }
@@ -849,15 +850,7 @@ esp_err_t ApTransferServer::PhotoMetaHandler(httpd_req_t* req) {
     char id[16] = {};
     CopyJsonString(root, "id", id, sizeof(id));
     PhotoInfo info = {};
-    bool found = false;
-    const int count = photo_get_count();
-    for (int i = 0; i < count && i < PHOTO_MAX_PHOTOS; ++i) {
-        if (photo_get_by_index(i, &info) == 0 && strcmp(info.id, id) == 0) {
-            found = true;
-            break;
-        }
-    }
-    if (!found) {
+    if (photo_get_by_id(id, &info) != 0) {
         cJSON_Delete(root);
         SendJson(req, "{\"success\":false,\"error\":\"not_found\"}");
         return ESP_FAIL;

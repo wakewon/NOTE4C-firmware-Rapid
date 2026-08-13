@@ -211,18 +211,24 @@ bool PhotoGalleryRenderer::HandleInput(const ButtonEvent& event) {
     switch (event.type) {
         case ButtonEvent::kUpClick:
             if (selected_index_ > 0) {
-                selected_index_--;
-                ClampSelection();
-                if (mode_ == kFullscreenMode) LoadPhotoData(selected_index_);
+                if (mode_ == kFullscreenMode) {
+                    if (!SelectLoadableFrom(selected_index_ - 1, -1, false)) break;
+                } else {
+                    selected_index_--;
+                    ClampSelection();
+                }
                 needs_full_refresh_ = true;
                 return true;
             }
             break;
         case ButtonEvent::kDownClick:
             if (selected_index_ < GetPhotoCount() - 1) {
-                selected_index_++;
-                ClampSelection();
-                if (mode_ == kFullscreenMode) LoadPhotoData(selected_index_);
+                if (mode_ == kFullscreenMode) {
+                    if (!SelectLoadableFrom(selected_index_ + 1, 1, false)) break;
+                } else {
+                    selected_index_++;
+                    ClampSelection();
+                }
                 needs_full_refresh_ = true;
                 return true;
             }
@@ -230,8 +236,7 @@ bool PhotoGalleryRenderer::HandleInput(const ButtonEvent& event) {
         case ButtonEvent::kBootClick:
             if (mode_ == kMemoryCardMode) {
                 ClampSelection();
-                LoadPhotoData(selected_index_);
-                mode_ = kFullscreenMode;
+                if (!EnterFullscreenMode()) return false;
             } else {
                 mode_ = kMemoryCardMode;
             }
@@ -251,28 +256,60 @@ bool PhotoGalleryRenderer::HandleInput(const ButtonEvent& event) {
     return false;
 }
 
-void PhotoGalleryRenderer::RefreshPhotoList() {
+void PhotoGalleryRenderer::RefreshPhotoList(const char* preferred_id) {
+    const int old_index = selected_index_;
+    char wanted_id[16] = {};
+    if (preferred_id && preferred_id[0] != '\0') {
+        strlcpy(wanted_id, preferred_id, sizeof(wanted_id));
+    } else if (selected_index_ >= 0 &&
+               selected_index_ < static_cast<int>(photo_ids_.size())) {
+        strlcpy(wanted_id, photo_ids_[selected_index_].id, sizeof(wanted_id));
+    }
     photo_ids_.clear();
 
-    PhotoInfo info;
-    int count = photo_get_count();
-    for (int i = 0; i < count && i < PHOTO_MAX_PHOTOS; i++) {
-        if (photo_get_by_index(i, &info) == 0) {
-            PhotoEntry entry = {};
-            memcpy(entry.id, info.id, sizeof(entry.id));
-            memcpy(entry.title, info.title, sizeof(entry.title));
-            memcpy(entry.date, info.date, sizeof(entry.date));
-            memcpy(entry.location, info.location, sizeof(entry.location));
-            memcpy(entry.body, info.body, sizeof(entry.body));
-            entry.width = info.width;
-            entry.height = info.height;
-            entry.file_size = info.file_size;
-            photo_ids_.push_back(entry);
+    std::vector<PhotoInfo> snapshot(PHOTO_MAX_PHOTOS);
+    const int count = photo_list(snapshot.data(), static_cast<int>(snapshot.size()));
+    for (int i = 0; i < count; i++) {
+        const PhotoInfo& info = snapshot[i];
+        PhotoEntry entry = {};
+        memcpy(entry.id, info.id, sizeof(entry.id));
+        memcpy(entry.title, info.title, sizeof(entry.title));
+        memcpy(entry.date, info.date, sizeof(entry.date));
+        memcpy(entry.location, info.location, sizeof(entry.location));
+        memcpy(entry.body, info.body, sizeof(entry.body));
+        entry.width = info.width;
+        entry.height = info.height;
+        entry.file_size = info.file_size;
+        photo_ids_.push_back(entry);
+    }
+    selected_index_ = old_index;
+    bool restored_by_id = false;
+    if (wanted_id[0] != '\0') {
+        for (int i = 0; i < static_cast<int>(photo_ids_.size()); ++i) {
+            if (strcmp(photo_ids_[i].id, wanted_id) == 0) {
+                selected_index_ = i;
+                restored_by_id = true;
+                break;
+            }
         }
     }
     ClampSelection();
+
+    if (mode_ == kFullscreenMode) {
+        if (photo_ids_.empty() ||
+            !SelectLoadableFrom(selected_index_, 1, true)) {
+            // Deleting the final photo is an ordinary empty-album transition,
+            // not an image-decoding error.
+            LoadPhotoData(-1);
+            mode_ = kMemoryCardMode;
+        }
+    }
     ESP_LOGI(kTag, "RefreshPhotoList: storage_count=%d visible_count=%d selected=%d",
              count, static_cast<int>(photo_ids_.size()), selected_index_);
+    if (wanted_id[0] != '\0' && !restored_by_id) {
+        ESP_LOGI(kTag, "Selected photo %s disappeared; fell back to index=%d",
+                 wanted_id, selected_index_);
+    }
 }
 
 void PhotoGalleryRenderer::SetSelectedIndex(int index) {
@@ -282,7 +319,7 @@ void PhotoGalleryRenderer::SetSelectedIndex(int index) {
     }
     selected_index_ = std::max(0, std::min(index, static_cast<int>(photo_ids_.size()) - 1));
     if (mode_ == kFullscreenMode) {
-        LoadPhotoData(selected_index_);
+        SelectLoadableFrom(selected_index_, 1, true);
     }
 }
 
@@ -290,18 +327,35 @@ bool PhotoGalleryRenderer::SetSelectedById(const char* id) {
     if (!id || id[0] == '\0') return false;
     for (int i = 0; i < static_cast<int>(photo_ids_.size()); ++i) {
         if (strcmp(photo_ids_[i].id, id) == 0) {
-            SetSelectedIndex(i);
+            if (i == selected_index_ && mode_ == kFullscreenMode &&
+                current_photo_data_ && current_photo_size_ > 0) {
+                return true;
+            }
+            const int old_index = selected_index_;
+            selected_index_ = i;
+            if (mode_ == kFullscreenMode && !LoadPhotoData(i)) {
+                ESP_LOGW(kTag, "Selected photo is unavailable: id=%s", id);
+                SelectLoadableFrom(old_index, 1, true);
+                return false;
+            }
             return true;
         }
     }
     return false;
 }
 
-void PhotoGalleryRenderer::EnterFullscreenMode() {
-    if (photo_ids_.empty()) return;
+bool PhotoGalleryRenderer::EnterFullscreenMode() {
+    if (photo_ids_.empty()) return false;
     showing_delete_dialog_ = false;
+    if (mode_ == kFullscreenMode && current_photo_data_ && current_photo_size_ > 0) {
+        return true;
+    }
+    if (!SelectLoadableFrom(selected_index_, 1, true)) {
+        mode_ = kMemoryCardMode;
+        return false;
+    }
     mode_ = kFullscreenMode;
-    LoadPhotoData(selected_index_);
+    return true;
 }
 
 bool PhotoGalleryRenderer::SelectNext(bool wrap) {
@@ -314,7 +368,7 @@ bool PhotoGalleryRenderer::SelectNext(bool wrap) {
         next = 0;
     }
 
-    SetSelectedIndex(next);
+    if (!SelectLoadableFrom(next, 1, wrap)) return false;
     needs_full_refresh_ = true;
     ESP_LOGI(kTag, "Slideshow next photo: %d/%d", selected_index_ + 1, count);
     return true;
@@ -541,7 +595,7 @@ void PhotoGalleryRenderer::RenderFullscreenMode(uint8_t* fb, int width, int heig
     DrawStyledRect(fb, width, {0, 0, width, height}, theme.Style(ThemeToken::BackgroundPrimary));
 
     if (photo_ids_.empty() || !current_photo_data_ || current_photo_size_ == 0) {
-        const char* label = "无法加载照片";
+        const char* label = "暂无可用照片";
         int tw = MeasureTextWidth(label, font_);
         DrawText(fb, width, (width - tw) / 2, height / 2, label, font_,
                  theme.ColorFor(ThemeToken::TextPrimary));
@@ -642,30 +696,54 @@ void PhotoGalleryRenderer::RenderDeleteDialog(uint8_t* fb, int width, int height
              hint, font_, secondary, height);
 }
 
-void PhotoGalleryRenderer::LoadPhotoData(int index) {
+bool PhotoGalleryRenderer::LoadPhotoData(int index) {
     if (current_photo_data_) {
         free(current_photo_data_);
         current_photo_data_ = nullptr;
     }
     current_photo_size_ = 0;
 
-    if (index < 0 || index >= static_cast<int>(photo_ids_.size())) return;
+    if (index < 0 || index >= static_cast<int>(photo_ids_.size())) return false;
 
-    PhotoInfo info;
-    if (photo_get_by_index(index, &info) != 0) return;
-
+    const PhotoEntry& info = photo_ids_[index];
+    if (info.file_size == 0 || info.width == 0 || info.height == 0) return false;
     current_photo_data_ = static_cast<uint8_t*>(malloc(info.file_size));
-    if (!current_photo_data_) return;
+    if (!current_photo_data_) return false;
 
     int bytes_read = photo_load(info.id, current_photo_data_, info.file_size);
-    if (bytes_read > 0) {
+    if (bytes_read > 0 &&
+        (IsBwry2bppImage(info.width, info.height, bytes_read) ||
+         IsMono1bppImage(info.width, info.height, bytes_read))) {
         current_photo_size_ = bytes_read;
         current_photo_width_ = info.width;
         current_photo_height_ = info.height;
+        return true;
     } else {
+        ESP_LOGW(kTag, "Skipping unreadable photo id=%s bytes=%d expected=%u",
+                 info.id, bytes_read, static_cast<unsigned>(info.file_size));
         free(current_photo_data_);
         current_photo_data_ = nullptr;
     }
+    return false;
+}
+
+bool PhotoGalleryRenderer::SelectLoadableFrom(int start, int direction, bool wrap) {
+    const int count = GetPhotoCount();
+    if (count <= 0 || direction == 0) return false;
+
+    int index = start;
+    for (int attempt = 0; attempt < count; ++attempt) {
+        if (index < 0 || index >= count) {
+            if (!wrap) return false;
+            index = index < 0 ? count - 1 : 0;
+        }
+        if (LoadPhotoData(index)) {
+            selected_index_ = index;
+            return true;
+        }
+        index += direction;
+    }
+    return false;
 }
 
 void PhotoGalleryRenderer::DeleteSelectedPhoto() {
@@ -675,14 +753,6 @@ void PhotoGalleryRenderer::DeleteSelectedPhoto() {
     if (photo_delete(id) == 0) {
         ESP_LOGI(kTag, "Deleted photo id=%s", id);
         RefreshPhotoList();
-        ClampSelection();
-        if (mode_ == kFullscreenMode) {
-            if (!photo_ids_.empty()) {
-                LoadPhotoData(selected_index_);
-            } else {
-                mode_ = kMemoryCardMode;
-            }
-        }
     } else {
         ESP_LOGW(kTag, "Failed to delete photo id=%s", id);
     }

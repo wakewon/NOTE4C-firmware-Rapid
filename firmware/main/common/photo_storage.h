@@ -104,6 +104,9 @@ int photo_get_count(void);
  */
 int photo_get_by_index(int index, PhotoInfo *out);
 
+/** Atomically copy photo metadata by id. */
+int photo_get_by_id(const char *id, PhotoInfo *out);
+
 /**
  * @brief Check if a photo exists by ID
  */

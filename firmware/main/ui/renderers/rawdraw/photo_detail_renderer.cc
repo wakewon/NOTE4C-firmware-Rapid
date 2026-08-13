@@ -89,7 +89,6 @@ void PhotoDetailRenderer::Init(int width, int height) {
     height_ = height;
     metadata_open_ = false;
     RefreshPhotoList();
-    LoadPhotoData(selected_index_);
     needs_full_refresh_ = true;
 }
 
@@ -160,16 +159,14 @@ bool PhotoDetailRenderer::HandleInput(const ButtonEvent& event) {
     switch (event.type) {
         case ButtonEvent::kUpClick:
             if (selected_index_ > 0) {
-                selected_index_--;
-                LoadPhotoData(selected_index_);
+                if (!SelectLoadableFrom(selected_index_ - 1, -1, false)) break;
                 needs_full_refresh_ = true;
                 return true;
             }
             break;
         case ButtonEvent::kDownClick:
             if (selected_index_ < static_cast<int>(photos_.size()) - 1) {
-                selected_index_++;
-                LoadPhotoData(selected_index_);
+                if (!SelectLoadableFrom(selected_index_ + 1, 1, false)) break;
                 needs_full_refresh_ = true;
                 return true;
             }
@@ -188,21 +185,34 @@ bool PhotoDetailRenderer::HandleInput(const ButtonEvent& event) {
 }
 
 void PhotoDetailRenderer::RefreshPhotoList() {
-    photos_.clear();
-    PhotoInfo info;
-    const int count = photo_get_count();
-    for (int i = 0; i < count && i < PHOTO_MAX_PHOTOS; ++i) {
-        if (photo_get_by_index(i, &info) == 0) {
-            photos_.push_back(info);
+    const int old_index = selected_index_;
+    char wanted_id[16] = {};
+    if (selected_index_ >= 0 && selected_index_ < static_cast<int>(photos_.size())) {
+        strlcpy(wanted_id, photos_[selected_index_].id, sizeof(wanted_id));
+    }
+    photos_.resize(PHOTO_MAX_PHOTOS);
+    const int count = photo_list(photos_.data(), static_cast<int>(photos_.size()));
+    photos_.resize(std::max(0, count));
+    selected_index_ = old_index;
+    if (wanted_id[0] != '\0') {
+        for (int i = 0; i < static_cast<int>(photos_.size()); ++i) {
+            if (strcmp(photos_[i].id, wanted_id) == 0) {
+                selected_index_ = i;
+                break;
+            }
         }
     }
     ClampSelection();
+    if (photos_.empty() || !SelectLoadableFrom(selected_index_, 1, true)) {
+        LoadPhotoData(-1);
+        metadata_open_ = false;
+    }
 }
 
 void PhotoDetailRenderer::SetSelection(int index) {
     selected_index_ = index;
     ClampSelection();
-    LoadPhotoData(selected_index_);
+    SelectLoadableFrom(selected_index_, 1, true);
     needs_full_refresh_ = true;
 }
 
@@ -210,26 +220,49 @@ bool PhotoDetailRenderer::IsCurrentPhotoBwry2bpp() const {
     return IsBwry2bppImage(current_photo_width_, current_photo_height_, current_photo_size_);
 }
 
-void PhotoDetailRenderer::LoadPhotoData(int index) {
+bool PhotoDetailRenderer::LoadPhotoData(int index) {
     if (current_photo_data_) {
         free(current_photo_data_);
         current_photo_data_ = nullptr;
     }
     current_photo_size_ = 0;
 
-    if (index < 0 || index >= static_cast<int>(photos_.size())) return;
+    if (index < 0 || index >= static_cast<int>(photos_.size())) return false;
     const auto& info = photos_[index];
+    if (info.file_size == 0 || info.width == 0 || info.height == 0) return false;
     current_photo_data_ = static_cast<uint8_t*>(malloc(info.file_size));
-    if (!current_photo_data_) return;
+    if (!current_photo_data_) return false;
     const int bytes_read = photo_load(info.id, current_photo_data_, info.file_size);
-    if (bytes_read > 0) {
+    if (bytes_read > 0 &&
+        (IsBwry2bppImage(info.width, info.height, bytes_read) ||
+         IsMono1bppImage(info.width, info.height, bytes_read))) {
         current_photo_size_ = bytes_read;
         current_photo_width_ = info.width;
         current_photo_height_ = info.height;
+        return true;
     } else {
         free(current_photo_data_);
         current_photo_data_ = nullptr;
     }
+    return false;
+}
+
+bool PhotoDetailRenderer::SelectLoadableFrom(int start, int direction, bool wrap) {
+    const int count = static_cast<int>(photos_.size());
+    if (count <= 0 || direction == 0) return false;
+    int index = start;
+    for (int attempt = 0; attempt < count; ++attempt) {
+        if (index < 0 || index >= count) {
+            if (!wrap) return false;
+            index = index < 0 ? count - 1 : 0;
+        }
+        if (LoadPhotoData(index)) {
+            selected_index_ = index;
+            return true;
+        }
+        index += direction;
+    }
+    return false;
 }
 
 void PhotoDetailRenderer::ClampSelection() {

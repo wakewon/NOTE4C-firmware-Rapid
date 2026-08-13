@@ -5,18 +5,32 @@ Target: ZecTrix Note4C, 400x300, SSD2683, BWRY (black/white/red/yellow)
 
 ## Outcome
 
-The firmware now has two deliberately separate SSD2683 refresh paths:
+The firmware now has explicit refresh intents over two SSD2683 waveform paths:
 
-- `ULTRA_BW`: every interactive RawDraw update is converted to black/white,
+- `ULTRA_BW`: interactive RawDraw updates are converted to black/white,
   driven through the controller-matched OTP fast-waveform selection sequence,
   and executed with experimental fixed-120 Hz / 2 ms controller timing.
 - `FULL_COLOR`: the pre-existing standard 2bpp BWRY refresh remains unchanged
-  as the recovery path. It runs once after 60 seconds with no new interactive
-  request. Every new interaction cancels/restarts that not-yet-started timer.
+  as the final-quality path.
+
+Callers must select one of these intents:
+
+- `FullColor`: background/device state changes, slideshow and storage sync;
+  these render correctly once and never create FAST_BW recovery debt.
+- `FastBwQuality`: default interactive/content mode, including manual photo
+  changes; recover with `FULL_COLOR` 10 seconds after the final request.
+- `FastBwDeferredInteraction`: explicit opt-in for menus, cursors and controls;
+  recover 30 seconds after the final request.
+
+Every new FAST_BW request restarts the deadline using that request's mode. A
+deadline creates a recovery only if a FAST_BW waveform actually ran since the
+last full-color refresh; a no-difference request cannot cause an idle refresh.
 
 The original approximately 12-second vendor timing remains a Kconfig fallback.
 No refresh-count threshold inserts a color refresh during continuous use. The
-implementation does not reset or remove panel power midway through a waveform.
+truncated-waveform balance guard is independent of these delays: at most six
+truncated fast waveforms may run consecutively, then the next fast waveform is
+allowed to complete.
 
 ## Existing firmware path
 
@@ -192,19 +206,21 @@ Serial warning logs bracket the actual controller operation:
 Validate on the Note4C panel in this order:
 
 1. Boot and confirm the unchanged standard full-color image is correct.
-2. Perform a single menu move. Confirm only black/white is shown and record both
-   the `ULTRA_BW waveform BUSY` and total duration.
-3. Operate buttons continuously for more than one minute. Confirm there is no
-   intervening `FULL_COLOR` refresh.
-4. Stop input. At 60 seconds after the final request, confirm one full-color
-   refresh restores red/yellow and improves residual balance.
-5. Press a button at about 55 seconds and confirm the recovery moves another
-   60 seconds later.
-6. Repeat black-to-white, white-to-black and color-underlay-to-B/W transitions;
+2. Perform a single menu move. Confirm `recovery=deferred_30s`, then one
+   `FULL_COLOR` about 30 seconds after the final menu request.
+3. Change a fullscreen photo. Confirm `recovery=quality_10s`, then one
+   `FULL_COLOR` about 10 seconds after the final photo request.
+4. Operate either interaction continuously beyond its delay. Confirm there is
+   no intervening `FULL_COLOR`; stopping starts the full delay again.
+5. Trigger a background status change and confirm it uses `FULL_COLOR`
+   directly, with no following idle recovery.
+6. Re-render identical content and confirm no FAST_BW debt or later full-color
+   refresh is created.
+7. Repeat black-to-white, white-to-black and color-underlay-to-B/W transitions;
    photograph residuals and record temperature and panel/FPC revision.
-7. If the image is too weak, test `120HZ` to retain 20 ms blanking. If that is
+8. If the image is too weak, test `120HZ` to retain 20 ms blanking. If that is
    still unusable, select `VENDOR` without changing the scheduling behavior.
-8. Disable `CONFIG_ZECTRIX_EPD_FAST_BW` only if this Note4C panel batch does not
+9. Disable `CONFIG_ZECTRIX_EPD_FAST_BW` only if this Note4C panel batch does not
    contain a compatible fast profile. Standard `FULL_COLOR` remains available
    independently through `RequestUrgentFullRefresh()`.
 

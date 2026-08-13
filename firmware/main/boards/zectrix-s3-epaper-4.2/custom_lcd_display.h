@@ -16,6 +16,7 @@
 #include <freertos/semphr.h>
 
 #include "lcd_display.h"
+#include "ssd2683_fast_bw.h"
 
 /* Display color */
 typedef enum {
@@ -73,7 +74,9 @@ public:
     void RequestUrgentRefresh() override;
     // SSD2683 interaction path: use the OTP fast waveform with B/W-only data,
     // then schedule a standard full-color recovery after the idle timeout.
-    void RequestFastBwRefresh();
+    void RequestFastBwRefresh(
+        ssd2683_fast_bw::RecoveryMode recovery_mode =
+            ssd2683_fast_bw::RecoveryMode::Quality);
     // The async SSD2683 path snapshots the framebuffer, so navigation can keep
     // updating/queuing the latest frame while a fast waveform is in progress.
     bool AllowsInputDuringRefresh() const;
@@ -174,6 +177,8 @@ private:
     bool idle_full_refresh_pending_ = false;
     bool idle_full_refresh_armed_ = false;
     TickType_t idle_full_refresh_deadline_ = 0;
+    ssd2683_fast_bw::RecoveryMode fast_bw_recovery_mode_ =
+        ssd2683_fast_bw::RecoveryMode::Quality;
     TickType_t last_sample_tick = 0;
     int sample_interval_ms = 300; // 节流：采样间隔（可调 200~800）
 
@@ -185,7 +190,8 @@ private:
 
     void UpdateDisplayBusyLocked();
     bool CheckRefreshIdleLocked();
-    void ArmIdleFullRefreshLocked(TickType_t now);
+    void ArmIdleFullRefreshLocked(TickType_t now,
+                                  ssd2683_fast_bw::RecoveryMode recovery_mode);
 
     // 文本渲染辅助
     void render_text_to_buffer(const char* text, int x, int y, const lv_font_t* font);

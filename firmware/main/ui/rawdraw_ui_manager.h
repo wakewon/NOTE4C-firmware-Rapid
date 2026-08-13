@@ -103,7 +103,16 @@ struct RawDrawStatusBarData {
  * The caller (typically CustomLcdDisplay) provides this callback
  * to handle the actual EPD refresh timing.
  */
-using RefreshCallback = std::function<void(const rawdraw::Rect& dirty_rect, bool urgent)>;
+enum class RefreshIntent {
+    FullColor,
+    // Default fast path for content such as photos: recover color after 10 s.
+    FastBwQuality,
+    // Menus/cursors can remain monochrome longer: recover color after 30 s.
+    FastBwDeferredInteraction,
+};
+
+using RefreshCallback =
+    std::function<void(const rawdraw::Rect& dirty_rect, RefreshIntent intent)>;
 using PageSwitchCallback = std::function<void(RawDrawPageId page)>;
 
 /**
@@ -371,9 +380,11 @@ public:
      * fb content to the EPD. This is the method that actually makes
      * pixels appear on the screen.
      *
-     * @param urgent If true, forces immediate full refresh (no throttling)
+     * @param intent Automatic state changes use FullColor. FastBwQuality is
+     *               the default interactive mode; menus explicitly opt into
+     *               FastBwDeferredInteraction.
      */
-    void TriggerRefresh(bool urgent = false);
+    void TriggerRefresh(RefreshIntent intent = RefreshIntent::FullColor);
     bool TryDisplayCurrentPhotoRaw4Color();
 
     /**
@@ -467,11 +478,15 @@ private:
     std::atomic<bool> clock_refresh_pending_{false};
     std::atomic<bool> transient_refresh_pending_{false};
     std::atomic<bool> active_page_refresh_pending_{false};
+    std::atomic<bool> gallery_storage_sync_pending_{false};
     std::atomic<bool> gallery_slideshow_pending_{false};
     std::atomic<int64_t> gallery_slideshow_deadline_us_{0};
     std::atomic<bool> input_refresh_locked_{false};
     int last_clock_minute_key_ = -1;
     int gallery_slideshow_interval_minutes_ = 0;
+    std::mutex gallery_storage_sync_mutex_;
+    std::string gallery_preferred_photo_id_;
+    std::string gallery_show_photo_id_;
 
     // Voice wakeup overlay state
     rawdraw::VoiceWakeupState voice_wakeup_state_;
@@ -485,8 +500,10 @@ private:
     // Internal helpers
     rawdraw::PageRenderer* GetRendererForPage(RawDrawPageId page) const;
     void InitRenderer(RawDrawPageId page);
-    void RefreshActivePage(bool urgent = false);
-    void RefreshActivePageRect(const rawdraw::Rect& rect, bool urgent = false);
+    void RefreshActivePage(RefreshIntent intent = RefreshIntent::FullColor);
+    void RefreshActivePageRect(
+        const rawdraw::Rect& rect,
+        RefreshIntent intent = RefreshIntent::FullColor);
     void DrawStatusBar(uint8_t* fb, int width, int height);
     void ArmClockRefreshTimer();
     void ArmTransientRefreshTimer(int delay_ms = 2000);
@@ -495,6 +512,7 @@ private:
     static void OnGallerySlideshowTimer(void* arg);
     void ArmGallerySlideshowTimer();
     void ResetGallerySlideshowTimer();
+    void QueueGalleryStorageSync(const char* preferred_photo_id = nullptr);
     bool AdvanceGallerySlideshow();
     void DrawGlobalPageFrame(uint8_t* fb, int width, int height);
     void DrawQuickSwitchOverlay(uint8_t* fb, int width, int height);
@@ -503,7 +521,8 @@ private:
     void SnapshotQuickSwitchBacking(uint8_t* fb);
     void RestoreQuickSwitchBacking(uint8_t* fb);
     void RedrawQuickSwitchOnly(uint8_t* fb);
-    void RefreshRect(const rawdraw::Rect& rect, bool urgent = false);
+    void RefreshRect(const rawdraw::Rect& rect,
+                     RefreshIntent intent = RefreshIntent::FullColor);
     static const std::array<QuickSwitchItem, 2>& GetQuickSwitchItems();
     void MarkAllRenderersFullRefresh();
 };

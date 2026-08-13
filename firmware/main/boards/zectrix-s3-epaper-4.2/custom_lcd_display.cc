@@ -35,8 +35,10 @@ static constexpr int kFourColorSampleIntervalMs = 12000;
 // what made a key press sit for several seconds before anything happened.
 static constexpr int kFourColorFastBwSampleIntervalMs = 500;
 #if CONFIG_ZECTRIX_EPD_FAST_BW
-static constexpr uint32_t kFastBwIdleFullMs =
+static constexpr uint32_t kFastBwDeferredIdleFullMs =
     CONFIG_ZECTRIX_EPD_FAST_BW_IDLE_FULL_SECONDS * 1000U;
+static constexpr uint32_t kFastBwQualityIdleFullMs =
+    CONFIG_ZECTRIX_EPD_FAST_BW_QUALITY_FULL_SECONDS * 1000U;
 
 #if CONFIG_ZECTRIX_EPD_FAST_BW_TIMING_VENDOR
 static constexpr uint8_t kFastBwPll = 0x08;  // dynamic, 12.5 Hz
@@ -466,17 +468,23 @@ void CustomLcdDisplay::RequestUrgentRefresh() {
     }
 }
 
-void CustomLcdDisplay::ArmIdleFullRefreshLocked(TickType_t now) {
+void CustomLcdDisplay::ArmIdleFullRefreshLocked(
+    TickType_t now, ssd2683_fast_bw::RecoveryMode recovery_mode) {
 #if CONFIG_ZECTRIX_EPD_FAST_BW
-    idle_full_refresh_deadline_ = now + pdMS_TO_TICKS(kFastBwIdleFullMs);
+    fast_bw_recovery_mode_ = recovery_mode;
+    const uint32_t delay_ms = ssd2683_fast_bw::RecoveryDelayMs(
+        recovery_mode, kFastBwQualityIdleFullMs, kFastBwDeferredIdleFullMs);
+    idle_full_refresh_deadline_ = now + pdMS_TO_TICKS(delay_ms);
     idle_full_refresh_armed_ = true;
     idle_full_refresh_pending_ = false;
 #else
     (void)now;
+    (void)recovery_mode;
 #endif
 }
 
-void CustomLcdDisplay::RequestFastBwRefresh() {
+void CustomLcdDisplay::RequestFastBwRefresh(
+    ssd2683_fast_bw::RecoveryMode recovery_mode) {
 #if !CONFIG_ZECTRIX_EPD_FAST_BW
     RequestUrgentRefresh();
     return;
@@ -506,7 +514,13 @@ void CustomLcdDisplay::RequestFastBwRefresh() {
     urgent_refresh = true;
     fast_bw_refresh_requested_ = true;
     refresh_in_progress = true;
-    ArmIdleFullRefreshLocked(xTaskGetTickCount());
+    ArmIdleFullRefreshLocked(xTaskGetTickCount(), recovery_mode);
+    ESP_LOGI(TAG, "[ULTRA_BW] request recovery=%s delay=%us",
+             recovery_mode == ssd2683_fast_bw::RecoveryMode::DeferredInteraction
+                 ? "deferred_interaction" : "quality",
+             static_cast<unsigned>(ssd2683_fast_bw::RecoveryDelayMs(
+                 recovery_mode, kFastBwQualityIdleFullMs,
+                 kFastBwDeferredIdleFullMs) / 1000U));
     const uint32_t kick_ms = (next_kick_ms_ > 0) ? next_kick_ms_ : kFourColorSampleIntervalMs;
     next_kick_ms_ = 0;
     UpdateDisplayBusyLocked();
@@ -582,6 +596,7 @@ void CustomLcdDisplay::refresh_task_loop() {
     uint32_t stat_urgent = 0;
     uint32_t stat_skip_throttle = 0;
     uint32_t stat_skip_nodiff = 0;
+    uint32_t stat_skip_redundant_full = 0;
     uint32_t stat_skip_tiny = 0;
     uint32_t stat_tiny_forced = 0;
     TickType_t last_stat_tick = 0;
@@ -603,11 +618,12 @@ void CustomLcdDisplay::refresh_task_loop() {
         if ((now_tick - last_stat_tick) >= kStatPeriodTicks) {
             ESP_LOGI(TAG,
                      "[REFRESH] Stat 3s: refresh=%u (full=%u, partial=%u, fast_bw=%u, idle_full=%u, urgent=%u), "
-                     "skip(throttle=%u, nodiff=%u, tiny=%u, tiny_forced=%u)",
+                     "skip(throttle=%u, nodiff=%u, redundant_full=%u, tiny=%u, tiny_forced=%u)",
                      (unsigned)stat_refresh, (unsigned)stat_full, (unsigned)stat_partial,
                      (unsigned)stat_fast_bw, (unsigned)stat_idle_full,
                      (unsigned)stat_urgent, (unsigned)stat_skip_throttle,
-                     (unsigned)stat_skip_nodiff, (unsigned)stat_skip_tiny,
+                     (unsigned)stat_skip_nodiff, (unsigned)stat_skip_redundant_full,
+                     (unsigned)stat_skip_tiny,
                      (unsigned)stat_tiny_forced);
             last_stat_tick = now_tick;
         }
@@ -630,6 +646,8 @@ void CustomLcdDisplay::refresh_task_loop() {
             TickDeadlineReached(now, idle_full_refresh_deadline_)) {
             idle_full_refresh_armed_ = false;
             idle_full_refresh_pending_ = fast_bw_since_full_;
+            ESP_LOGD(TAG, "[FULL_COLOR] idle deadline: fast_bw_debt=%d request=%d",
+                     fast_bw_since_full_, idle_full_refresh_pending_);
         }
 #endif
         if (urgent_refresh) {
@@ -726,6 +744,17 @@ void CustomLcdDisplay::refresh_task_loop() {
         // 统一差异分析：仅统计差异比例
         FrameDiffResult result = analyze_frame_diff(prev_buffer, tx_buf, Width, Height);
 
+        if ((force_full || idle_full) &&
+            !ssd2683_fast_bw::FullColorHasWork(
+                IsFourColorPanel(), prev_buffer_synced,
+                result.diff_bits > 0, fast_bw_since_full_)) {
+            ESP_LOGI(TAG,
+                     "[FULL_COLOR] skip redundant request: previous refresh already full-color and framebuffer unchanged");
+            force_full = false;
+            idle_full = false;
+            stat_skip_redundant_full++;
+        }
+
         // 快速退出：没有任何变化
         if (result.diff_bits == 0 && !force_full && !idle_full) {
             tiny_diff_streak = 0;
@@ -801,7 +830,7 @@ void CustomLcdDisplay::refresh_task_loop() {
             fast_bw = true;
             fast_bw_promoted = true;
             xSemaphoreTake(dirty_mutex, portMAX_DELAY);
-            ArmIdleFullRefreshLocked(xTaskGetTickCount());
+            ArmIdleFullRefreshLocked(xTaskGetTickCount(), fast_bw_recovery_mode_);
             xSemaphoreGive(dirty_mutex);
 #else
             should_full = true;
@@ -827,8 +856,19 @@ void CustomLcdDisplay::refresh_task_loop() {
             if (idle_full) {
                 stat_idle_full++;
             }
-            ESP_LOGW(TAG, "[FULL_COLOR] start reason=%s",
-                     idle_full ? "fast_bw_idle_timeout" : "explicit_or_strategy");
+            const char* full_reason = "strategy";
+            if (!prev_buffer_synced || !prev_buffer) {
+                full_reason = "boot_baseline";
+            } else if (idle_full) {
+                full_reason = "fast_bw_idle_recovery";
+            } else if (force_full) {
+                full_reason = "explicit_request";
+            } else if (result.diff_ratio >= kForceFullDiffRatio) {
+                full_reason = "large_frame_diff";
+            } else if (partial_since_full >= 10) {
+                full_reason = "partial_refresh_limit";
+            }
+            ESP_LOGW(TAG, "[FULL_COLOR] start reason=%s", full_reason);
             ESP_LOGI(TAG, "[REFRESH] Performing FULL refresh");
             EPD_Init();
             EPD_Display();
@@ -853,8 +893,11 @@ void CustomLcdDisplay::refresh_task_loop() {
             // telemetry is at DEBUG: the secondary USB-Serial-JTAG console
             // blocks the logging task while a host is attached but not
             // draining, so volume here costs input responsiveness.
-            ESP_LOGI(TAG, "[ULTRA_BW] complete in %u ms",
-                     (unsigned)((xTaskGetTickCount() - refresh_started) * portTICK_PERIOD_MS));
+            ESP_LOGI(TAG, "[ULTRA_BW] complete in %u ms; recovery=%s",
+                     (unsigned)((xTaskGetTickCount() - refresh_started) * portTICK_PERIOD_MS),
+                     fast_bw_recovery_mode_ ==
+                             ssd2683_fast_bw::RecoveryMode::DeferredInteraction
+                         ? "deferred_30s" : "quality_10s");
         } else {
             stat_partial++;
             ESP_LOGI(TAG, "[REFRESH] Performing PARTIAL refresh");

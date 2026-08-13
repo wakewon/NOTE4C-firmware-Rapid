@@ -42,12 +42,14 @@ public:
     };
 
     // Data interface
-    void RefreshPhotoList();  // Reload from photo_storage
+    // Reload from photo_storage while preserving the selected id. A preferred
+    // id is used after upload; deletion falls back to the next readable item.
+    void RefreshPhotoList(const char* preferred_id = nullptr);
     int GetPhotoCount() const { return static_cast<int>(photo_ids_.size()); }
     int GetSelectedIndex() const { return selected_index_; }
     void SetSelectedIndex(int index);
     bool SetSelectedById(const char* id);
-    void EnterFullscreenMode();
+    bool EnterFullscreenMode();
     bool SelectNext(bool wrap);
     bool IsFullscreenMode() const { return mode_ == kFullscreenMode; }
     bool IsDeleteDialogOpen() const { return showing_delete_dialog_; }
@@ -78,7 +80,8 @@ private:
     void RenderFullscreenMode(uint8_t* fb, int width, int height);
 
     // Photo data loading
-    void LoadPhotoData(int index);
+    bool LoadPhotoData(int index);
+    bool SelectLoadableFrom(int start, int direction, bool wrap);
     void DeleteSelectedPhoto();
 
     // Helpers
