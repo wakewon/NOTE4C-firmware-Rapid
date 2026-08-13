@@ -9,6 +9,9 @@ CLAUDE.md
 __pycache__/
 *.pyc
 
+# Local-only working tree: design docs, fixtures, scratch. Never committed.
+local_assets/
+
 # Local env and secrets
 .env
 .env.local
