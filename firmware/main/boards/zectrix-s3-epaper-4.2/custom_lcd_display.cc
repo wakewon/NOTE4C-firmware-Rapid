@@ -510,9 +510,12 @@ void CustomLcdDisplay::CompleteFullColorRefreshLocked() {
     // A standard waveform clears every kind of FAST_BW debt. Drop both an
     // armed deadline and a callback that became pending while the controller
     // was busy; a later queued FAST_BW request will establish a fresh one when
-    // it actually completes.
+    // it actually completes. The truncation streak is DC debt too: a full
+    // waveform is balanced, so truncations from before it must not carry
+    // forward and count against the next streak's cap.
     idle_full_refresh_armed_ = false;
     idle_full_refresh_pending_ = false;
+    g_fast_bw_truncations_since_complete = 0;
 }
 
 void CustomLcdDisplay::RequestFastBwRefresh(
