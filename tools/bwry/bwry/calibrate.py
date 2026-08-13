@@ -65,11 +65,18 @@ GRID_ROWS = 3
 #: White bands around the patch grid, in chart coordinates, clear of both the
 #: registration marks and the patches. These are known-white by construction,
 #: so they are what the illumination field is fitted from.
+#:
+#: They must also stay *inside* the quadrilateral through the four mark centres
+#: (x 21..379, y 21..279). The homography is only an interpolation within that
+#: quad; a zone reaching past it extrapolates off the active area and onto the
+#: panel bezel, which reads near-black. That contaminated the illumination fit
+#: with values 30x below the true white level and reported a 51% light
+#: variation on a frame whose real variation is a third of that.
 WHITE_ZONES = [
-    (44, 8, 356, 44),    # top
-    (44, 252, 356, 292),  # bottom
-    (8, 44, 44, 256),    # left
-    (356, 44, 392, 256),  # right
+    (44, 24, 356, 48),    # top
+    (44, 252, 356, 276),  # bottom
+    (24, 44, 48, 256),    # left
+    (352, 44, 376, 256),  # right
 ]
 
 
@@ -167,18 +174,42 @@ def find_marks(photo: np.ndarray) -> np.ndarray:
     h, w = gray.shape
     thr = np.percentile(gray, 12.0)
     mask = gray <= thr
-    mask = ndimage.binary_opening(mask, structure=np.ones((3, 3)))
+
+    # Sever thin dark structures before labelling. The panel's bezel seam, a
+    # cable, or the edge of the table is only a few pixels thick, but if one
+    # touches a mark it becomes a single connected component whose centre of
+    # mass sits out on the line rather than on the mark. That is not a small
+    # error: a top-bezel seam merged with the top-left mark here produced a
+    # blob 1799 px wide with a fill ratio of 0.20 and moved that corner 280 px,
+    # skewing the homography enough to sample the black patch as "white border".
+    radius = max(1, int(min(h, w) * 0.0025))
+    mask = ndimage.binary_opening(mask, structure=np.ones((2 * radius + 1, 2 * radius + 1)))
 
     labels, count = ndimage.label(mask)
     if count == 0:
         raise ValueError("no dark regions found; pass --corners")
     sizes = ndimage.sum(mask, labels, range(1, count + 1))
     centers = np.array(ndimage.center_of_mass(mask, labels, range(1, count + 1)))
+    boxes = ndimage.find_objects(labels)
 
+    # A mark is a solid square, so demand that shape: it separates the marks
+    # from halftone bands, glare edges and anything else dark in frame.
     min_area = (h * w) * 0.00015
-    keep = sizes >= min_area
-    if not keep.any():
-        raise ValueError("registration marks too small to detect; pass --corners")
+    keep = np.zeros(count, dtype=bool)
+    for i in range(count):
+        if sizes[i] < min_area:
+            continue
+        ys, xs = boxes[i]
+        bh, bw = ys.stop - ys.start, xs.stop - xs.start
+        if bh == 0 or bw == 0:
+            continue
+        fill = sizes[i] / float(bh * bw)
+        aspect = bw / float(bh)
+        keep[i] = fill >= 0.55 and 0.5 <= aspect <= 2.0
+    if keep.sum() < 4:
+        raise ValueError(
+            f"found {int(keep.sum())} square registration marks, need 4; pass --corners"
+        )
     centers = centers[keep]
 
     corners = np.array([[0, 0], [0, w], [h, w], [h, 0]], dtype=np.float64)  # TL TR BR BL in (y, x)
@@ -233,9 +264,23 @@ class IlluminationField:
     of error in the whole procedure.
     """
 
-    def __init__(self, coeffs: np.ndarray, residual: float):
+    def __init__(self, coeffs: np.ndarray, residual: float, zone_spread: float = 0.0):
         self.coeffs = coeffs  # (6, 3)
         self._residual = residual
+        self._zone_spread = zone_spread
+
+    @property
+    def zone_spread(self) -> float:
+        """Worst disagreement between the corrected white zones, as a fraction.
+
+        This is the number that actually decides whether the flat field did its
+        job. ``non_uniformity`` says how steep the light was; this says whether
+        dividing it out left the four borders of the chart agreeing with each
+        other, which is the precondition for comparing a patch in one corner
+        against a patch in another. A steep but smooth gradient corrects
+        cleanly; a shallow but lumpy one does not.
+        """
+        return float(self._zone_spread)
 
     def evaluate(self, chart_pts: np.ndarray) -> np.ndarray:
         return _poly_features(np.asarray(chart_pts, dtype=np.float64)) @ self.coeffs
@@ -260,32 +305,79 @@ class IlluminationField:
 
     @property
     def residual(self) -> float:
-        """RMS of the quadratic fit against the white border, in linear light.
+        """RMS of the quadratic fit against the white border, relative to level.
 
         A large residual means the light is not smooth -- a hard shadow edge, a
         specular highlight, or a reflection of something in the room.
+
+        Relative, not absolute: the same scene developed a stop brighter has a
+        proportionally larger absolute residual while being no less smooth, so
+        an absolute threshold would fail frames for being well exposed.
         """
-        return float(self._residual)
+        return float(self._residual / max(float(np.mean(self.reference)), 1e-9))
 
 
-def estimate_illumination(photo: np.ndarray, corners: np.ndarray) -> IlluminationField:
+def estimate_illumination(
+    photo: np.ndarray, corners: np.ndarray, linear_photo: np.ndarray | None = None
+) -> IlluminationField:
     h = homography(mark_centers(), np.asarray(corners, dtype=np.float64))
-    linear_photo = C.srgb_to_linear(photo.astype(np.float64) / 255.0)
+    if linear_photo is None:
+        linear_photo = C.srgb_to_linear(photo.astype(np.float64) / 255.0)
+    else:
+        linear_photo = np.asarray(linear_photo, dtype=np.float64)
 
-    pts = []
+    zones = []
     for x0, y0, x1, y1 in WHITE_ZONES:
         gx, gy = np.meshgrid(
             np.linspace(x0 + 3, x1 - 3, max(4, int((x1 - x0) / 8))),
             np.linspace(y0 + 3, y1 - 3, max(4, int((y1 - y0) / 8))),
         )
-        pts.append(np.stack([gx.ravel(), gy.ravel()], axis=1))
-    chart_pts = np.concatenate(pts)
+        zones.append(np.stack([gx.ravel(), gy.ravel()], axis=1))
+    chart_pts = np.concatenate(zones)
 
     vals = _sample(linear_photo, h, chart_pts)
     basis = _poly_features(chart_pts)
     coeffs, *_ = np.linalg.lstsq(basis, vals, rcond=None)
     resid = float(np.sqrt(np.mean((basis @ coeffs - vals) ** 2)))
-    return IlluminationField(coeffs, resid)
+    field = IlluminationField(coeffs, resid)
+
+    # How well did it actually work? Correct each zone and compare their means.
+    # Patch sampling averages hundreds of points, so per-pixel noise is not the
+    # question; systematic disagreement between one edge of the chart and
+    # another is, because that is what biases one patch against another.
+    luma = np.array([0.2126, 0.7152, 0.0722])
+    zone_means = []
+    for pts in zones:
+        corrected = _sample(linear_photo, h, pts) / np.maximum(field.gain(pts), 1e-9)
+        zone_means.append(float(np.mean(corrected @ luma)))
+    zone_means = np.asarray(zone_means)
+    field._zone_spread = float(
+        (zone_means.max() - zone_means.min()) / max(zone_means.mean(), 1e-9)
+    )
+    return field
+
+
+def brightest_chart_level(linear: np.ndarray, corners: np.ndarray) -> float:
+    """Brightest channel anywhere on the chart itself, in linear light.
+
+    Used to expose a RAW for the chart instead of for the frame around it. It
+    reads the patches and the white border, not the whole image, so a white
+    bezel or a lit wall cannot set the exposure. The reference is a high
+    percentile rather than the maximum, so a dust speck or a hot pixel on one
+    patch does not cost the other eleven a stop of range.
+    """
+    h = homography(mark_centers(), np.asarray(corners, dtype=np.float64))
+    regions = [rect for _, rect in _patch_rects()] + list(WHITE_ZONES)
+
+    vals = []
+    for (px, py, qx, qy) in regions:
+        mx, my = (qx - px) * 0.30, (qy - py) * 0.30
+        gx, gy = np.meshgrid(
+            np.linspace(px + mx, qx - mx, 16), np.linspace(py + my, qy - my, 16)
+        )
+        pts = np.stack([gx.ravel(), gy.ravel()], axis=1)
+        vals.append(_sample(linear, h, pts))
+    return float(np.percentile(np.concatenate(vals), 99.5))
 
 
 def sample_patches(
@@ -293,11 +385,29 @@ def sample_patches(
     corners: np.ndarray,
     inset: float = 0.30,
     illumination: IlluminationField | None = None,
+    linear_photo: np.ndarray | None = None,
 ) -> dict[str, PatchSample]:
-    """Sample every chart patch from ``photo`` given the four mark centres."""
+    """Sample every chart patch from ``photo`` given the four mark centres.
+
+    ``linear_photo`` optionally supplies the same scene already in linear light
+    (from a developed RAW), which is then measured instead of the 8-bit encode.
+    That matters for the darkest channel of a saturated ink: this panel's yellow
+    reflects 1.3% of white in blue, which survives 14-bit RAW comfortably but
+    lands on code value 13 +/- noise once encoded to 8-bit sRGB, where a tenth
+    of the patch quantises to zero and looks like a clipped measurement.
+    """
     h = homography(mark_centers(), np.asarray(corners, dtype=np.float64))
-    photo_f = photo.astype(np.float64)
-    linear_photo = C.srgb_to_linear(photo_f / 255.0)
+    if linear_photo is None:
+        if photo is None:
+            raise ValueError("give either photo or linear_photo")
+        photo_f = photo.astype(np.float64)
+        linear_photo = C.srgb_to_linear(photo_f / 255.0)
+        clip_hi, clip_lo, hi, lo = photo_f, photo_f, 253.0, 2.0
+    else:
+        linear_photo = np.asarray(linear_photo, dtype=np.float64)
+        # In linear light "clipped" means the sensor actually ran out of range,
+        # not that the encode ran out of code values.
+        clip_hi, clip_lo, hi, lo = linear_photo, linear_photo, 1.0, 1e-5
 
     out: dict[str, PatchSample] = {}
     for label, (px, py, qx, qy) in _patch_rects():
@@ -313,11 +423,10 @@ def sample_patches(
         if illumination is not None:
             vals = vals / np.maximum(illumination.gain(chart_pts), 1e-9)
 
-        # Clipping check on the raw 8-bit values: a blown white patch or a
+        # Clipping check on the uncorrected values: a blown white patch or a
         # crushed black one makes the whole profile wrong, silently.
-        raw = _sample(photo_f, h, chart_pts)
-        clipped_high = float(np.mean(raw >= 253.0))
-        clipped_low = float(np.mean(raw <= 2.0))
+        clipped_high = float(np.mean(_sample(clip_hi, h, chart_pts) >= hi))
+        clipped_low = float(np.mean(_sample(clip_lo, h, chart_pts) <= lo))
 
         mean_linear = vals.mean(axis=0)
         out[label] = PatchSample(
@@ -445,50 +554,92 @@ def photo_diagnostics(
         if s.clipped_high > 0.05:
             warnings.append(f"{s.label} patch is partly clipped high ({s.clipped_high * 100:.0f}%)")
         if s.clipped_low > 0.05:
-            problems.append(
-                f"{s.label} patch has a channel crushed to zero ({s.clipped_low * 100:.0f}% of it). "
-                "The camera's saturation processing has thrown away that ink's real reflectance, "
-                "and no tone curve can put it back."
-            )
+            # How much does it actually cost? Compare the ink as measured with
+            # the same ink if the floored channel were truly zero. For a
+            # saturated ink's weakest channel that bound is small; for a channel
+            # carrying real luminance it is not. Reporting the bound beats
+            # asserting a cause -- the cause differs between an 8-bit file
+            # (processing) and a RAW (the channel is simply at the noise floor).
+            floor_test = s.linear.copy()
+            floor_test[np.argmin(s.linear)] = 0.0
+            impact = float(C.delta_e76(
+                C.xyz_to_lab(C.linear_to_xyz(s.linear / max(white.linear.max(), 1e-9))),
+                C.xyz_to_lab(C.linear_to_xyz(floor_test / max(white.linear.max(), 1e-9))),
+            ))
+            where = f"{s.label} patch reads zero in its weakest channel over {s.clipped_low * 100:.0f}% of it"
+            if impact > 5.0:
+                problems.append(
+                    f"{where}, which leaves that ink uncertain by up to dE {impact:.0f}. "
+                    "Expose brighter, or shoot RAW if this was a JPEG."
+                )
+            else:
+                warnings.append(
+                    f"{where}; the channel is near the noise floor, so this ink's "
+                    f"colour is uncertain by up to dE {impact:.1f}. A brighter exposure "
+                    "would pin it down"
+                )
 
-    # Hard physical invariant, and the cleanest validity test available: the
-    # white state is the most reflective thing the panel has, so no ink can
-    # out-reflect it in any channel. If one does, the camera is not reporting
-    # reflectance -- it is reporting its own idea of a nice-looking picture.
+    # Hard physical invariant: the white state is the most *luminous* thing the
+    # panel has, so no ink may out-shine it in Y. If one does, the camera is not
+    # reporting reflectance -- it is reporting its own idea of a nice picture.
+    #
+    # The invariant is deliberately on luminance and not per channel. A
+    # saturated ink may legitimately exceed white in a single channel: this
+    # panel's yellow reflects 1.55x the white state in R (measured from RAW,
+    # with the illumination controlled for by the white border directly above
+    # each patch), because its white is a dull particle layer while its yellow
+    # pigment reflects strongly above 500 nm. Its luminance is still only 0.91
+    # of white, so nothing is physically wrong. An earlier per-channel test
+    # rejected exactly this, which is why the first RAW frame was misdiagnosed
+    # as camera processing.
+    #
     # This has to run on the *uncorrected* samples: the gamma correction
     # normalises against white and clips, which erases the evidence.
+    luma = np.array([0.2126, 0.7152, 0.0722])
     invariant_src = raw if raw is not None else samples
     invariant_white = invariant_src["white"]
+    yw_inv = float(invariant_white.linear @ luma)
     for s in invariant_src.values():
         if s.label == "white" or s.label.startswith("mix"):
             continue
-        ratio = s.linear / np.maximum(invariant_white.linear, 1e-9)
-        if ratio.max() > 1.06:
-            ch = "RGB"[int(np.argmax(ratio))]
+        y_ratio = float(s.linear @ luma) / max(yw_inv, 1e-9)
+        if y_ratio > 1.03:
             problems.append(
-                f"{s.label} reflects {ratio.max():.2f}x the white patch in {ch}, which is "
+                f"{s.label} is {y_ratio:.2f}x as luminous as the white patch, which is "
                 "physically impossible. The camera applied saturation/colour processing. "
                 "Re-shoot in RAW or with a manual camera app, everything 'enhancing' off."
+            )
+        ratio = s.linear / np.maximum(invariant_white.linear, 1e-9)
+        if ratio.max() > 2.5:
+            ch = "RGB"[int(np.argmax(ratio))]
+            warnings.append(
+                f"{s.label} reflects {ratio.max():.2f}x the white patch in {ch}. That is "
+                "possible for a saturated ink but extreme; check for colour processing"
             )
 
     yw = float(white.linear @ np.array([0.2126, 0.7152, 0.0722]))
     yb = float(black.linear @ np.array([0.2126, 0.7152, 0.0722]))
     contrast = yw / max(yb, 1e-9)
-    # A BWRY panel lives somewhere around 6:1 to 13:1. Outside that band the
-    # photograph is measuring something other than the panel.
+    # The upper bound exists to catch a camera tone curve, which inflates
+    # contrast dramatically -- the phone JPEG that motivated this check read
+    # 33:1. It was originally set from the *estimated* profile's 7.8:1, which
+    # was a guess and turned out to be far too pessimistic: a linear RAW of this
+    # panel, with no curve anywhere in the path and neither patch clipped,
+    # measures 18:1. Widened to match the evidence rather than the guess, while
+    # still rejecting the JPEG-tone-curve case that the check is for.
     if contrast < 3.5:
         problems.append(
             f"contrast is only {contrast:.1f}:1, too low for this panel. Almost always "
             "glare: a light source or a bright window is reflecting off the front surface "
             "and lifting the black patch. Move the light off-axis."
         )
-    elif contrast > 18.0:
+    elif contrast > 28.0:
         problems.append(
             f"contrast is {contrast:.1f}:1, well above what this panel can physically do. "
             "The camera's tone curve is still in the photo. Shoot RAW or in a manual "
             "camera app with HDR off, or pass --camera-gamma to correct it."
         )
-    elif contrast > 14.0:
+    elif contrast > 22.0:
         warnings.append(
             f"contrast is {contrast:.1f}:1, on the high side for this panel; some of the "
             "camera's contrast curve may still be present"
@@ -496,17 +647,31 @@ def photo_diagnostics(
 
     if illumination is not None:
         nu = illumination.non_uniformity
-        if nu > 0.35:
+        spread = illumination.zone_spread
+        # Judge the correction, not the lighting. A steep gradient that divides
+        # out cleanly is harmless; what ruins a profile is the four edges of the
+        # chart still disagreeing afterwards, because then a patch in one corner
+        # is not comparable with a patch in another.
+        if spread > 0.05:
             problems.append(
-                f"light across the panel varies by {nu * 100:.0f}% -- too uneven to correct "
+                f"after flat-field correction the chart's white borders still disagree by "
+                f"{spread * 100:.0f}% -- the light is too uneven or too lumpy to correct "
                 "reliably. Move further from the light source, or use a larger/more diffuse one."
             )
-        elif nu > 0.15:
-            warnings.append(f"light varies by {nu * 100:.0f}% across the panel; corrected, but even is better")
-        if illumination.residual > 0.02:
+        elif spread > 0.02:
             warnings.append(
-                "the white border does not vary smoothly -- check for a hard shadow edge, "
-                "a specular highlight, or a reflection in the panel"
+                f"corrected white borders still differ by {spread * 100:.1f}%; usable, "
+                "but more even light would be better"
+            )
+        if nu > 0.15:
+            warnings.append(
+                f"light varies by {nu * 100:.0f}% across the panel "
+                f"(corrected to {spread * 100:.1f}% between borders)"
+            )
+        if illumination.residual > 0.15:
+            warnings.append(
+                f"the white border is lumpy (RMS {illumination.residual * 100:.0f}% of level) -- "
+                "check for a hard shadow edge, a specular highlight, or a reflection in the panel"
             )
 
     return {
@@ -518,6 +683,55 @@ def photo_diagnostics(
         "problems": problems,
         "warnings": warnings,
         "usable": not problems,
+    }
+
+
+def fit_yule_nielsen(samples: dict[str, PatchSample]) -> tuple[float, dict]:
+    """Fit the panel's halftone non-linearity from the black/white ramp.
+
+    A halftone does not average in reflectance the way the dithering model
+    assumes. Light entering the paper between two dark pixels can scatter
+    sideways and be absorbed on its way out, so a fine mix of black and white
+    reads darker than the coverage-weighted average of the two solids. The
+    standard description is Yule-Nielsen::
+
+        Y_mix ** (1/n) = sum_i coverage_i * Y_i ** (1/n)
+
+    with ``n = 1`` meaning the ideal linear model. Fitted here on the three
+    black/white ramp patches only; the colour mixes are left out so they can
+    serve as an independent check of whether the fitted n generalises.
+    """
+    luma = np.array([0.2126, 0.7152, 0.0722])
+    Y = {k: float(v.linear @ luma) for k, v in samples.items()}
+    ramp = [(f, Y[f"mix_bw_{int(f * 100)}"]) for f in (0.25, 0.50, 0.75)
+            if f"mix_bw_{int(f * 100)}" in Y]
+    if not ramp or "black" not in Y or "white" not in Y:
+        return 1.0, {}
+
+    def predict(n: float, a: float) -> float:
+        return ((1 - a) * Y["black"] ** (1 / n) + a * Y["white"] ** (1 / n)) ** n
+
+    grid = np.arange(1.0, 6.001, 0.01)
+    errs = [sum((predict(n, a) - meas) ** 2 for a, meas in ramp) for n in grid]
+    n = float(grid[int(np.argmin(errs))])
+
+    checks = {}
+    for label, a, b in (("mix_by_50", "black", "yellow"), ("mix_ry_50", "red", "yellow"),
+                        ("mix_wr_50", "white", "red"), ("mix_br_50", "black", "red"),
+                        ("mix_wy_50", "white", "yellow")):
+        if label not in Y:
+            continue
+        linear_pred = 0.5 * Y[a] + 0.5 * Y[b]
+        yn_pred = (0.5 * Y[a] ** (1 / n) + 0.5 * Y[b] ** (1 / n)) ** n
+        checks[label] = {
+            "measured_Y": round(Y[label], 4),
+            "linear_error_pct": round(100 * (linear_pred / max(Y[label], 1e-9) - 1), 1),
+            "yule_nielsen_error_pct": round(100 * (yn_pred / max(Y[label], 1e-9) - 1), 1),
+        }
+    return n, {
+        "n": round(n, 2),
+        "fitted_from": "black/white ramp (25/50/75%)",
+        "independent_checks": checks,
     }
 
 
@@ -536,15 +750,21 @@ def profile_from_samples(
     else:
         scale = np.full(3, 1.0 / max(float(white_linear.mean()), 1e-9))
 
-    normalised = {k: np.clip(v.linear * scale, 0.0, 1.0) for k, v in samples.items()}
+    # Keep the measurement unclipped: an ink is not confined to the sRGB cube,
+    # and this panel's yellow genuinely reflects more red than its own white.
+    # Clipping here would bake a dE76 24 hue error into the profile. The clipped
+    # copy is only for the preview colours.
+    normalised = {k: v.linear * scale for k, v in samples.items()}
+    display_rgb = {k: np.clip(v, 0.0, 1.0) for k, v in normalised.items()}
 
     colors = {}
     for ink in ("black", "white", "yellow", "red"):
-        colors[ink] = C.srgb_to_u8(C.linear_to_srgb(normalised[ink]))
+        colors[ink] = C.srgb_to_u8(C.linear_to_srgb(display_rgb[ink]))
 
     profile = build_profile(
         name=name,
         colors={k: [int(c) for c in v] for k, v in colors.items()},
+        linear={k: normalised[k] for k in ("black", "white", "yellow", "red")},
         display=display,
         source="measured",
         notes=notes or "Measured from a photograph of the calibration chart; media-relative, "
@@ -560,7 +780,9 @@ def profile_from_samples(
     # a non-linear mixing model later.
     report = {"mix_check": {}}
     for label, ink_a, ink_b, frac in PATCHES:
-        if frac <= 0.0:
+        # Skip mixes the caller did not supply: a colorimeter reading, or a
+        # partial set, is still enough to build the four inks from.
+        if frac <= 0.0 or label not in normalised:
             continue
         names = {BLACK: "black", WHITE: "white", YELLOW: "yellow", RED: "red"}
         predicted = (1.0 - frac) * normalised[names[ink_a]] + frac * normalised[names[ink_b]]
@@ -578,6 +800,11 @@ def profile_from_samples(
     des = [v["delta_e76"] for v in report["mix_check"].values()]
     report["mix_check_mean_delta_e"] = round(float(np.mean(des)), 2) if des else 0.0
     report["linear_mixing_ok"] = report["mix_check_mean_delta_e"] < 5.0
+
+    n, yn_report = fit_yule_nielsen(samples)
+    if yn_report:
+        report["halftone"] = yn_report
+        profile.measured_reflectance["yule_nielsen_n"] = round(n, 2)
 
     return profile, report
 

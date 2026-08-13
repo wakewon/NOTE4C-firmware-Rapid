@@ -109,8 +109,17 @@ def to_srgb(img: Image.Image) -> Image.Image:
 
 
 def open_image(path) -> Image.Image:
-    """Open, apply EXIF orientation, and normalise to sRGB. Returns RGB."""
+    """Open, apply EXIF orientation, and normalise to sRGB. Returns RGB.
+
+    Camera RAW files are developed rather than decoded -- see :mod:`.rawdev`.
+    """
     from PIL import ImageOps
+
+    from .rawdev import develop, is_raw
+
+    if is_raw(path):
+        rgb, _ = develop(path)
+        return Image.fromarray(rgb, mode="RGB")
 
     img = ImageOps.exif_transpose(Image.open(path))
     if img.mode in ("RGBA", "LA", "P"):

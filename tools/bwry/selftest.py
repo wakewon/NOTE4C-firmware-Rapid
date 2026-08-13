@@ -150,8 +150,12 @@ def test_pipeline_outputs() -> None:
     # A flat mid-grey block, to check ink density lands where it should.
     rgb[:100, :100] = 128
 
-    profile = PaletteProfile.load("note4c-estimate-v1")
-    for recipe in ab_matrix():
+    # Pin the profile explicitly rather than inheriting whatever the current
+    # default is: the integration check below only means anything if the
+    # conversion and the rendering are talking about the same panel.
+    profile_name = "note4c-estimate-v1"
+    profile = PaletteProfile.load(profile_name)
+    for recipe in ab_matrix(profile_name):
         result = convert(rgb, recipe, render_profile=profile)
         ok_size = len(result.payload) == pack.SIZE_2BPP
         ok_codes = bool(result.codes.min() >= 0 and result.codes.max() <= 3)
@@ -161,7 +165,7 @@ def test_pipeline_outputs() -> None:
 
     # Average tone: a flat patch must integrate to what was asked for.
     flat = np.full((pack.SCREEN_HEIGHT, pack.SCREEN_WIDTH, 3), 128, dtype=np.uint8)
-    recipe = get_preset("photo")
+    recipe = get_preset("photo", profile_name)
     recipe.tone = ToneParams(autocontrast=False, saturation=1.0)
     recipe.dither.edge_suppress = 0.0
     result = convert(flat, recipe, render_profile=profile)
@@ -235,6 +239,72 @@ def test_calibration_chart() -> None:
     check("a glare-washed photograph is rejected", not glare["usable"],
           glare["problems"][0][:60] if glare["problems"] else "not caught")
 
+    # The white zones are what the illumination field is fitted from, and the
+    # homography is only valid inside the quad through the four mark centres.
+    # A zone reaching outside it samples the bezel and poisons the fit.
+    from bwry.calibrate import WHITE_ZONES
+
+    mc = mark_centers()
+    inside = all(
+        z[0] >= mc[:, 0].min() and z[2] <= mc[:, 0].max()
+        and z[1] >= mc[:, 1].min() and z[3] <= mc[:, 1].max()
+        for z in WHITE_ZONES
+    )
+    check("white zones stay inside the registration-mark quad", inside)
+
+    # A saturated ink may out-reflect the white state in one channel while
+    # being less luminous overall. Media-relative normalisation must not clip
+    # that away, or the profile describes an ink the panel cannot make.
+    from bwry.calibrate import PatchSample
+
+    def sample(label, lin):
+        return PatchSample(label, np.asarray(lin, float),
+                           C.srgb_to_u8(C.linear_to_srgb(np.clip(lin, 0, 1))), 0.0, 0.0)
+
+    hot = {
+        "black": sample("black", [0.03, 0.03, 0.035]),
+        "white": sample("white", [0.60, 0.62, 0.63]),
+        # 1.55x white in red, but only 0.91x its luminance -- physical.
+        "yellow": sample("yellow", [0.93, 0.505, 0.008]),
+        "red": sample("red", [0.35, 0.045, 0.045]),
+    }
+    hot_profile, _ = profile_from_samples(dict(hot), name="hot")
+    y_lin = hot_profile.inks[hot_profile.index_of("yellow")].linear
+    check("an ink brighter than white in one channel is kept unclipped",
+          y_lin is not None and float(y_lin[0]) > 1.2, f"yellow R = {float(y_lin[0]):.2f}")
+    reloaded = PaletteProfile.from_dict(hot_profile.to_dict())
+    de_rt = float(C.delta_e76(reloaded.lab, hot_profile.lab).max())
+    check("...and survives a save/load round trip", de_rt < 0.5, f"max dE76 {de_rt:.3f}")
+    check("...and the luminance invariant does not reject it",
+          photo_diagnostics(dict(hot), None)["usable"],
+          str(photo_diagnostics(dict(hot), None)["problems"]))
+
+
+def test_mark_detection() -> None:
+    print("registration mark detection")
+    from bwry.calibrate import find_marks
+
+    truth = PaletteProfile.load("note4c-estimate-v1")
+    photo = truth.render_codes(make_chart())
+    photo = np.repeat(np.repeat(photo, 3, axis=0), 3, axis=1)  # a "photo" 3x the chart
+    expected = mark_centers() * 3.0 + 1.0
+
+    found = find_marks(photo)
+    err = float(np.abs(found - expected).max())
+    check("finds the four marks on a clean render", err < 4.0, f"max error {err:.1f}px")
+
+    # A thin dark line touching a mark -- a panel bezel seam, a cable, a table
+    # edge. Before this was handled, the mark and the seam merged into one
+    # component whose centre of mass sat out on the seam, moving that corner
+    # far enough to sample a patch as "white border".
+    seamed = photo.copy()
+    y = int(expected[0][1])
+    seamed[y - 2 : y + 2, :] = 0
+    found_seam = find_marks(seamed)
+    err_seam = float(np.abs(found_seam - expected).max())
+    check("a dark seam through a mark does not drag the corner off it",
+          err_seam < 8.0, f"max error {err_seam:.1f}px")
+
     h = homography(mark_centers(), mark_centers() * 2.0 + 17.0)
     check("homography solves an affine case",
           bool(np.allclose(h @ np.array([10.0, 20.0, 1.0]), [10 * 2 + 17, 20 * 2 + 17, 1.0])))
@@ -302,6 +372,7 @@ def main() -> int:
         test_tone_lut,
         test_bluenoise,
         test_calibration_chart,
+        test_mark_detection,
         test_recipe_serialisation,
         test_pipeline_outputs,
         test_legacy_matches_shipping_js,

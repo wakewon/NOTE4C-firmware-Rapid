@@ -2,3 +2,7 @@
 numpy>=1.26
 pillow>=10.0
 scipy>=1.11
+
+# Camera RAW for calibration (LibRaw). Optional: only `calibrate` on a RAW
+# file needs it, and it says so if it is missing.
+rawpy>=0.19

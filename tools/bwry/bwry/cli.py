@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import abtest, calibrate, pack
+from . import abtest, calibrate, pack, rawdev
 from .dither import ALGORITHMS
 from .palette import PaletteProfile
 from .pipeline import Recipe, convert
@@ -160,8 +160,17 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
             print("give a photograph of the chart, or use --swatches", file=sys.stderr)
             return 2
         # open_image applies EXIF orientation and converts via the embedded ICC
-        # profile: phone photos are usually Display P3, not sRGB.
-        photo = np.asarray(pack.open_image(args.photo), dtype=np.uint8)
+        # profile: phone photos are usually Display P3, not sRGB. A camera RAW
+        # is developed instead -- linear sensor data, no camera tone curve or
+        # saturation processing, which is what calibration actually wants.
+        develop_report = None
+        raw_linear = None
+        if rawdev.is_raw(args.photo):
+            raw_linear, camera_wb = rawdev.develop_linear(args.photo)
+            exposure = args.raw_exposure or rawdev.auto_exposure(raw_linear)
+            photo, _ = rawdev.encode_srgb(raw_linear, exposure)
+        else:
+            photo = np.asarray(pack.open_image(args.photo), dtype=np.uint8)
         if args.corners:
             nums = [float(v) for v in args.corners.replace(";", ",").split(",")]
             if len(nums) != 8:
@@ -175,14 +184,55 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
                 print(f"  {x:8.1f}, {y:8.1f}")
             print("  if these look wrong, re-run with --corners")
 
-        illumination = None if args.no_flat_field else calibrate.estimate_illumination(photo, corners)
-        samples = calibrate.sample_patches(photo, corners, illumination=illumination)
+        # Now that the chart is located, re-expose for the chart rather than for
+        # the frame. A shot of a panel in a white bezel, or against a wall, has
+        # its brightest pixels outside the area being measured; exposing for
+        # those leaves the panel down in the bottom eighth of the range, where
+        # a dark ink's weakest channel has single-digit code values left.
+        if raw_linear is not None and args.raw_exposure is None:
+            level = calibrate.brightest_chart_level(raw_linear, corners)
+            exposure = rawdev.exposure_for_level(level)
+            photo, clipped = rawdev.encode_srgb(raw_linear, exposure)
+            develop_report = rawdev.DevelopReport(
+                exposure_gain=exposure,
+                white_level_before=float(raw_linear.max()),
+                brightest_channel_after=float(min(level * exposure, 1.0)),
+                clipped_fraction=clipped,
+                camera_white_balance=camera_wb,
+            )
+        elif raw_linear is not None:
+            develop_report = rawdev.DevelopReport(
+                exposure_gain=exposure,
+                white_level_before=float(raw_linear.max()),
+                brightest_channel_after=float(np.clip(raw_linear * exposure, 0, 1).max()),
+                clipped_fraction=float((raw_linear * exposure >= 1.0).any(axis=2).mean()),
+                camera_white_balance=camera_wb,
+            )
+
+        # With a RAW there is no reason to measure through the 8-bit encode:
+        # the linear frame is what the sensor actually recorded.
+        measure_linear = None if raw_linear is None else raw_linear * exposure
+
+        illumination = (
+            None if args.no_flat_field
+            else calibrate.estimate_illumination(photo, corners, linear_photo=measure_linear)
+        )
+        samples = calibrate.sample_patches(
+            photo, corners, illumination=illumination, linear_photo=measure_linear
+        )
 
         gamma_report = None
-        if args.camera_gamma is None:
-            gamma, gamma_report = calibrate.fit_camera_gamma(samples)
-        else:
+        if args.camera_gamma is not None:
             gamma = args.camera_gamma
+        elif develop_report is not None:
+            # A developed RAW has no camera tone curve to remove. Fitting one
+            # anyway would find the panel's own dot gain -- the black/white ramp
+            # is a halftone, and this panel lays down more ink than nominal --
+            # and quietly attribute it to the camera, erasing the very panel
+            # behaviour the mix check exists to report.
+            gamma = 1.0
+        else:
+            gamma, gamma_report = calibrate.fit_camera_gamma(samples)
         raw_samples = samples
         samples = calibrate.apply_camera_gamma(samples, gamma)
 
@@ -190,11 +240,16 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
         diagnostics["camera_gamma"] = round(gamma, 3)
 
         print("\nphotograph check:")
+        if develop_report is not None:
+            print(develop_report.describe())
         if gamma_report:
             print(f"  camera tone curve      : gamma {gamma_report['gamma']:.2f} "
                   f"(fitted from the black/white ramp)")
             print(f"  contrast               : {gamma_report['contrast_before']:.1f}:1 as shot "
                   f"-> {gamma_report['contrast_after']:.1f}:1 corrected")
+        elif develop_report is not None:
+            print("  camera tone curve      : none (developed from RAW; "
+                  "residual non-linearity is the panel's, see the mix check)")
         else:
             print(f"  camera tone curve      : gamma {gamma:.2f} (given)")
         print(f"  contrast measured      : {diagnostics['contrast_ratio']:.1f}:1")
@@ -232,7 +287,20 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
         for label, row in report["mix_check"].items():
             print(f"  {label:<12} {row['predicted_hex']} -> {row['measured_hex']}   dE76 {row['delta_e76']:5.2f}")
         print(f"  mean dE76 {report['mix_check_mean_delta_e']:.2f} -> "
-              f"{'linear mixing holds' if report['linear_mixing_ok'] else 'significant dot gain; treat the profile as approximate'}")
+              f"{'linear mixing holds' if report['linear_mixing_ok'] else 'significant dot gain, quantified below'}")
+
+    if "halftone" in report:
+        ht = report["halftone"]
+        print(f"\nhalftone non-linearity: Yule-Nielsen n = {ht['n']:.2f} "
+              f"(n=1.00 would mean halftones average linearly, as the dither assumes)")
+        print("  independent check on the colour mixes, which were not used in the fit:")
+        print(f"    {'patch':<12}{'linear model':>14}{'n-corrected':>14}")
+        for label, row in ht["independent_checks"].items():
+            print(f"    {label:<12}{row['linear_error_pct']:>+13.1f}%{row['yule_nielsen_error_pct']:>+13.1f}%")
+        if ht["n"] > 1.15:
+            print(f"  the panel lays down more ink than nominal: a dithered midtone renders"
+                  f"\n  darker than the linear model predicts. Not yet corrected for in the"
+                  f"\n  dither -- worth an A/B on the panel before wiring it in.")
         Path(out).with_suffix(".report.json").write_text(json.dumps(report, indent=2) + "\n")
     return 0
 
@@ -273,7 +341,7 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("input")
     c.add_argument("output")
     c.add_argument("--preset", default="photo", choices=sorted(PRESETS))
-    c.add_argument("--profile", default="note4c-estimate-v1", help="palette profile name or path")
+    c.add_argument("--profile", default="note4c-measured-v1", help="palette profile name or path")
     c.add_argument("--render-profile", help="panel appearance for previews and metrics (defaults to --profile)")
     c.add_argument("--recipe", help="JSON recipe file; overrides --preset")
     c.add_argument("--algorithm", choices=ALGORITHMS)
@@ -292,7 +360,7 @@ def build_parser() -> argparse.ArgumentParser:
     a = sub.add_parser("ab", help="run the A/B matrix and build a contact sheet")
     a.add_argument("images", nargs="+")
     a.add_argument("--out", required=True)
-    a.add_argument("--profile", default="note4c-estimate-v1", help="palette the recipes convert against")
+    a.add_argument("--profile", default="note4c-measured-v1", help="palette the recipes convert against")
     a.add_argument("--render-profile", help="panel's measured appearance; used for every preview and "
                    "metric so all candidates are judged against the same physical reality "
                    "(defaults to --profile)")
@@ -306,7 +374,7 @@ def build_parser() -> argparse.ArgumentParser:
     ch.add_argument("--out", default="chart_400x300_2bpp.bin")
     ch.add_argument("--preview")
     ch.add_argument("--preview-scale", type=int, default=1)
-    ch.add_argument("--profile", default="note4c-estimate-v1")
+    ch.add_argument("--profile", default="note4c-measured-v1")
     ch.add_argument("--push", metavar="URL")
     ch.set_defaults(func=cmd_chart)
 
@@ -316,6 +384,9 @@ def build_parser() -> argparse.ArgumentParser:
     cal.add_argument("--name", default="note4c-measured")
     cal.add_argument("--corners", help="x_tl,y_tl,x_tr,y_tr,x_br,y_br,x_bl,y_bl in photo pixels")
     cal.add_argument("--swatches", help="black,white,yellow,red as hex, skipping the photo")
+    cal.add_argument("--raw-exposure", type=float,
+                     help="linear exposure gain for a camera RAW. Default fits one so the "
+                          "brightest channel lands just under clipping")
     cal.add_argument("--camera-gamma", type=float,
                      help="tone curve the camera applied, to divide out. Default is to fit it "
                           "from the chart's black/white ramp; pass 1.0 to trust the photo as-is")
@@ -332,7 +403,7 @@ def build_parser() -> argparse.ArgumentParser:
     pv = sub.add_parser("preview", help="render an existing .bin back to PNG")
     pv.add_argument("input")
     pv.add_argument("output")
-    pv.add_argument("--profile", default="note4c-estimate-v1")
+    pv.add_argument("--profile", default="note4c-measured-v1")
     pv.add_argument("--scale", type=int, default=1)
     pv.add_argument("--simulated", action="store_true")
     pv.set_defaults(func=cmd_preview)

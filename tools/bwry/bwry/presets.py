@@ -17,7 +17,7 @@ from .dither import DitherParams
 from .pipeline import EdgeParams, Recipe
 from .tone import ChromaGate, ToneParams
 
-CAL = "note4c-estimate-v1"
+CAL = "note4c-measured-v1"
 IDEAL = "note4c-ideal"
 
 

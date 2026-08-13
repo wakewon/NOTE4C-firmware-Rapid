@@ -60,7 +60,7 @@ class Recipe:
 
     name: str
     description: str = ""
-    profile: str = "note4c-estimate-v1"
+    profile: str = "note4c-measured-v1"
     fit: str = "contain"
 
     tone: ToneParams = field(default_factory=ToneParams)
@@ -96,7 +96,7 @@ class Recipe:
         return Recipe(
             name=data["name"],
             description=data.get("description", ""),
-            profile=data.get("profile", "note4c-estimate-v1"),
+            profile=data.get("profile", "note4c-measured-v1"),
             fit=data.get("fit", "contain"),
             legacy=data.get("legacy", False),
             gamut_knee=data.get("gamut_knee", 0.80),

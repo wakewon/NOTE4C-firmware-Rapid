@@ -29,18 +29,35 @@ PROFILE_DIR = Path(__file__).resolve().parent / "profiles"
 DEVICE_CODES = {"black": 0, "white": 1, "yellow": 2, "red": 3}
 
 
+def _looks_like_profile(path: Path) -> bool:
+    try:
+        return isinstance(json.loads(path.read_text()).get("inks"), list)
+    except Exception:
+        return False
+
+
 @dataclass(frozen=True)
 class Ink:
     name: str
     device_code: int
-    srgb: np.ndarray  # media-relative sRGB, float 0..1
+    srgb: np.ndarray  # media-relative sRGB, float 0..1 -- display/preview only
+    linear: np.ndarray | None = None  # media-relative linear reflectance, may exceed 1
 
     @property
     def lab(self) -> np.ndarray:
-        return C.srgb_to_lab(self.srgb)
+        return C.xyz_to_lab(self.xyz)
 
     @property
     def xyz(self) -> np.ndarray:
+        # Colorimetry comes from linear reflectance when it was measured, because
+        # an ink is not confined to the sRGB cube. The panel's yellow reflects
+        # ~1.6x more red than its own white state (measured, not assumed), so
+        # media-relative normalisation puts its red channel at 1.55. Forcing that
+        # into 0..1 costs dE76 24 and swings a* from +12 to -11 -- the profile
+        # would describe a greenish yellow the panel cannot make, and every warm
+        # tone would be dithered against it.
+        if self.linear is not None:
+            return C.linear_to_xyz(self.linear)
         return C.srgb_to_xyz(self.srgb)
 
 
@@ -60,8 +77,8 @@ class PaletteProfile:
         order = {"black": 0, "white": 1, "yellow": 2, "red": 3}
         self.inks = sorted(self.inks, key=lambda i: order.get(i.name, 99))
         self._srgb = np.stack([i.srgb for i in self.inks])
-        self._lab = C.srgb_to_lab(self._srgb)
-        self._xyz = C.srgb_to_xyz(self._srgb)
+        self._xyz = np.stack([i.xyz for i in self.inks])
+        self._lab = C.xyz_to_lab(self._xyz)
         self._codes = np.array([i.device_code for i in self.inks], dtype=np.uint8)
 
     @property
@@ -125,6 +142,10 @@ class PaletteProfile:
                     "device_code": i.device_code,
                     "srgb": [int(v) for v in C.srgb_to_u8(i.srgb)],
                     "hex": C.srgb_to_hex(i.srgb),
+                    # Authoritative when present: sRGB above is the clipped
+                    # preview colour, this is what the ink actually reflects.
+                    **({"linear": [round(float(v), 5) for v in i.linear]}
+                       if i.linear is not None else {}),
                     "lab": [round(float(v), 2) for v in i.lab],
                 }
                 for i in self.inks
@@ -149,7 +170,9 @@ class PaletteProfile:
             else:
                 raise ValueError(f"ink {name!r} needs 'srgb' or 'hex'")
             code = int(entry.get("device_code", DEVICE_CODES[name]))
-            inks.append(Ink(name=name, device_code=code, srgb=srgb))
+            linear = (np.asarray(entry["linear"], dtype=np.float64)
+                      if "linear" in entry else None)
+            inks.append(Ink(name=name, device_code=code, srgb=srgb, linear=linear))
         return PaletteProfile(
             name=data.get("name", "unnamed"),
             inks=inks,
@@ -174,7 +197,14 @@ class PaletteProfile:
 
     @staticmethod
     def available() -> list[str]:
-        return sorted(p.stem.replace("_", "-") for p in PROFILE_DIR.glob("*.json"))
+        # Content, not extension: calibrating with --out pointing here also
+        # drops a "<name>.report.json" sidecar beside the profile, and a
+        # filename glob would offer that as a palette and then fail to load it.
+        return sorted(
+            p.stem.replace("_", "-")
+            for p in PROFILE_DIR.glob("*.json")
+            if _looks_like_profile(p)
+        )
 
     # -- rendering ------------------------------------------------------
     def render_codes(self, codes: np.ndarray) -> np.ndarray:
@@ -213,10 +243,21 @@ def build_profile(
     source: str = "unknown",
     notes: str = "",
     measured_reflectance: dict | None = None,
+    linear: dict[str, Iterable[float]] | None = None,
 ) -> PaletteProfile:
-    """Build a profile from ``{"black": (r, g, b), ...}`` with 0..255 values."""
+    """Build a profile from ``{"black": (r, g, b), ...}`` with 0..255 values.
+
+    ``linear`` optionally supplies media-relative linear reflectance per ink,
+    which is allowed to exceed 1.0 and takes precedence for all colorimetry.
+    """
+    linear = linear or {}
     inks = [
-        Ink(name=n, device_code=DEVICE_CODES[n], srgb=np.asarray(v, dtype=np.float64) / 255.0)
+        Ink(
+            name=n,
+            device_code=DEVICE_CODES[n],
+            srgb=np.asarray(v, dtype=np.float64) / 255.0,
+            linear=(np.asarray(linear[n], dtype=np.float64) if n in linear else None),
+        )
         for n, v in colors.items()
     ]
     return PaletteProfile(

@@ -28,7 +28,7 @@ def run_matrix(
     recipes: list[Recipe],
     out_dir: str | Path,
     *,
-    render_profile: str = "note4c-estimate-v1",
+    render_profile: str = "note4c-measured-v1",
     preview_scale: int = 1,
     verbose: bool = True,
 ) -> dict:

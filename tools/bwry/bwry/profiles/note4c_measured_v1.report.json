@@ -1,0 +1,141 @@
+{
+  "mix_check": {
+    "mix_bw_50": {
+      "predicted_hex": "#C1C0C0",
+      "measured_hex": "#AFAFB2",
+      "delta_e76": 6.31
+    },
+    "mix_bw_25": {
+      "predicted_hex": "#949294",
+      "measured_hex": "#807E82",
+      "delta_e76": 7.91
+    },
+    "mix_bw_75": {
+      "predicted_hex": "#E3E2E3",
+      "measured_hex": "#D7D7D8",
+      "delta_e76": 4.14
+    },
+    "mix_wy_50": {
+      "predicted_hex": "#FFF4BD",
+      "measured_hex": "#FFEFAC",
+      "delta_e76": 5.87
+    },
+    "mix_wr_50": {
+      "predicted_hex": "#E5C1C1",
+      "measured_hex": "#DFB1B1",
+      "delta_e76": 6.58
+    },
+    "mix_br_50": {
+      "predicted_hex": "#984648",
+      "measured_hex": "#8F4C4E",
+      "delta_e76": 7.47
+    },
+    "mix_by_50": {
+      "predicted_hex": "#E7B035",
+      "measured_hex": "#C39D4A",
+      "delta_e76": 20.53
+    },
+    "mix_ry_50": {
+      "predicted_hex": "#FFB13A",
+      "measured_hex": "#F4A04A",
+      "delta_e76": 14.48
+    }
+  },
+  "mix_check_mean_delta_e": 9.16,
+  "linear_mixing_ok": false,
+  "halftone": {
+    "n": 1.57,
+    "fitted_from": "black/white ramp (25/50/75%)",
+    "independent_checks": {
+      "mix_by_50": {
+        "measured_Y": 0.2217,
+        "linear_error_pct": 31.9,
+        "yule_nielsen_error_pct": 6.7
+      },
+      "mix_ry_50": {
+        "measured_Y": 0.2727,
+        "linear_error_pct": 20.6,
+        "yule_nielsen_error_pct": 9.2
+      },
+      "mix_wr_50": {
+        "measured_Y": 0.306,
+        "linear_error_pct": 17.2,
+        "yule_nielsen_error_pct": 5.0
+      },
+      "mix_br_50": {
+        "measured_Y": 0.0697,
+        "linear_error_pct": 0.0,
+        "yule_nielsen_error_pct": -5.3
+      },
+      "mix_wy_50": {
+        "measured_Y": 0.5487,
+        "linear_error_pct": 5.9,
+        "yule_nielsen_error_pct": 5.9
+      }
+    }
+  },
+  "corners": [
+    [
+      1686.7,
+      969.8
+    ],
+    [
+      4742.1,
+      984.5
+    ],
+    [
+      4720.5,
+      3187.8
+    ],
+    [
+      1678.1,
+      3159.4
+    ]
+  ],
+  "diagnostics": {
+    "contrast_ratio": 18.44,
+    "white_clipped": 0.0,
+    "black_clipped": 0.0023,
+    "illumination_non_uniformity": 0.3932,
+    "illumination_residual": 0.0878,
+    "problems": [],
+    "warnings": [
+      "yellow patch reads zero in its weakest channel over 8% of it; the channel is near the noise floor, so this ink's colour is uncertain by up to dE 3.1. A brighter exposure would pin it down",
+      "light varies by 39% across the panel (corrected to 0.6% between borders)"
+    ],
+    "usable": true,
+    "camera_gamma": 1.0
+  },
+  "illumination_coeffs": [
+    [
+      0.586531,
+      0.607875,
+      0.614455
+    ],
+    [
+      0.050621,
+      0.047883,
+      0.04354
+    ],
+    [
+      0.084302,
+      0.077999,
+      0.081479
+    ],
+    [
+      -0.05263,
+      -0.061509,
+      -0.058236
+    ],
+    [
+      0.019375,
+      0.01448,
+      0.015273
+    ],
+    [
+      0.023201,
+      0.02266,
+      0.045838
+    ]
+  ]
+}
