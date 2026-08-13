@@ -24,11 +24,16 @@ the photo album and asset pack are never at risk either way.
 
 If esptool cannot connect: hold BOOT, tap RESET (or re-plug USB while holding
 BOOT), release BOOT, and run again.
+
+esptool/pyserial live in their own venv, ``.venv-esptool`` at the repo root,
+created automatically on first run -- this never touches whatever ``python3``
+is first on PATH. Delete the directory to force a clean reinstall.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import time
@@ -40,6 +45,7 @@ from espimage import (  # noqa: E402
     BUILD,
     Partition,
     app_build_stamp,
+    ensure_esptool_venv,
     human_size,
     read_partition_table,
 )
@@ -74,8 +80,9 @@ def list_ports() -> list:
         from serial.tools import list_ports as lp
     except ImportError:
         raise FlashError(
-            "pyserial is not installed. Install esptool, which brings it:\n"
-            "  python3 -m pip install --upgrade esptool"
+            "pyserial is not importable even inside .venv-esptool -- something about\n"
+            "that venv is broken. Delete it and rerun to have it rebuilt:\n"
+            "  rm -rf .venv-esptool"
         )
     ports = [p for p in lp.comports() if "Bluetooth" not in (p.device or "")]
     ports.sort(key=lambda p: (p.vid not in LIKELY_VIDS, p.device))
@@ -129,7 +136,11 @@ def esptool(port: str, chip: str, baud: int, *args: str, what: str = "esptool") 
     try:
         subprocess.run(cmd, check=True)
     except FileNotFoundError:
-        raise FlashError("esptool not installed: python3 -m pip install --upgrade esptool")
+        raise FlashError(
+            "esptool not importable even inside .venv-esptool -- something about\n"
+            "that venv is broken. Delete it and rerun to have it rebuilt:\n"
+            "  rm -rf .venv-esptool"
+        )
     except subprocess.CalledProcessError as exc:
         raise FlashError(
             f"\n{what} failed (exit {exc.returncode}).\n"
@@ -246,6 +257,27 @@ def choose_image(explicit: str | None, images: dict, interactive: bool) -> str:
 # --------------------------------------------------------------------------
 
 
+def reexec_into_esptool_venv() -> None:
+    """Re-launch this script under the dedicated esptool venv, once.
+
+    Both port listing (pyserial) and flashing (esptool) need packages that
+    have no reason to live in whatever ``python3`` happens to be first on
+    PATH. Re-exec'ing here, before argparse or anything else runs, means the
+    rest of the script can just import ``serial``/``esptool`` normally.
+    """
+    if os.environ.get("_FLASH_PY_REEXECED"):
+        return
+    venv_python = str(ensure_esptool_venv())
+    # Compare by resolved path, not realpath: a venv's python is typically a
+    # *symlink* to the base interpreter, so realpath() resolves both down to
+    # the same target and makes them look identical even though only one has
+    # the venv's site-packages on sys.path. os.path.abspath preserves that.
+    if os.path.abspath(venv_python) == os.path.abspath(sys.executable):
+        return
+    os.environ["_FLASH_PY_REEXECED"] = "1"
+    os.execv(venv_python, [venv_python, str(Path(__file__).resolve()), *sys.argv[1:]])
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--list", action="store_true", help="list serial ports and images, then exit")
@@ -339,4 +371,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    reexec_into_esptool_venv()
     raise SystemExit(main())

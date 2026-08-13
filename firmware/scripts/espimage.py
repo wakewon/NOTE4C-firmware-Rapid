@@ -14,10 +14,15 @@ import os
 import re
 import shutil
 import struct
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 FIRMWARE = Path(__file__).resolve().parents[1]
+REPO_ROOT = FIRMWARE.parent
+ESPTOOL_VENV = REPO_ROOT / ".venv-esptool"
+ESPTOOL_REQUIREMENTS = ("esptool", "pyserial")
 BUILD = FIRMWARE / "build"
 
 PARTITION_MAGIC = b"\xaa\x50"
@@ -212,3 +217,60 @@ def idf_env_prefix(idf: Path, tools: Path | None) -> str:
 
 def human_size(n: int) -> str:
     return f"{n / 1024 / 1024:.2f} MB" if n >= 1 << 20 else f"{n / 1024:.1f} KB"
+
+
+def _cli() -> int:
+    """Print the activation prelude, for ``eval "$(python3 firmware/scripts/espimage.py)"``.
+
+    package.py and flash.py never need this -- they activate their own
+    environment internally. This is only for typing bare ``idf.py`` commands
+    (menuconfig, monitor, size, ...) by hand, without copy-pasting hardcoded
+    paths that go stale the moment the toolchain moves or gets reinstalled
+    under a different Python version.
+    """
+    import argparse
+
+    p = argparse.ArgumentParser(description=_cli.__doc__)
+    p.add_argument("--idf-path")
+    p.add_argument("--idf-tools-path")
+    args = p.parse_args()
+
+    idf = find_idf(args.idf_path)
+    if not idf:
+        print("could not find ESP-IDF; pass --idf-path or set IDF_PATH", file=sys.stderr)
+        return 2
+    tools = find_idf_tools(idf, args.idf_tools_path)
+    print(idf_env_prefix(idf, tools))
+    print(f"echo 'idf.py active: {idf}'", file=sys.stdout)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_cli())
+
+
+def _venv_python(venv: Path) -> Path:
+    return venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python3")
+
+
+def ensure_esptool_venv(venv: Path = ESPTOOL_VENV) -> Path:
+    """Path to a python that can ``-m esptool``, creating a dedicated venv if needed.
+
+    esptool talks to hardware over pyserial; it has no business living in
+    whatever ``python3`` happens to be first on PATH (often a Homebrew
+    interpreter that refuses ``pip install`` outright as externally-managed).
+    This keeps it in its own throwaway venv, the same way ``tools/bwry`` keeps
+    its dependencies in ``.venv-imgtool`` rather than the system Python.
+    """
+    python = _venv_python(venv)
+    if python.exists():
+        probe = subprocess.run([str(python), "-c", "import esptool, serial"], capture_output=True)
+        if probe.returncode == 0:
+            return python
+    print(f"setting up {venv.relative_to(REPO_ROOT)} (one-time, needed to talk to the device)...")
+    subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True)
+    subprocess.run(
+        [str(python), "-m", "pip", "install", "--quiet", "--upgrade", "pip", *ESPTOOL_REQUIREMENTS],
+        check=True,
+    )
+    return python
