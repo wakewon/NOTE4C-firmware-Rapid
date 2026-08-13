@@ -1,16 +1,16 @@
-"""Faithful re-implementation of the algorithm currently shipping.
+"""Faithful re-implementation of the historical pre-09k web algorithm.
 
 This exists purely as the A/B baseline. It mirrors, line for line, the
 ``bwry2bpp`` branch of the uploader embedded in
-``firmware/main/ui/renderers/rawdraw/ap_transfer_server.cc`` and the exported
-copy in ``docs/inkscreen_image_converter.js``:
+explicit ``rgbaToBwry2bppLegacy`` export in
+``docs/inkscreen_image_converter.js``:
 
 * palette assumed to be pure ``#000000 / #FFFFFF / #FF0000 / #FFFF00``
 * nearest colour by luma-weighted squared RGB distance
 * Floyd-Steinberg, raster order, no serpentine, no clamping of the work buffer
 
-Do not "improve" anything in here -- the whole point is that it stays wrong in
-exactly the same way the device is wrong today.
+Do not "improve" anything in here -- the whole point is that the research
+baseline remains frozen after the shipping default moved to 09k.
 """
 
 from __future__ import annotations

@@ -3,9 +3,10 @@
 
     python3 tools/bwry/selftest.py
 
-The important one is ``legacy vs docs/inkscreen_image_converter.js``: the whole
-A/B ladder is meaningless if the baseline is not bit-for-bit what the device
-does today. That check runs only when node is available.
+The web checks lock three contracts: generated browser/firmware assets are in
+sync, the default exported colour converter matches the selected Python 09k
+recipe byte-for-byte, and the historical legacy baseline remains byte-exact for
+the research ladder. They run only when node is available.
 """
 
 from __future__ import annotations
@@ -514,8 +515,8 @@ def test_mark_detection() -> None:
           bool(np.allclose(h @ np.array([10.0, 20.0, 1.0]), [10 * 2 + 17, 20 * 2 + 17, 1.0])))
 
 
-def test_legacy_matches_shipping_js() -> None:
-    print("legacy baseline vs docs/inkscreen_image_converter.js")
+def test_web_converter() -> None:
+    print("09k web converter")
     js = REPO / "docs" / "inkscreen_image_converter.js"
     if not js.exists():
         check("reference converter present", False, str(js))
@@ -524,8 +525,20 @@ def test_legacy_matches_shipping_js() -> None:
         print("  SKIP  node not available")
         return
 
-    rng = np.random.default_rng(1234)
-    rgb = (rng.random((pack.SCREEN_HEIGHT, pack.SCREEN_WIDTH, 3)) * 255).astype(np.uint8)
+    generated = subprocess.run(
+        [sys.executable, str(REPO / "tools" / "bwry" / "generate_web_converter.py"), "--check"],
+        capture_output=True,
+        text=True,
+    )
+    check("browser and firmware generated assets are in sync", generated.returncode == 0,
+          (generated.stdout + generated.stderr).strip()[:200])
+
+    yy, xx = np.mgrid[:pack.SCREEN_HEIGHT, :pack.SCREEN_WIDTH]
+    rgb = np.stack([
+        (xx * 255 / (pack.SCREEN_WIDTH - 1)),
+        (yy * 255 / (pack.SCREEN_HEIGHT - 1)),
+        ((3 * xx + 5 * yy) % 256),
+    ], axis=-1).astype(np.uint8)
     rgba = np.concatenate([rgb, np.full(rgb.shape[:2] + (1,), 255, dtype=np.uint8)], axis=2)
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -539,17 +552,26 @@ def test_legacy_matches_shipping_js() -> None:
             f"const mod = require({str(js)!r});\n"
             f"const rgba = new Uint8Array(fs.readFileSync({str(tmp / 'in.raw')!r}));\n"
             "const out = mod.rgbaToBwry2bpp(rgba);\n"
+            "const legacy = mod.rgbaToBwry2bppLegacy(rgba);\n"
             f"fs.writeFileSync({str(tmp / 'out.bin')!r}, Buffer.from(out));\n"
+            f"fs.writeFileSync({str(tmp / 'legacy.bin')!r}, Buffer.from(legacy));\n"
         )
         proc = subprocess.run(["node", str(script)], capture_output=True, text=True)
         if proc.returncode != 0:
             check("reference converter runs", False, proc.stderr.strip()[:200])
             return
-        reference = (tmp / "out.bin").read_bytes()
+        web_payload = (tmp / "out.bin").read_bytes()
+        legacy_payload = (tmp / "legacy.bin").read_bytes()
 
-    ours = pack.pack_2bpp(legacy_bwry_codes(rgb))
-    check("byte-for-byte identical to the shipping converter", ours == reference,
-          f"{sum(a != b for a, b in zip(ours, reference))} of {len(reference)} bytes differ")
+    legacy_reference = pack.pack_2bpp(legacy_bwry_codes(rgb))
+    check("legacy A/B export remains byte-for-byte stable", legacy_payload == legacy_reference,
+          f"{sum(a != b for a, b in zip(legacy_payload, legacy_reference))} bytes differ")
+
+    python_payload = convert(rgb, get_preset("photo")).payload
+    differing = sum(a != b for a, b in zip(web_payload, python_payload))
+    check("web default is byte-for-byte Python 09k", web_payload == python_payload,
+          f"{differing} of {len(python_payload)} bytes differ")
+    check("web default is no longer the legacy converter", web_payload != legacy_payload)
 
 
 def _have_node() -> bool:
@@ -590,7 +612,7 @@ def main() -> int:
         test_mark_detection,
         test_recipe_serialisation,
         test_pipeline_outputs,
-        test_legacy_matches_shipping_js,
+        test_web_converter,
     ):
         fn()
         print()

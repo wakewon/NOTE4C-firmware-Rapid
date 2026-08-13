@@ -250,13 +250,12 @@ curl -X POST "http://192.168.110.238/settings" \
 
 ## NAS 定时任务示例
 
-### 推荐：`tools/bwry`（画质更好）
+### Python：`tools/bwry`
 
-四色转换推荐用 [`tools/bwry`](../tools/bwry/README.md)。它用实测 palette、Lab 选色、
-Yule-Nielsen 光学混色、色域压缩和 chroma gate，相比下面的 JS 版本明显减少灰墙/天空/肤色
-暗部上的红黄彩噪；实验矩阵还提供自适应暖色 look 与四原色 tetra 蓝噪声，用于把大面积
-不可表示的蓝/绿统一翻译成更适合 B/W/R/Y 面板的老照片式视觉语言。
-输出格式完全一致，仍然是 400×300 2bpp 30000 字节。
+[`tools/bwry`](../tools/bwry/README.md) 与设备网页、下面的 Node.js 入口默认都使用真机定档的
+09k：实测 palette、选择性 LCh 色彩转译、物理色域候选搜索、chroma gate、Yule-Nielsen
+补偿和 Sierra-2 hybrid 扩散。Python 入口额外保留完整 A/B、标定、指标和自定义 recipe 能力。
+输出格式始终是 400×300 2bpp 30000 字节。
 
 ```bash
 python3 -m venv .venv-imgtool
@@ -274,14 +273,14 @@ python3 -m venv .venv-imgtool
 
 内容类型不同建议换 preset：照片 `photo`、插画海报 `illustration`、截图文档 `text`。
 
-### 兼容：`docs/inkscreen_image_converter.js`
+### Node.js：与设备网页共用 09k 核心
 
 ```text
 docs/inkscreen_image_converter.js
 ```
 
-它抽取自设备管理 HTML 页面中的转换算法，与设备网页上传的结果逐字节一致，
-需要 1BP 黑白输出或不想引入 Python 依赖时使用。命令行模式依赖 `sharp` 解码和缩放图片：
+它和设备管理网页使用同一个生成的 09k JavaScript 核心；Node.js 命令行模式依赖 `sharp`
+解码和 cover 裁切图片。历史 legacy 算法只作为代码中的显式 A/B 导出保留，不再是默认值：
 
 ```bash
 npm install sharp

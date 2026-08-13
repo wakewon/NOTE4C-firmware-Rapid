@@ -6,7 +6,7 @@
  * - WiFi AP (SSID: InkScreen-AP, Password: 12345678)
  * - HTTP Server at 192.168.4.1
  * - HTML page for image upload
- * - Floyd-Steinberg dithering
+ * - Browser-side measured-profile 09k colour conversion
  * - Save to SPIFFS
  */
 

@@ -41,7 +41,7 @@ public:
         kWaitingForConnection,  // AP started, waiting for client
         kClientConnected,       // Client connected to AP
         kUploading,             // Image being uploaded
-        kProcessing,            // Floyd-Steinberg dithering
+        kProcessing,            // Browser-side image conversion / upload
         kComplete,              // Upload complete, image saved
         kError,                 // Error occurred
     };

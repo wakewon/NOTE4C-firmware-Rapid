@@ -7,9 +7,9 @@
 
 ---
 
-## 1. 出发点：现在的算法错在哪
+## 1. 出发点：legacy 算法错在哪
 
-现有实现（`docs/inkscreen_image_converter.js`，以及 `ap_transfer_server.cc` 里内嵌的同一份 JS）：
+早期 legacy 实现（现在只作为显式 A/B 基线保留）：
 
 ```
 RGB → 理想 B/W/R/Y palette → 亮度加权 RGB 最近色 → Floyd-Steinberg（raster） → 2bpp
@@ -266,8 +266,8 @@ legacy → 01-cal-lab-fs → 02-linear-error → 03-tone-gamut → 04-chroma-gat
 
 **公平性上有两个必须注意的点：**
 
-1. **基线必须是真的基线。** `legacy` 是当前线上算法的忠实复刻，
-   自检里有一条与 `docs/inkscreen_image_converter.js` 的**逐字节一致性**校验（30000/30000 字节相同）。
+1. **基线必须是真的基线。** `legacy` 是早期线上算法的忠实复刻；
+   自检会验证 JavaScript 的显式 legacy 导出与 Python 基线逐字节一致。
 2. **所有候选按同一个物理现实打分。** 预览和指标一律用「面板实测 profile」渲染，
    不管该配方自己是按哪个 palette 做的决策。
    否则 `legacy` 会被按纯 `#FF0000` 评分 —— 那是任何电子纸都做不出来的颜色，对比就没有意义了。
@@ -289,7 +289,7 @@ legacy → 01-cal-lab-fs → 02-linear-error → 03-tone-gamut → 04-chroma-gat
 
 ---
 
-## 10. 现状与下一步
+## 10. 当前落地状态
 
 **已完成并验证：** 实测 palette 框架 + 标定流程、Lab 选色、线性光误差扩散、
 Yule-Nielsen 物理积分模型与可切换补偿、
@@ -300,19 +300,16 @@ chroma gate（含残差衰减及 tetra 单次 gate）、色调/局部对比度�
 **实测标定已完成**（`note4c-measured-v1`，A7M2 RAW），并已成为默认 profile。
 标定过程中修掉的 4 个真实 bug 见 §11。
 
-**下一步，按顺序：**
+真机 A/B 已将 `09k-selective-vintage-hybrid` 定为照片默认。Python `photo` preset、
+`docs/inkscreen_image_converter.js` 和设备内嵌上传网页均使用 09k。浏览器版本直接搜索
+1330 个实测物理色域候选，不使用会引入插值误差的 3D LUT；转换运行在 Web Worker 中。
+JavaScript 核心与固件 include 由 `tools/bwry/generate_web_converter.py` 从同一模板生成，
+自检同时约束生成物同步、与 Python 09k 逐字节一致以及 legacy A/B 基线。
 
-1. **真机 A/B 定档。** 把矩阵推到设备逐张看，选出照片路线的赢家。
-   客观指标只负责把 15 个候选缩到 3～4 个。现在候选是基于实测 profile 生成的，
-   预览与真机应当第一次真正对得上。
-2. **给 Yule-Nielsen 修正定档。** 对比 `09-sierra2-edge` 与
-   `09b-sierra2-edge-yn`；它会整体提亮中间调，必须真机决定是否进入默认 preset。
-3. **移植到设备侧。** 真机定档之后，再把胜出配方移植到
-   `ap_transfer_server.cc` 内嵌的网页和 `docs/inkscreen_image_converter.js`。
-   现在移植是浪费 —— 参数还没定，而且两份 JS 一旦分叉就会长期不一致。
-   在那之前，NAS / 脚本路线可以直接用本工具产出 `.bin` 再走 `/upload`。
-4. **可选：** ΔE94 / CIEDE2000（当前误差扩散内层固定 ΔE76）、按内容自动选 preset。
-5. **可选：重拍一张更亮的标定照。** 当前这张把面板压在传感器动态范围的下 1/8，
+仍可继续考虑：
+
+1. **可选：** ΔE94 / CIEDE2000（当前误差扩散内层固定 ΔE76）、按内容自动选 preset。
+2. **可选：重拍一张更亮的标定照。** 当前这张把面板压在传感器动态范围的下 1/8，
    黄色的蓝通道只比黑电平高约 14 ADU，8% 的采样点被钳到 0，
    使黄色存在约 ΔE 3 的不确定度。其余数据不受影响。
 

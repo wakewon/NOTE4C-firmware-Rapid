@@ -84,8 +84,9 @@ Sierra-2 扩散。A/B 矩阵仍保留原来的自然基线，避免历史候选�
 3. `selective-vivid` 只在严格色域压缩仍会把明显有色区域压成灰时，局部混入 saturation intent。
    严格映射已经有可见颜色的区域保持原样，避免对原本可展示的红黄继续加饱和。
 
-最后定档后可以把第 2 层采样成 3D LUT（建议 1D shaper + 33³ LUT、四面体插值），供 Python、
-网页 JS 与别的主机实现共用；第 1 层的图像统计仍保留在 LUT 外面。
+网页实现曾验证过 33³ LUT，但插值会改变部分最终墨水决策。浏览器直接搜索 1330 个实测
+物理色域候选只需约 1～2 秒，因此正式实现保留完整搜索，不用近似 LUT；同一 400×300
+RGBA 输入与 Python 09k 的 30000 字节输出完全一致。
 
 ### 四原色 tetra 蓝噪声
 
@@ -113,8 +114,8 @@ profile 描述的是四种墨水在**真实面板上**长什么样，用**媒体
 内置：
 
 - `note4c-measured-v1` —— **实测值，当前默认**。由 Sony A7M2 的 RAW（`tmp/A7_09377.ARW`）标定得到。
-- `note4c-ideal` —— 纯 `#000/#FFF/#FF0000/#FFFF00`。这是现在固件网页和 `docs/inkscreen_image_converter.js` 的假设，
-  留作 A/B 基线。**这不是面板的样子。**
+- `note4c-ideal` —— 纯 `#000/#FFF/#FF0000/#FFFF00`。这是早期 legacy 算法的假设，
+  现在只留作显式 A/B 基线。**这不是面板的样子。**
 - `note4c-estimate-v1` —— 早期按 E Ink Spectra BWRY 常见反射率推出来的估计值，
   只留作对照。实测证明它错得相当离谱：
 
@@ -278,7 +279,7 @@ RAW 输入时相机 gamma 固定按 1.0 处理，**不再去拟合**：RAW 本�
 | `photo` | 照片 | 适度 S 曲线 + 较强局部对比度，chroma gate 收紧，Sierra-2 serpentine + 边缘保护 |
 | `illustration` | 插画、海报、漫画、UI | 保饱和度，gate 放宽，Atkinson 让平涂区域干净、线条锐利 |
 | `text` | 截图、文档 | 硬色调曲线，chroma 几乎全关，误差扩散削弱以保住字形边缘 |
-| `legacy` | —— | 当前线上算法，A/B 基线 |
+| `legacy` | —— | 早期线上算法，A/B 基线 |
 
 `convert` 会顺带打印它对内容类型的判断（`content looks : photo`），可以拿来对照 preset 选得对不对。
 
@@ -288,7 +289,7 @@ RAW 输入时相机 gamma 固定按 1.0 处理，**不再去拟合**：RAW 本�
 而不是只能得出「新的看着好一点」：
 
 ```
-legacy                       现在线上的算法（与 JS 逐字节一致）
+legacy                       早期线上算法（显式 JS legacy 导出仍逐字节一致）
 01-cal-lab-fs                + 实测 palette + Lab ΔE76 选色
 02-linear-error              + 误差改在线性光里扩散
 03-tone-gamut                + 色调曲线 / 局部对比度 / 色域压缩
@@ -358,7 +359,7 @@ bwry/tone.py        单调色调 LUT、局部对比度、L* 区间映射、chrom
 bwry/edges.py       梯度 / 平坦度 / 内容分类
 bwry/bluenoise.py   void-and-cluster 蓝噪声（增量能量场）
 bwry/dither.py      误差扩散核 + 两色 / 四原色蓝噪声有序抖色
-bwry/legacy.py      当前线上算法的忠实复刻（A/B 基线）
+bwry/legacy.py      早期线上算法的忠实复刻（A/B 基线）
 bwry/metrics.py     HVS ΔE、色彩保留/原生增艳、墨水用量、彩噪率、纹理各向异性
 bwry/pipeline.py    Recipe / convert / 产物写出
 bwry/presets.py     preset 与 A/B 矩阵

@@ -6,18 +6,17 @@
  * - 400x300 1bpp black/white raw buffer: 15000 bytes
  * - 400x300 2bpp black/white/yellow/red raw buffer: 30000 bytes
  *
- * The algorithm matches the firmware HTML uploader:
+ * The default colour algorithm is the measured, on-panel selected 09k recipe
+ * and matches the firmware HTML uploader:
  * 1. Decode the source image to RGBA.
- * 2. Resize/pad to exactly 400x300 on a white background.
- * 3. Apply Floyd-Steinberg dithering.
+ * 2. Cover-crop to exactly 400x300.
+ * 3. Apply measured-palette tone, selective colour translation, gamut mapping,
+ *    chroma gating and Yule-Nielsen compensated Sierra-2 hybrid dithering.
  * 4. Pack pixels into the raw format expected by /upload.
  *
- * NOTE: for 2bpp colour output, tools/bwry produces visibly better results
- * (measured palette, Lab colour matching, gamut compression, chroma gating)
- * for the same 30,000-byte format. See tools/bwry/README.md. This file is kept
- * because it is byte-for-byte what the device's own upload page does, which
- * makes it the A/B baseline; tools/bwry/selftest.py asserts that equivalence.
- * Do not "improve" the algorithm here without updating the firmware page too.
+ * ``bwry09k_core.js`` is generated from the same project-owned template and
+ * static colour assets as the firmware copy. Run
+ * ``tools/bwry/generate_web_converter.py`` after changing that source.
  *
  * This file has no dependency for the core conversion functions. The optional
  * CLI uses `sharp` only for image decode/resize:
@@ -34,6 +33,7 @@ const SCREEN_HEIGHT = 300;
 const PIXELS = SCREEN_WIDTH * SCREEN_HEIGHT;
 const SIZE_1BPP = PIXELS / 8;
 const SIZE_2BPP = PIXELS * 2 / 8;
+const Bwry09k = require("./bwry09k_core.js");
 
 /**
  * Convert a 400x300 RGBA buffer to 1bpp black/white raw data.
@@ -86,7 +86,7 @@ function rgbaTo1bpp(rgba, width = SCREEN_WIDTH, height = SCREEN_HEIGHT) {
  * - pixel 0 uses bits 7..6, pixel 3 uses bits 1..0.
  * - device color codes: black=0, white=1, yellow=2, red=3.
  */
-function rgbaToBwry2bpp(rgba, width = SCREEN_WIDTH, height = SCREEN_HEIGHT) {
+function rgbaToBwry2bppLegacy(rgba, width = SCREEN_WIDTH, height = SCREEN_HEIGHT) {
   assertRgba(rgba, width, height);
 
   const work = new Array(height);
@@ -146,6 +146,11 @@ function rgbaToBwry2bpp(rgba, width = SCREEN_WIDTH, height = SCREEN_HEIGHT) {
   return out;
 }
 
+/** Convert fitted RGBA with the shipping 09k photo recipe. */
+function rgbaToBwry2bpp(rgba, width = SCREEN_WIDTH, height = SCREEN_HEIGHT, options = {}) {
+  return Bwry09k.rgbaToBwry2bpp(rgba, width, height, options);
+}
+
 function assertRgba(rgba, width, height) {
   if (!rgba || typeof rgba.length !== "number") {
     throw new Error("rgba must be a Uint8Array/Buffer-like object");
@@ -185,7 +190,7 @@ function diffuseRgb(work, width, height, x, y, errR, errG, errB) {
   add(1, 1, 1 / 16);
 }
 
-async function loadImageRgbaWithSharp(inputPath) {
+async function loadImageRgbaWithSharp(inputPath, fit = "cover") {
   let sharp;
   try {
     sharp = require("sharp");
@@ -195,7 +200,7 @@ async function loadImageRgbaWithSharp(inputPath) {
 
   const { data } = await sharp(inputPath)
     .resize(SCREEN_WIDTH, SCREEN_HEIGHT, {
-      fit: "contain",
+      fit,
       background: { r: 255, g: 255, b: 255, alpha: 1 },
     })
     .ensureAlpha()
@@ -214,7 +219,7 @@ async function cli() {
     process.exit(2);
   }
 
-  const rgba = await loadImageRgbaWithSharp(input);
+  const rgba = await loadImageRgbaWithSharp(input, format === "1bpp" ? "contain" : "cover");
   const bin = format === "1bpp" ? rgbaTo1bpp(rgba) : rgbaToBwry2bpp(rgba);
   await fs.writeFile(output, bin);
 
@@ -230,6 +235,7 @@ if (typeof module !== "undefined") {
     SIZE_2BPP,
     rgbaTo1bpp,
     rgbaToBwry2bpp,
+    rgbaToBwry2bppLegacy,
     loadImageRgbaWithSharp,
   };
 }

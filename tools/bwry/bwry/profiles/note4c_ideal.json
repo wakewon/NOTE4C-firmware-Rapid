@@ -2,7 +2,7 @@
   "name": "note4c-ideal",
   "display": "ZECTRIX Note4C 400x300 BWRY (SSD2683)",
   "source": "ideal",
-  "notes": "Legacy palette: the four inks treated as pure sRGB primaries. This is what the current firmware HTML uploader and docs/inkscreen_image_converter.js assume. Kept as the A/B baseline; it is NOT what the panel looks like.",
+  "notes": "Historical legacy palette: the four inks treated as pure sRGB primaries. Kept only as an explicit A/B baseline after every default converter moved to 09k; it is NOT what the panel looks like.",
   "measured_reflectance": {},
   "inks": [
     { "name": "black",  "device_code": 0, "srgb": [0, 0, 0],       "hex": "#000000" },
