@@ -120,6 +120,48 @@ def xyz_to_srgb(xyz: np.ndarray) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------
+# Halftone optical mixing
+# --------------------------------------------------------------------------
+
+
+def yule_nielsen_encode_xyz(xyz: np.ndarray, n: float) -> np.ndarray:
+    """Map XYZ into the additive domain of a Yule-Nielsen halftone model.
+
+    The measured exponent describes luminance, not three independently fitted
+    colour channels.  We therefore warp Y by ``1/n`` while preserving each
+    colour's XYZ ratios.  This is exact for the measured luminance model and is
+    less speculative than applying the same exponent independently to X/Y/Z.
+    ``n=1`` is the ordinary linear-reflectance model.
+    """
+    v = np.asarray(xyz, dtype=np.float64)
+    n = float(n)
+    if n <= 0:
+        raise ValueError("Yule-Nielsen n must be positive")
+    if abs(n - 1.0) < 1e-12:
+        return v.copy()
+
+    y = np.maximum(v[..., 1], 0.0)
+    scale = np.zeros_like(y)
+    np.divide(np.power(y, 1.0 / n), y, out=scale, where=y > 1e-12)
+    return v * scale[..., None]
+
+
+def yule_nielsen_decode_xyz(encoded: np.ndarray, n: float) -> np.ndarray:
+    """Inverse :func:`yule_nielsen_encode_xyz` after spatial mixing."""
+    v = np.asarray(encoded, dtype=np.float64)
+    n = float(n)
+    if n <= 0:
+        raise ValueError("Yule-Nielsen n must be positive")
+    if abs(n - 1.0) < 1e-12:
+        return v.copy()
+
+    y = np.maximum(v[..., 1], 0.0)
+    # decoded / encoded = y**n / y = y**(n-1).  Zero remains zero.
+    scale = np.power(y, n - 1.0)
+    return v * scale[..., None]
+
+
+# --------------------------------------------------------------------------
 # Lab <-> LCh
 # --------------------------------------------------------------------------
 

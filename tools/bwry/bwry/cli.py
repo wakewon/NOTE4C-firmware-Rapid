@@ -35,6 +35,8 @@ def cmd_convert(args: argparse.Namespace) -> int:
         recipe.dither.serpentine = False
     if args.edge_suppress is not None:
         recipe.dither.edge_suppress = args.edge_suppress
+    if args.dot_gain is not None:
+        recipe.dither.dot_gain_compensation = args.dot_gain
     if args.saturation is not None:
         recipe.tone.saturation = args.saturation
     if args.contrast is not None:
@@ -63,6 +65,9 @@ def cmd_convert(args: argparse.Namespace) -> int:
     print(f"  recipe        : {recipe.name}  [{recipe.profile}]")
     print(f"  algorithm     : {'legacy FS' if recipe.legacy else recipe.dither.algorithm}"
           f"{' serpentine' if not recipe.legacy and recipe.dither.serpentine else ''}")
+    if not recipe.legacy:
+        print(f"  dot gain      : {'compensated' if recipe.dither.dot_gain_compensation else 'uncorrected'}"
+              f"  (profile n={result.profile.yule_nielsen_n:.2f})")
     print(f"  content looks : {result.meta['suggested_preset']} "
           f"(flat {result.meta['content']['flat_ratio']:.2f}, edges {result.meta['content']['strong_edge_ratio']:.3f})")
     print(f"  HVS dE76      : mean {m['hvs_delta_e']['mean']:.2f}  p95 {m['hvs_delta_e']['p95']:.2f}")
@@ -347,6 +352,8 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--algorithm", choices=ALGORITHMS)
     c.add_argument("--no-serpentine", action="store_true")
     c.add_argument("--edge-suppress", type=float)
+    c.add_argument("--dot-gain", action=argparse.BooleanOptionalAction, default=None,
+                   help="compensate optical dot gain using the profile's Yule-Nielsen exponent")
     c.add_argument("--saturation", type=float)
     c.add_argument("--contrast", type=float)
     c.add_argument("--fit", choices=["contain", "cover", "stretch"])

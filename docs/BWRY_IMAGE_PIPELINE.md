@@ -81,8 +81,10 @@ profile 用**媒体相对** sRGB 存四种墨水：面板自己的纸白按通�
 拟合得 `n = 1.57`，并由未参与拟合的彩色混色块独立验证（线性模型误差最大 +31.9%，
 n 修正后 +6.7%）。
 
-**这意味着抖动后的中间调在真机上比模型预测更暗。** 尚未接入 dither，
-因为它会改变所有图片的整体影调，应先做真机 A/B。
+**这意味着抖动后的中间调在真机上比线性模型预测更暗。** 修正已作为
+`dot_gain_compensation` 独立开关接入 dither，但 shipping preset 暂不默认开启。
+`09-sierra2-edge` 与 `09b-sierra2-edge-yn` 除此开关外逐项相同，用来做真机定档。
+人眼模拟与指标始终按实测 `n` 渲染，保证两个候选都以同一个物理面板为评分基准。
 
 ### 标定流程
 
@@ -122,10 +124,11 @@ bwryctl calibrate chart.jpg --out my_profile.json
 所以：
 
 - **选色** 用 Lab ΔE76 —— 这才是防止偏蓝阴影被判给红墨水的东西；
-- **残差** 在线性光（XYZ）里累积和传递 —— 这是唯一能让平均色调正确的选择。
+- **残差** 默认在线性光（XYZ）里累积和传递；启用 dot-gain 修正时，则在
+  Yule-Nielsen 的可加空间累积和传递，使真机积分后的平均色调命中目标。
 
-自检里有一条直接验证：一块平坦中性色，半色调后在线性光里积分回来，
-与目标亮度差 **dL\* = 0.025**。
+自检分别验证两个表面：`n=1` 时平坦色块在线性光里积分命中目标；实测 `n=1.57` 时，
+未修正的 50% 中间调偏出 ΔE76 > 5，而修正后 ΔE76 < 0.3、黑点覆盖率回到 50%。
 
 A/B 矩阵把这一步单独拆成了一级（`01-cal-lab-fs` → `02-linear-error`），
 `error_space="lab"` 也保留了下来 —— 这个失败模式值得摆到面板上并排看一次。
@@ -253,7 +256,8 @@ gate 拦住了*选色*，却拦不住*残差累积*。
 ```
 legacy → 01-cal-lab-fs → 02-linear-error → 03-tone-gamut → 04-chroma-gate
        → 05-fs-serpentine → 06-sierra2 / 07-stucki / 08-atkinson
-       → 09-sierra2-edge → 10-bluenoise → 11-sierra2-bluenoise-hybrid
+       → 09-sierra2-edge / 09b-sierra2-edge-yn（只差 dot gain）
+       → 10-bluenoise → 11-sierra2-bluenoise-hybrid
        → 12-illustration / 13-text
 ```
 
@@ -286,6 +290,7 @@ legacy → 01-cal-lab-fs → 02-linear-error → 03-tone-gamut → 04-chroma-gat
 ## 10. 现状与下一步
 
 **已完成并验证：** 实测 palette 框架 + 标定流程、Lab 选色、线性光误差扩散、
+Yule-Nielsen 物理积分模型与可切换补偿、
 四面体色域压缩、chroma gate（含残差衰减）、色调/局部对比度、5 类扩散核 + serpentine、
 蓝噪声与混合路线、边缘保护、三个 preset、A/B 矩阵与对比页、自检。
 
@@ -295,10 +300,10 @@ legacy → 01-cal-lab-fs → 02-linear-error → 03-tone-gamut → 04-chroma-gat
 **下一步，按顺序：**
 
 1. **真机 A/B 定档。** 把矩阵推到设备逐张看，选出照片路线的赢家。
-   客观指标只负责把 14 个候选缩到 3～4 个。现在候选是基于实测 profile 生成的，
+   客观指标只负责把 15 个候选缩到 3～4 个。现在候选是基于实测 profile 生成的，
    预览与真机应当第一次真正对得上。
-2. **决定要不要接 Yule-Nielsen 修正。** n=1.57 已实测，但会整体提亮中间调，
-   必须真机对比后再定，不能只看指标。
+2. **给 Yule-Nielsen 修正定档。** 对比 `09-sierra2-edge` 与
+   `09b-sierra2-edge-yn`；它会整体提亮中间调，必须真机决定是否进入默认 preset。
 3. **移植到设备侧。** 真机定档之后，再把胜出配方移植到
    `ap_transfer_server.cc` 内嵌的网页和 `docs/inkscreen_image_converter.js`。
    现在移植是浪费 —— 参数还没定，而且两份 JS 一旦分叉就会长期不一致。

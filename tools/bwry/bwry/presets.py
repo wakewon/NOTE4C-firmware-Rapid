@@ -227,6 +227,11 @@ def ab_matrix(profile: str = CAL) -> list[Recipe]:
         _tweak(p, "09-sierra2-edge", "Sierra-2 serpentine + edge-aware error attenuation. "
                "Expected best-of-class for photographs.",
                **{"dither.algorithm": "sierra2", "dither.edge_suppress": 0.45}),
+        _tweak(p, "09b-sierra2-edge-yn", "Exact 09 pair with measured Yule-Nielsen dot-gain "
+               "compensation (n from the profile). This isolates whether buying back the "
+               "panel's darker halftone midtones improves the real display.",
+               **{"dither.algorithm": "sierra2", "dither.edge_suppress": 0.45,
+                  "dither.dot_gain_compensation": True}),
         # -- step 8: blue noise ------------------------------------------------
         _tweak(p, "10-bluenoise", "Ordered void-and-cluster blue noise over optimal ink pairs. "
                "No scan-order artefacts at all; second route from the plan.",

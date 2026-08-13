@@ -27,6 +27,7 @@ from bwry.calibrate import make_chart, homography, mark_centers, sample_patches
 from bwry.gamut import GamutHull, compress_into_gamut
 from bwry.legacy import legacy_bwry_codes
 from bwry.palette import PaletteProfile
+from bwry.dither import DitherParams, dither
 from bwry.pipeline import convert
 from bwry.presets import ab_matrix, get_preset
 from bwry.tone import ToneParams, build_tone_lut
@@ -110,6 +111,61 @@ def test_palette_and_gamut() -> None:
     check("compression actually reduced chroma",
           float(C.chroma(out).item()) < float(C.chroma(warm).item()),
           f"C* {float(C.chroma(warm).item()):.1f} -> {float(C.chroma(out).item()):.1f}")
+
+
+def test_halftone_model() -> None:
+    print("halftone optical model")
+    profile = PaletteProfile.load("note4c-measured-v1")
+    n = profile.yule_nielsen_n
+    check("measured profile exposes Yule-Nielsen n", abs(n - 1.57) < 1e-9, f"n={n:.2f}")
+
+    # The transform must leave every solid ink unchanged. Only spatial mixtures
+    # are supposed to move; otherwise previews would alter the calibrated
+    # palette itself.
+    roundtrip = C.yule_nielsen_decode_xyz(C.yule_nielsen_encode_xyz(profile.xyz, n), n)
+    check("Yule-Nielsen transform preserves solid inks",
+          bool(np.allclose(roundtrip, profile.xyz, atol=1e-12)))
+
+    black = profile.xyz[profile.index_of("black")]
+    white = profile.xyz[profile.index_of("white")]
+    half_work = 0.5 * C.yule_nielsen_encode_xyz(black, n) \
+        + 0.5 * C.yule_nielsen_encode_xyz(white, n)
+    physical_half = C.yule_nielsen_decode_xyz(half_work, n)
+    linear_half = 0.5 * black + 0.5 * white
+    check("measured dot gain makes a 50% halftone darker than linear mixing",
+          float(physical_half[1]) < float(linear_half[1]) * 0.85,
+          f"Y {linear_half[1]:.3f} -> {physical_half[1]:.3f}")
+
+    # Ask for exactly that physical 50/50 tone. Ordinary linear diffusion lays
+    # down too much black; compensation should recover 50% coverage and the
+    # requested optical colour once the same panel model integrates the result.
+    target_one = C.xyz_to_lab(physical_half)
+    target = np.broadcast_to(target_one, (120, 160, 3)).copy()
+    closed_gate = np.zeros(target.shape[:2])
+
+    def run(compensate: bool, algorithm: str = "sierra2") -> tuple[float, float]:
+        params = DitherParams(
+            algorithm=algorithm, serpentine=True, chroma_penalty=100.0,
+            dot_gain_compensation=compensate,
+        )
+        codes = dither(target, profile, params, gate_open=closed_gate)
+        mixed = C.yule_nielsen_encode_xyz(profile.xyz_of_codes(codes), n).mean(axis=(0, 1))
+        got = C.xyz_to_lab(C.yule_nielsen_decode_xyz(mixed, n))
+        de = float(C.delta_e76(got, target_one))
+        black_fraction = float(np.mean(codes == profile.inks[profile.index_of("black")].device_code))
+        return de, black_fraction
+
+    uncorrected_de, uncorrected_black = run(False)
+    corrected_de, corrected_black = run(True)
+    check("uncorrected diffusion reproduces the measured dark-midtones failure",
+          uncorrected_de > 5.0, f"dE76={uncorrected_de:.2f}, black={uncorrected_black:.3f}")
+    check("dot-gain compensation recovers the requested physical midtone",
+          corrected_de < 0.3 and abs(corrected_black - 0.5) < 0.01,
+          f"dE76={corrected_de:.2f}, black={corrected_black:.3f}")
+    blue_de, blue_black = run(True, "bluenoise")
+    check("ordered blue noise uses the same dot-gain model",
+          blue_de < 0.3 and abs(blue_black - 0.5) < 0.01,
+          f"dE76={blue_de:.2f}, black={blue_black:.3f}")
 
 
 def test_tone_lut() -> None:
@@ -363,12 +419,22 @@ def test_recipe_serialisation() -> None:
         again = Recipe.from_dict(json.loads(json.dumps(recipe.to_dict())))
         check(f"{recipe.name}: survives a JSON round trip", again.to_dict() == recipe.to_dict())
 
+    by_name = {r.name: r for r in ab_matrix()}
+    base = by_name["09-sierra2-edge"].to_dict()
+    corrected = by_name["09b-sierra2-edge-yn"].to_dict()
+    for data in (base, corrected):
+        data.pop("name")
+        data.pop("description")
+    corrected["dither"]["dot_gain_compensation"] = False
+    check("09/09b A/B pair differs only by dot-gain compensation", corrected == base)
+
 
 def main() -> int:
     for fn in (
         test_colour_roundtrip,
         test_packing,
         test_palette_and_gamut,
+        test_halftone_model,
         test_tone_lut,
         test_bluenoise,
         test_calibration_chart,

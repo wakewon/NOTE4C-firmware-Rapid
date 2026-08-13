@@ -64,13 +64,15 @@ def render_simulated(
 ) -> Image.Image:
     """Approximate how the panel looks to the eye at normal viewing distance.
 
-    The halftone is integrated in linear light -- which is what actually happens
-    optically -- rather than in sRGB, so mid-tones do not drift the way a naive
-    blur of the preview PNG would.
+    The halftone is integrated in the measured panel's Yule-Nielsen mixing
+    domain rather than in sRGB.  Profiles without a measured exponent naturally
+    fall back to linear-light averaging (n=1).
     """
     xyz = profile.xyz_of_codes(codes)
+    xyz = C.yule_nielsen_encode_xyz(xyz, profile.yule_nielsen_n)
     if sigma > 0:
         xyz = ndimage.gaussian_filter(xyz, sigma=(sigma, sigma, 0), mode="nearest")
+    xyz = C.yule_nielsen_decode_xyz(xyz, profile.yule_nielsen_n)
     rgb = C.srgb_to_u8(C.xyz_to_srgb(xyz))
     img = Image.fromarray(rgb, mode="RGB")
     if scale > 1:

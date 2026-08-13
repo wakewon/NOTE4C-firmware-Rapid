@@ -55,7 +55,8 @@ python3 -m venv .venv-imgtool
 
 ### 两个容易踩的坑
 
-**误差扩散必须在线性光里做。** 半色调在视觉上是按*反射率线性*平均的，不是按 L\* 平均。
+**误差扩散不能在 Lab 里做。** 理想半色调按线性反射率平均；实测面板存在 dot gain 时，
+则按 Yule-Nielsen 可加空间平均。两者都不是 L\* 平均。
 在 Lab 里扩散误差看起来很「感知正确」，实际结果是每一块平坦区域都墨量不足、整张图发灰发白。
 默认 `error_space="linear"`（XYZ）；`"lab"` 保留下来是为了能把这个失败模式摆到面板上并排看
 （A/B 矩阵里的 `01-cal-lab-fs` vs `02-linear-error`）。
@@ -151,8 +152,11 @@ RAW 输入时相机 gamma 固定按 1.0 处理，**不再去拟合**：RAW 本�
 | mix_ry_50 | +20.6% | +9.2% |
 | mix_wr_50 | +17.2% | +5.0% |
 
-**含义**：抖动后的中间调在真机上会比模型预测的更暗。这一项目前**还没有**接进
-dither，因为它会改变所有图片的整体影调，应当先在真机上做 A/B 再决定。
+**含义**：抖动后的中间调在真机上会比线性模型预测的更暗。修正现已作为独立开关
+`dot_gain_compensation` 接入 dither，但 `photo` 默认仍保持关闭，等待真机定档。
+内置 `09-sierra2-edge` / `09b-sierra2-edge-yn` 是只差这一个开关的公平 A/B。
+人眼模拟预览与 dE 指标则始终按 profile 的实测 `n` 积分，因为它们描述的是面板本身，
+不应随候选是否补偿而改变评分口径。
 
 ### 必须走网页「展示」全屏
 
@@ -263,6 +267,7 @@ legacy                       现在线上的算法（与 JS 逐字节一致）
 07-stucki                    Stucki
 08-atkinson                  Atkinson
 09-sierra2-edge              + 边缘感知误差衰减
+09b-sierra2-edge-yn          只增加 n=1.57 dot-gain 修正（与 09 成对）
 10-bluenoise                 有序 void-and-cluster 蓝噪声（第二条路线）
 11-sierra2-bluenoise-hybrid  Sierra-2 + 蓝噪声调制
 12-illustration / 13-text    两个 preset
@@ -275,13 +280,13 @@ legacy                       现在线上的算法（与 JS 逐字节一致）
 只跑其中几个：
 
 ```bash
-... ab tmp/Cubes.jpg --out tmp/ab --only 06-sierra2,09-sierra2-edge,10-bluenoise
+... ab tmp/Cubes.jpg --out tmp/ab --only 09-sierra2-edge,09b-sierra2-edge-yn
 ```
 
 **直接推到设备逐张对比**（这一步会写入设备相册，所以是显式 opt-in）：
 
 ```bash
-... ab tmp/Cubes.jpg --out tmp/ab --only 06-sierra2,09-sierra2-edge --push http://<设备IP>
+... ab tmp/Cubes.jpg --out tmp/ab --only 09-sierra2-edge,09b-sierra2-edge-yn --push http://<设备IP>
 ```
 
 每张的标题会写成 `图片名 · 配方名`，在设备上翻页就能对上号。
@@ -296,6 +301,8 @@ legacy                       现在线上的算法（与 JS 逐字节一致）
 - **anisotropy** —— 半色调纹理的方向性。蛇形扫描和蓝噪声会把它压向 0，raster 扫描的 worm 会把它抬高。
 
 dE 都是在 HVS 滤波之后算的：半色调逐像素比对没有意义，两边都要先过一个近似人眼空间响应的高斯。
+对 `note4c-measured-v1`，滤波在 Yule-Nielsen 可加空间进行，再还原到 XYZ/Lab；因此修正候选
+不会被旧的线性评分器误判为“过亮”。单张转换也可用 `--dot-gain` / `--no-dot-gain` 显式切换。
 
 ## 目录
 

@@ -128,6 +128,12 @@ class PaletteProfile:
         yb = float(self._xyz[self.index_of("black"), 1])
         return yw / max(yb, 1e-9)
 
+    @property
+    def yule_nielsen_n(self) -> float:
+        """Measured optical dot-gain exponent; 1 means linear mixing."""
+        value = float(self.measured_reflectance.get("yule_nielsen_n", 1.0))
+        return value if np.isfinite(value) and value > 0 else 1.0
+
     # -- serialisation --------------------------------------------------
     def to_dict(self) -> dict:
         return {

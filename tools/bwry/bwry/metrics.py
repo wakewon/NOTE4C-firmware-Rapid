@@ -32,10 +32,12 @@ DEFAULT_HVS_SIGMA = 0.9
 
 
 def hvs_filtered_lab(codes: np.ndarray, profile: PaletteProfile, sigma: float = DEFAULT_HVS_SIGMA) -> np.ndarray:
-    """Integrate the halftone in linear light, then report Lab."""
+    """Integrate the halftone with the panel's measured optical model."""
     xyz = profile.xyz_of_codes(codes)
+    xyz = C.yule_nielsen_encode_xyz(xyz, profile.yule_nielsen_n)
     if sigma > 0:
         xyz = ndimage.gaussian_filter(xyz, sigma=(sigma, sigma, 0), mode="nearest")
+    xyz = C.yule_nielsen_decode_xyz(xyz, profile.yule_nielsen_n)
     return C.xyz_to_lab(xyz)
 
 

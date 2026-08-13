@@ -23,6 +23,12 @@ half-way between the inks in L* comes out as a 50/50 mix, which then integrates
 optically to a good deal lighter than the target. Every flat area ends up
 under-inked and the whole image washes out. ``error_space="lab"`` is kept so
 that failure mode can be put on the panel next to the correct one.
+
+On the measured panel, fine halftones are not perfectly additive even in
+reflectance: the fitted Yule-Nielsen exponent is 1.57.  Optional dot-gain
+compensation carries the residual in that model's additive domain, buying back
+the lightness that optical spreading would otherwise lose.  It is deliberately
+an independent recipe switch so the change can be judged on the panel.
 """
 
 from __future__ import annotations
@@ -94,6 +100,9 @@ class DitherParams:
     strength: float = 1.0
     #: ``"linear"`` (XYZ) or ``"lab"``. See the module docstring.
     error_space: str = "linear"
+    #: Compensate measured optical dot gain using the profile's Yule-Nielsen n.
+    #: False preserves ordinary linear-reflectance diffusion for a clean A/B.
+    dot_gain_compensation: bool = False
     #: dE penalty applied to red/yellow, scaled by how closed the chroma gate is.
     chroma_penalty: float = 26.0
     #: Global damping of the colour residual; 1.0 keeps it fully in play. The
@@ -181,20 +190,23 @@ def _error_diffusion_linear(target_lab, profile, params, *, gate_open, edge):
     kernel = KERNELS[params.algorithm]
     pal_lab = profile.lab
     pal_xyz = profile.xyz
+    mix_n = profile.yule_nielsen_n if params.dot_gain_compensation else 1.0
+    pal_work = C.yule_nielsen_encode_xyz(pal_xyz, mix_n)
     pl = [float(v) for v in pal_lab[:, 0]]
     pa = [float(v) for v in pal_lab[:, 1]]
     pb = [float(v) for v in pal_lab[:, 2]]
-    px = [float(v) for v in pal_xyz[:, 0]]
-    py = [float(v) for v in pal_xyz[:, 1]]
-    pz = [float(v) for v in pal_xyz[:, 2]]
+    px = [float(v) for v in pal_work[:, 0]]
+    py = [float(v) for v in pal_work[:, 1]]
+    pz = [float(v) for v in pal_work[:, 2]]
     pcode = [int(v) for v in profile.device_codes]
     chromatic = [bool(v) for v in ~profile.achromatic_mask]
     nk = len(pl)
 
     tgt_xyz = C.lab_to_xyz(target_lab)
-    tx = tgt_xyz[..., 0].ravel().tolist()
-    ty = tgt_xyz[..., 1].ravel().tolist()
-    tz = tgt_xyz[..., 2].ravel().tolist()
+    tgt_work = C.yule_nielsen_encode_xyz(tgt_xyz, mix_n)
+    tx = tgt_work[..., 0].ravel().tolist()
+    ty = tgt_work[..., 1].ravel().tolist()
+    tz = tgt_work[..., 2].ravel().tolist()
 
     pen, atten, offs = _side_inputs((h, w), params, gate_open, edge)
     cscale = _chroma_error_scale(params, gate_open, n)
@@ -230,13 +242,24 @@ def _error_diffusion_linear(target_lab, profile, params, *, gate_open, edge):
             Y = ty[i] + aY
             Z = tz[i] + aZ
 
+            # Ink choice still happens in perceptual Lab.  With dot-gain
+            # compensation X/Y/Z above live in the Yule-Nielsen additive
+            # domain, so decode the accumulated value before measuring dE.
+            if mix_n != 1.0:
+                gain = max(Y, 0.0) ** (mix_n - 1.0)
+                decision_X = X * gain
+                decision_Y = Y * gain
+                decision_Z = Z * gain
+            else:
+                decision_X, decision_Y, decision_Z = X, Y, Z
+
             # Inline XYZ -> Lab; the branch handles the negative values that
             # accumulated error legitimately produces.
-            t = X / _XN
+            t = decision_X / _XN
             fx = t**_THIRD if t > _LAB_EPS else t / _LAB_KAPPA + 0.13793103448275862
-            t = Y / _YN
+            t = decision_Y / _YN
             fy = t**_THIRD if t > _LAB_EPS else t / _LAB_KAPPA + 0.13793103448275862
-            t = Z / _ZN
+            t = decision_Z / _ZN
             fz = t**_THIRD if t > _LAB_EPS else t / _LAB_KAPPA + 0.13793103448275862
             L = 116.0 * fy - 16.0
             A = 500.0 * (fx - fy)
@@ -395,6 +418,8 @@ def error_diffusion(
     gate_open: np.ndarray | None = None,
     edge: np.ndarray | None = None,
 ) -> np.ndarray:
+    if params.error_space == "lab" and params.dot_gain_compensation:
+        raise ValueError("dot-gain compensation requires error_space='linear'")
     fn = _error_diffusion_lab if params.error_space == "lab" else _error_diffusion_linear
     return fn(target_lab, profile, params, gate_open=gate_open, edge=edge)
 
@@ -437,11 +462,14 @@ def ordered_bluenoise(
 ) -> np.ndarray:
     h, w = target_lab.shape[:2]
     pal_xyz = profile.xyz
+    mix_n = profile.yule_nielsen_n if params.dot_gain_compensation else 1.0
+    pal_work = C.yule_nielsen_encode_xyz(pal_xyz, mix_n)
     codes = profile.device_codes
     chromatic = (~profile.achromatic_mask).astype(np.float64)
     nk = pal_xyz.shape[0]
 
     tgt_xyz = C.lab_to_xyz(target_lab)
+    tgt_work = C.yule_nielsen_encode_xyz(tgt_xyz, mix_n)
     fn = C.DELTA_E[delta_e]
 
     closed = np.zeros((h, w)) if gate_open is None else (1.0 - np.asarray(gate_open))
@@ -454,16 +482,18 @@ def ordered_bluenoise(
 
     for i in range(nk):
         for j in range(i + 1, nk):
-            a = pal_xyz[i]
-            d = pal_xyz[j] - a
+            a = pal_work[i]
+            d = pal_work[j] - a
             denom = float(np.dot(d, d))
             if denom < 1e-12:
                 continue
-            # Mixing is linear in XYZ, so the best two-ink approximation is the
-            # orthogonal projection of the target onto that segment.
-            t = np.clip(((tgt_xyz - a) @ d) / denom, 0.0, 1.0)
+            # Mixing is linear in the selected optical model's additive domain,
+            # so the best two-ink approximation is the orthogonal projection of
+            # the target onto that segment.
+            t = np.clip(((tgt_work - a) @ d) / denom, 0.0, 1.0)
             mixed = a + t[..., None] * d
-            score = fn(C.xyz_to_lab(mixed), target_lab)
+            optical = C.yule_nielsen_decode_xyz(mixed, mix_n)
+            score = fn(C.xyz_to_lab(optical), target_lab)
             # Charge the chroma penalty in proportion to how much chromatic
             # ink the mix actually spends.
             score = score + penalty * ((1.0 - t) * chromatic[i] + t * chromatic[j])
