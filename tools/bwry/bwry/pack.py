@@ -83,6 +83,44 @@ def render_simulated(
 # --------------------------------------------------------------------------
 
 
+def to_srgb(img: Image.Image) -> Image.Image:
+    """Convert an image to sRGB using its embedded ICC profile, if it has one.
+
+    Phones do not shoot sRGB by default -- iPhones tag Display P3, and several
+    Android makers ship wider spaces too. Reading a P3 file as though it were
+    sRGB makes every saturated colour read hotter than it is, which for
+    calibration means baking a systematic error straight into the profile.
+    """
+    icc = img.info.get("icc_profile")
+    if not icc:
+        return img.convert("RGB")
+    try:
+        from io import BytesIO
+
+        from PIL import ImageCms
+
+        src = ImageCms.ImageCmsProfile(BytesIO(icc))
+        dst = ImageCms.createProfile("sRGB")
+        return ImageCms.profileToProfile(img.convert("RGB"), src, dst, outputMode="RGB")
+    except Exception:
+        # A broken or unsupported profile should not stop a conversion; sRGB is
+        # the right guess when we have nothing better.
+        return img.convert("RGB")
+
+
+def open_image(path) -> Image.Image:
+    """Open, apply EXIF orientation, and normalise to sRGB. Returns RGB."""
+    from PIL import ImageOps
+
+    img = ImageOps.exif_transpose(Image.open(path))
+    if img.mode in ("RGBA", "LA", "P"):
+        rgba = img.convert("RGBA")
+        flat = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+        flat.alpha_composite(rgba)
+        img = flat
+    return to_srgb(img)
+
+
 def load_and_fit(
     path,
     width: int = SCREEN_WIDTH,
@@ -99,9 +137,8 @@ def load_and_fit(
         img = img.convert("RGBA")
         flat = Image.new("RGBA", img.size, tuple(background) + (255,))
         flat.alpha_composite(img)
-        img = flat.convert("RGB")
-    else:
-        img = img.convert("RGB")
+        img = flat
+    img = to_srgb(img)
 
     if fit == "cover":
         out = ImageOps.fit(img, (width, height), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))

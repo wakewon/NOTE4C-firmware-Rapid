@@ -191,6 +191,50 @@ def test_calibration_chart() -> None:
     check("halftone linearity check passes on synthetic data", report["linear_mixing_ok"],
           f"mean dE76 {report['mix_check_mean_delta_e']:.2f}")
 
+    # Same thing under uneven light: this is the realistic case for a phone
+    # photo, and the whole point of fitting the illumination field.
+    from bwry.calibrate import estimate_illumination, photo_diagnostics
+
+    h, w = rendered.shape[:2]
+    yy, xx = np.mgrid[0:h, 0:w]
+    # ~35% brighter top-left than bottom-right, plus a little vignetting.
+    shade = 1.15 - 0.30 * (xx / w) - 0.18 * (yy / h)
+    shade *= 1.0 - 0.10 * (((xx / w - 0.5) ** 2 + (yy / h - 0.5) ** 2) * 2.0)
+    lit = C.srgb_to_u8(C.linear_to_srgb(C.srgb_to_linear(rendered / 255.0) * shade[..., None]))
+
+    field = estimate_illumination(lit, corners)
+    nu = field.non_uniformity
+    check("illumination field detects the gradient", 0.25 < nu < 0.60, f"{nu * 100:.0f}% variation")
+
+    corrected, _ = profile_from_samples(sample_patches(lit, corners, illumination=field), name="lit")
+    naive, _ = profile_from_samples(sample_patches(lit, corners), name="lit-naive")
+    de_corr = float(C.delta_e76(corrected.lab, truth.lab).max())
+    de_naive = float(C.delta_e76(naive.lab, truth.lab).max())
+    check("flat-field correction recovers the palette under uneven light", de_corr < 3.0,
+          f"max dE76 {de_corr:.2f} (uncorrected {de_naive:.2f})")
+    check("flat-field correction is a clear improvement", de_corr < de_naive * 0.6,
+          f"{de_naive:.2f} -> {de_corr:.2f}")
+
+    # Diagnostics have to actually catch a bad photograph. The "good" fixture
+    # is exposed the way a real shot should be -- paper white a little under
+    # clipping, not pinned at 255.
+    exposed = C.srgb_to_u8(C.linear_to_srgb(C.srgb_to_linear(rendered / 255.0) * 0.78))
+    ok = photo_diagnostics(sample_patches(exposed, corners), None)
+    check("a well-exposed render passes the photo checks", ok["usable"], str(ok["problems"]))
+    check("...and still recovers the palette",
+          float(C.delta_e76(profile_from_samples(sample_patches(exposed, corners), name="e")[0].lab,
+                            truth.lab).max()) < 3.0)
+
+    blown = np.clip(rendered.astype(np.int32) + 90, 0, 255).astype(np.uint8)
+    bad = photo_diagnostics(sample_patches(blown, corners), None)
+    check("an over-exposed photograph is rejected", not bad["usable"],
+          bad["problems"][0][:60] if bad["problems"] else "not caught")
+
+    glared = C.srgb_to_u8(C.linear_to_srgb(C.srgb_to_linear(rendered / 255.0) * 0.5 + 0.25))
+    glare = photo_diagnostics(sample_patches(glared, corners), None)
+    check("a glare-washed photograph is rejected", not glare["usable"],
+          glare["problems"][0][:60] if glare["problems"] else "not caught")
+
     h = homography(mark_centers(), mark_centers() * 2.0 + 17.0)
     check("homography solves an affine case",
           bool(np.allclose(h @ np.array([10.0, 20.0, 1.0]), [10 * 2 + 17, 20 * 2 + 17, 1.0])))

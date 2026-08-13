@@ -8,7 +8,6 @@ import sys
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
 
 from . import abtest, calibrate, pack
 from .dither import ALGORITHMS
@@ -160,7 +159,9 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
         if not args.photo:
             print("give a photograph of the chart, or use --swatches", file=sys.stderr)
             return 2
-        photo = np.asarray(Image.open(args.photo).convert("RGB"), dtype=np.uint8)
+        # open_image applies EXIF orientation and converts via the embedded ICC
+        # profile: phone photos are usually Display P3, not sRGB.
+        photo = np.asarray(pack.open_image(args.photo), dtype=np.uint8)
         if args.corners:
             nums = [float(v) for v in args.corners.replace(";", ",").split(",")]
             if len(nums) != 8:
@@ -174,11 +175,52 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
                 print(f"  {x:8.1f}, {y:8.1f}")
             print("  if these look wrong, re-run with --corners")
 
-        samples = calibrate.sample_patches(photo, corners)
+        illumination = None if args.no_flat_field else calibrate.estimate_illumination(photo, corners)
+        samples = calibrate.sample_patches(photo, corners, illumination=illumination)
+
+        gamma_report = None
+        if args.camera_gamma is None:
+            gamma, gamma_report = calibrate.fit_camera_gamma(samples)
+        else:
+            gamma = args.camera_gamma
+        raw_samples = samples
+        samples = calibrate.apply_camera_gamma(samples, gamma)
+
+        diagnostics = calibrate.photo_diagnostics(samples, illumination, raw=raw_samples)
+        diagnostics["camera_gamma"] = round(gamma, 3)
+
+        print("\nphotograph check:")
+        if gamma_report:
+            print(f"  camera tone curve      : gamma {gamma_report['gamma']:.2f} "
+                  f"(fitted from the black/white ramp)")
+            print(f"  contrast               : {gamma_report['contrast_before']:.1f}:1 as shot "
+                  f"-> {gamma_report['contrast_after']:.1f}:1 corrected")
+        else:
+            print(f"  camera tone curve      : gamma {gamma:.2f} (given)")
+        print(f"  contrast measured      : {diagnostics['contrast_ratio']:.1f}:1")
+        if diagnostics["illumination_non_uniformity"] is not None:
+            print(f"  light evenness         : {diagnostics['illumination_non_uniformity'] * 100:.0f}% "
+                  f"variation across the panel (corrected)")
+        for w in diagnostics["warnings"]:
+            print(f"  warning: {w}")
+        for p in diagnostics["problems"]:
+            print(f"  PROBLEM: {p}")
+
+        if diagnostics["problems"] and not args.force:
+            print("\nNot writing a profile from this photograph. A profile built on a bad "
+                  "measurement is worse than the estimate it would replace -- re-shoot, or "
+                  "pass --force if you know better.", file=sys.stderr)
+            return 1
+
         profile, report = calibrate.profile_from_samples(
             samples, name=args.name, notes=f"Measured from {Path(args.photo).name}."
         )
         report["corners"] = [[round(float(v), 1) for v in c] for c in corners]
+        report["diagnostics"] = diagnostics
+        if gamma_report:
+            report["camera_response"] = gamma_report
+        if illumination is not None:
+            report["illumination_coeffs"] = illumination.coeffs.round(6).tolist()
 
     out = Path(args.out)
     profile.save(out)
@@ -274,6 +316,13 @@ def build_parser() -> argparse.ArgumentParser:
     cal.add_argument("--name", default="note4c-measured")
     cal.add_argument("--corners", help="x_tl,y_tl,x_tr,y_tr,x_br,y_br,x_bl,y_bl in photo pixels")
     cal.add_argument("--swatches", help="black,white,yellow,red as hex, skipping the photo")
+    cal.add_argument("--camera-gamma", type=float,
+                     help="tone curve the camera applied, to divide out. Default is to fit it "
+                          "from the chart's black/white ramp; pass 1.0 to trust the photo as-is")
+    cal.add_argument("--no-flat-field", action="store_true",
+                     help="skip the illumination correction fitted from the chart's white border")
+    cal.add_argument("--force", action="store_true",
+                     help="write a profile even if the photograph failed its checks")
     cal.set_defaults(func=cmd_calibrate)
 
     pr = sub.add_parser("profiles", help="list or describe palette profiles")
