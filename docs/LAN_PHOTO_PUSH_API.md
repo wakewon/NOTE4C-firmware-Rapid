@@ -253,7 +253,9 @@ curl -X POST "http://192.168.110.238/settings" \
 ### 推荐：`tools/bwry`（画质更好）
 
 四色转换推荐用 [`tools/bwry`](../tools/bwry/README.md)。它用实测 palette、Lab 选色、
-色域压缩和 chroma gate，相比下面的 JS 版本明显减少灰墙/天空/肤色暗部上的红黄彩噪。
+Yule-Nielsen 光学混色、色域压缩和 chroma gate，相比下面的 JS 版本明显减少灰墙/天空/肤色
+暗部上的红黄彩噪；实验矩阵还提供自适应暖色 look 与四原色 tetra 蓝噪声，用于把大面积
+不可表示的蓝/绿统一翻译成更适合 B/W/R/Y 面板的老照片式视觉语言。
 输出格式完全一致，仍然是 400×300 2bpp 30000 字节。
 
 ```bash

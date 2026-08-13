@@ -93,7 +93,11 @@ class PaletteProfile:
 
     @property
     def xyz(self) -> np.ndarray:
-        """(N, 3) XYZ of each ink. Spatial mixing is linear in this space."""
+        """(N, 3) XYZ of each solid ink.
+
+        Profiles with ``yule_nielsen_n != 1`` mix spatially in the corresponding
+        optical domain rather than directly in XYZ.
+        """
         return self._xyz
 
     @property

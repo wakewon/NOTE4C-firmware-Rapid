@@ -159,6 +159,55 @@ def ab_matrix(profile: str = CAL) -> list[Recipe]:
     )
     off_gate = ChromaGate(enabled=False)
     p = photo(profile)
+    yn = _tweak(
+        p, "09b-sierra2-edge-yn", "Exact 09 pair with measured Yule-Nielsen dot-gain "
+        "compensation and physical gamut (n from the profile).",
+        **{"dither.algorithm": "sierra2", "dither.edge_suppress": 0.45,
+           "dither.dot_gain_compensation": True},
+    )
+    cover = _tweak(
+        yn, "09c-sierra2-yn-cover", "Exact 09b conversion with a 4:3 cover crop so a wide "
+        "photo uses the full panel instead of spending 25% of it on white letterboxing.",
+        fit="cover",
+    )
+    vivid = _tweak(
+        cover, "09d-sierra2-vivid", "Adds saturation-intent gamut mapping. Neutral areas stay "
+        "neutral; unsupported blue/green hues rotate gently toward the available red/yellow "
+        "inks instead of collapsing to greyscale.",
+        gamut_intent="vivid", gamut_vivid_strength=0.45,
+    )
+    vivid_strong = _tweak(
+        vivid, "09e-vivid-strong", "Raises only saturation-intent strength from 45% to 70%, "
+        "showing how much false-hue colourfulness this four-ink palette can usefully carry.",
+        gamut_vivid_strength=0.70,
+    )
+    vivid_hybrid = _tweak(
+        vivid_strong, "09f-vivid-hybrid", "Adds gentle tone-dependent blue-noise threshold modulation "
+        "to break up diffusion worms without disturbing solid highlights or shadows.",
+        **{"dither.blue_noise_amount": 0.25},
+    )
+    vintage = _tweak(
+        cover, "09g-adaptive-vintage", "Adaptive aged-photo grade before hue-preserving gamut "
+        "mapping: the measured loss of unsupported colours controls the overall strength, "
+        "while already printable red/yellow regions receive less local restyling.",
+        color_style="vintage", color_style_strength=0.88,
+    )
+    vintage_hybrid = _tweak(
+        vintage, "09h-adaptive-vintage-hybrid", "Exact adaptive-vintage pair with gentle "
+        "tone-dependent blue-noise threshold modulation to compare texture only.",
+        **{"dither.blue_noise_amount": 0.25},
+    )
+    vintage_tetra = _tweak(
+        vintage, "09i-adaptive-vintage-tetra", "Same adaptive look, but replaces sequential "
+        "error diffusion with four-primary tetrahedral blue-noise screening: slightly less "
+        "locally exact, with no scan-order worms or directional grain.",
+        **{"dither.algorithm": "tetra-bluenoise"},
+    )
+    vivid_tetra = _tweak(
+        vivid_strong, "09j-vivid-tetra", "Same vivid mapping with four-primary tetrahedral "
+        "blue-noise screening, isolating texture from the colour-rendering intent.",
+        **{"dither.algorithm": "tetra-bluenoise"},
+    )
 
     recipes = [
         legacy(),
@@ -227,11 +276,15 @@ def ab_matrix(profile: str = CAL) -> list[Recipe]:
         _tweak(p, "09-sierra2-edge", "Sierra-2 serpentine + edge-aware error attenuation. "
                "Expected best-of-class for photographs.",
                **{"dither.algorithm": "sierra2", "dither.edge_suppress": 0.45}),
-        _tweak(p, "09b-sierra2-edge-yn", "Exact 09 pair with measured Yule-Nielsen dot-gain "
-               "compensation (n from the profile). This isolates whether buying back the "
-               "panel's darker halftone midtones improves the real display.",
-               **{"dither.algorithm": "sierra2", "dither.edge_suppress": 0.45,
-                  "dither.dot_gain_compensation": True}),
+        yn,
+        cover,
+        vivid,
+        vivid_strong,
+        vivid_hybrid,
+        vintage,
+        vintage_hybrid,
+        vintage_tetra,
+        vivid_tetra,
         # -- step 8: blue noise ------------------------------------------------
         _tweak(p, "10-bluenoise", "Ordered void-and-cluster blue noise over optimal ink pairs. "
                "No scan-order artefacts at all; second route from the plan.",

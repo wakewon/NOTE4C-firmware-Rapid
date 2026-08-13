@@ -40,6 +40,7 @@ import numpy as np
 
 from . import bluenoise as bn_mod
 from . import color as C
+from .gamut import GamutHull
 from .palette import PaletteProfile
 
 # --------------------------------------------------------------------------
@@ -85,7 +86,7 @@ KERNELS: dict[str, list[tuple[int, int, float]]] = {
     ],
 }
 
-ALGORITHMS = sorted(KERNELS) + ["bluenoise", "nearest"]
+ALGORITHMS = sorted(KERNELS) + ["bluenoise", "tetra-bluenoise", "nearest"]
 
 _LAB_EPS = (6.0 / 29.0) ** 3
 _LAB_KAPPA = 3.0 * (6.0 / 29.0) ** 2
@@ -119,6 +120,9 @@ class DitherParams:
     #: Blue-noise modulation of the decision threshold (error diffusion only).
     blue_noise_amount: float = 0.0
     blue_noise_scale: float = 10.0  # L* units at amount 1.0
+    #: Fade threshold modulation to zero near solid black/white, where noise is
+    #: visible but cannot improve a halftone. This is the tone-dependent part.
+    blue_noise_tone_adaptive: bool = True
     #: Hard cap on accumulated error, in units of the working space. 0 disables.
     error_clamp: float = 0.0
     mask_size: int = 64
@@ -151,7 +155,7 @@ def _chroma_error_scale(params: DitherParams, gate_open, n: int):
     return (base * (floor + (1.0 - floor) * o)).tolist()
 
 
-def _side_inputs(shape, params: DitherParams, gate_open, edge):
+def _side_inputs(shape, params: DitherParams, gate_open, edge, target_l=None, profile=None):
     h, w = shape
     n = h * w
 
@@ -167,7 +171,17 @@ def _side_inputs(shape, params: DitherParams, gate_open, edge):
 
     if params.blue_noise_amount > 0:
         mask = bn_mod.tile(bn_mod.void_and_cluster(params.mask_size, params.mask_sigma), h, w)
-        offs = ((mask - 0.5) * (2.0 * params.blue_noise_amount * params.blue_noise_scale)).ravel().tolist()
+        amount = 2.0 * params.blue_noise_amount * params.blue_noise_scale
+        if params.blue_noise_tone_adaptive and target_l is not None and profile is not None:
+            tone = np.clip(
+                (np.asarray(target_l) - profile.l_black)
+                / max(profile.l_white - profile.l_black, 1e-9),
+                0.0,
+                1.0,
+            )
+            # Smooth parabola: 0 at either solid, 1 at the 50% midtone.
+            amount = amount * (4.0 * tone * (1.0 - tone))
+        offs = ((mask - 0.5) * amount).ravel().tolist()
     else:
         offs = None
 
@@ -208,7 +222,9 @@ def _error_diffusion_linear(target_lab, profile, params, *, gate_open, edge):
     ty = tgt_work[..., 1].ravel().tolist()
     tz = tgt_work[..., 2].ravel().tolist()
 
-    pen, atten, offs = _side_inputs((h, w), params, gate_open, edge)
+    pen, atten, offs = _side_inputs(
+        (h, w), params, gate_open, edge, target_l=target_lab[..., 0], profile=profile
+    )
     cscale = _chroma_error_scale(params, gate_open, n)
 
     ex = [0.0] * n
@@ -338,7 +354,9 @@ def _error_diffusion_lab(target_lab, profile, params, *, gate_open, edge):
     ta = target_lab[..., 1].ravel().tolist()
     tb = target_lab[..., 2].ravel().tolist()
 
-    pen, atten, offs = _side_inputs((h, w), params, gate_open, edge)
+    pen, atten, offs = _side_inputs(
+        (h, w), params, gate_open, edge, target_l=target_lab[..., 0], profile=profile
+    )
     cscale = _chroma_error_scale(params, gate_open, n)
 
     el = [0.0] * n
@@ -515,6 +533,77 @@ def ordered_bluenoise(
     return out.astype(np.uint8)
 
 
+def tetrahedral_bluenoise(
+    target_lab: np.ndarray,
+    profile: PaletteProfile,
+    params: DitherParams,
+    *,
+    gate_open: np.ndarray | None = None,
+    edge: np.ndarray | None = None,
+) -> np.ndarray:
+    """Ordered blue-noise sampling of all four Neugebauer primaries.
+
+    Pair selection is necessarily approximate for a point in the interior of
+    the four-ink tetrahedron. Here the gamut mapper's target is decomposed
+    directly into its four barycentric ink coverages in the measured optical
+    mixing domain. A uniform void-and-cluster threshold then samples that
+    categorical distribution. Flat areas integrate to the requested colour,
+    but there is no sequential residual and therefore no diffusion worm.
+
+    This is the panel analogue of a tetrahedral 3-D LUT followed by ordered
+    screening: the colour model and the texture generator stay independent.
+    """
+    h, w = target_lab.shape[:2]
+    mix_n = profile.yule_nielsen_n if params.dot_gain_compensation else 1.0
+    hull = GamutHull(profile, mixing_n=mix_n)
+    weights = hull.barycentric(C.lab_to_xyz(target_lab))
+    # Lab interpolation in the chroma gate can put a value microscopically
+    # outside a convex hull in the optical domain. Project those float crumbs
+    # back onto the simplex before treating them as area coverages.
+    weights = np.maximum(weights, 0.0)
+    weights /= np.maximum(weights.sum(axis=-1, keepdims=True), 1e-12)
+
+    if gate_open is not None:
+        # A neutral target can mathematically use a tiny amount of coloured ink
+        # to cancel the real black particle's blue cast. That is exactly the
+        # visually objectionable confetti the chroma gate promises to forbid.
+        # Re-decompose the closed part strictly on the measured black/white
+        # segment, then cross-fade coverages by gate openness.
+        black_i = profile.index_of("black")
+        white_i = profile.index_of("white")
+        a = hull.vertices[black_i]
+        d = hull.vertices[white_i] - a
+        target_work = C.yule_nielsen_encode_xyz(C.lab_to_xyz(target_lab), mix_n)
+        t = np.clip(((target_work - a) @ d) / max(float(d @ d), 1e-12), 0.0, 1.0)
+        neutral = np.zeros_like(weights)
+        neutral[..., black_i] = 1.0 - t
+        neutral[..., white_i] = t
+        # Area coverage makes even a small openness visible as isolated dots;
+        # steepen the soft gate so its uncertain lower half stays clean while
+        # confidently chromatic regions still reach full coverage.
+        openness = np.clip(np.asarray(gate_open), 0.0, 1.0)[..., None] ** 3
+        weights = neutral + openness * (weights - neutral)
+
+    if edge is not None and params.edge_suppress > 0:
+        # At contours, prefer one solid ink to a high-frequency screen. This is
+        # the categorical equivalent of attenuating diffusion across edges.
+        dominant = np.argmax(weights, axis=-1)
+        one_hot = np.eye(weights.shape[-1], dtype=np.float64)[dominant]
+        amount = (
+            params.edge_suppress * np.clip(np.asarray(edge), 0.0, 1.0)
+        )[..., None]
+        weights += amount * (one_hot - weights)
+
+    threshold = bn_mod.tile(
+        bn_mod.void_and_cluster(params.mask_size, params.mask_sigma), h, w
+    )
+    cdf = np.cumsum(weights, axis=-1)
+    # Count passed boundaries instead of argmax so the final ink remains a
+    # catch-all even when round-off leaves the last CDF value at 0.999999...
+    index = np.sum(threshold[..., None] >= cdf[..., :-1], axis=-1)
+    return profile.device_codes[index].astype(np.uint8)
+
+
 # --------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------
@@ -534,6 +623,10 @@ def dither(
         )
     if params.algorithm == "bluenoise":
         return ordered_bluenoise(target_lab, profile, params, gate_open=gate_open, edge=edge)
+    if params.algorithm == "tetra-bluenoise":
+        return tetrahedral_bluenoise(
+            target_lab, profile, params, gate_open=gate_open, edge=edge
+        )
     if params.algorithm not in KERNELS:
         raise ValueError(f"unknown algorithm {params.algorithm!r}; try one of {ALGORITHMS}")
     return error_diffusion(target_lab, profile, params, gate_open=gate_open, edge=edge)

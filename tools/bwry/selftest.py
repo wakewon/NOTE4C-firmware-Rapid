@@ -24,7 +24,8 @@ from bwry import color as C
 from bwry import pack
 from bwry.bluenoise import void_and_cluster
 from bwry.calibrate import make_chart, homography, mark_centers, sample_patches
-from bwry.gamut import GamutHull, compress_into_gamut
+from bwry.gamut import GamutHull, compress_into_gamut, map_vivid_into_gamut
+from bwry.grade import adaptive_grade_amount, apply_palette_grade
 from bwry.legacy import legacy_bwry_codes
 from bwry.palette import PaletteProfile
 from bwry.dither import DitherParams, dither
@@ -112,6 +113,32 @@ def test_palette_and_gamut() -> None:
           float(C.chroma(out).item()) < float(C.chroma(warm).item()),
           f"C* {float(C.chroma(warm).item()):.1f} -> {float(C.chroma(out).item()):.1f}")
 
+    measured = PaletteProfile.load("note4c-measured-v1")
+    physical_hull = GamutHull(measured, mixing_n=measured.yule_nielsen_n)
+    samples_xyz, _ = physical_hull.sample(12)
+    check("Yule-Nielsen gamut samples remain inside the physical hull",
+          bool(physical_hull.contains(samples_xyz).all()))
+
+    # A B/W/R/Y gamut has no blue cusp. Hue-preserving compression correctly
+    # turns blue nearly neutral; the opt-in vivid intent must be able to retain
+    # colourfulness by rotating it toward a printable warm hue, while leaving
+    # genuinely neutral content alone.
+    blue = C.srgb_to_lab(np.array([[[0.10, 0.20, 0.90]]]))
+    blue[..., 0] = 60.0
+    blue_base = compress_into_gamut(blue, physical_hull)
+    blue_vivid = map_vivid_into_gamut(blue, physical_hull, strength=0.7)
+    check("vivid intent keeps unsupported blue visibly chromatic",
+          float(C.chroma(blue_vivid).item()) > float(C.chroma(blue_base).item()) + 20.0,
+          f"C* {float(C.chroma(blue_base).item()):.1f} -> {float(C.chroma(blue_vivid).item()):.1f}")
+    check("vivid result remains physically reachable",
+          bool(physical_hull.contains(C.lab_to_xyz(blue_vivid)).all()))
+
+    grey = np.array([[[60.0, 0.0, 0.0]]])
+    grey_base = compress_into_gamut(grey, physical_hull)
+    grey_vivid = map_vivid_into_gamut(grey, physical_hull, strength=0.7)
+    check("vivid intent does not tint neutral content",
+          bool(np.allclose(grey_vivid, grey_base, atol=1e-10)))
+
 
 def test_halftone_model() -> None:
     print("halftone optical model")
@@ -166,6 +193,10 @@ def test_halftone_model() -> None:
     check("ordered blue noise uses the same dot-gain model",
           blue_de < 0.3 and abs(blue_black - 0.5) < 0.01,
           f"dE76={blue_de:.2f}, black={blue_black:.3f}")
+    tetra_de, tetra_black = run(True, "tetra-bluenoise")
+    check("tetrahedral blue noise preserves optical area coverage",
+          tetra_de < 0.3 and abs(tetra_black - 0.5) < 0.01,
+          f"dE76={tetra_de:.2f}, black={tetra_black:.3f}")
 
 
 def test_tone_lut() -> None:
@@ -197,6 +228,51 @@ def test_bluenoise() -> None:
     low = spectrum[c - 3 : c + 4, c - 3 : c + 4].sum()
     total = spectrum.sum()
     check("low-frequency energy is suppressed", low / total < 0.05, f"{low / total:.4f} of total")
+
+
+def test_palette_grade() -> None:
+    print("palette-aware colour grade")
+    profile = PaletteProfile.load("note4c-measured-v1")
+    swatches = C.srgb_to_lab(np.array([[
+        [0.10, 0.20, 0.90],  # blue sky
+        [0.10, 0.70, 0.20],  # green foliage
+        [0.50, 0.50, 0.50],  # neutral stone
+        [0.00, 0.00, 0.00],
+        [1.00, 1.00, 1.00],
+    ]]))
+    graded, meta = apply_palette_grade(swatches, profile, style="vintage", strength=1.0)
+    hues = C.hue_deg(graded)[0]
+    chroma = C.chroma(graded)[0]
+    red_h = float(C.hue_deg(profile.lab[profile.index_of("red")]))
+    yellow_h = float(C.hue_deg(profile.lab[profile.index_of("yellow")]))
+
+    check("vintage grade maps blue toward brick red",
+          float(C.hue_distance(hues[0], red_h)) < float(C.hue_distance(hues[0], yellow_h)))
+    check("vintage grade maps green toward ochre",
+          float(C.hue_distance(hues[1], yellow_h)) < float(C.hue_distance(hues[1], red_h)))
+    check("vintage grade gives neutral midtones a restrained warm cast",
+          3.0 < float(chroma[2]) < 12.0, f"C*={chroma[2]:.1f}")
+    check("vintage grade keeps solid black and paper white neutral",
+          float(chroma[3]) < 1e-6 and float(chroma[4]) < 1e-3,
+          f"C* black={chroma[3]:.3g} white={chroma[4]:.3g}")
+    check("vintage grade reports its transform", meta["style"] == "vintage")
+
+    # The adaptive controller must distinguish a palette-native photograph
+    # from one dominated by hues the panel cannot reproduce.
+    hull = GamutHull(profile, mixing_n=profile.yule_nielsen_n)
+    native = np.broadcast_to(profile.lab[[2, 3]][None, :, :], (12, 2, 3)).copy()
+    native_faithful = compress_into_gamut(native, hull, knee=1.0, l_adapt=0.0)
+    native_amount, native_meta = adaptive_grade_amount(native, native_faithful)
+    cool = np.broadcast_to(swatches[:, :2, :], (12, 2, 3)).copy()
+    cool_faithful = compress_into_gamut(cool, hull, knee=1.0, l_adapt=0.0)
+    cool_amount, cool_meta = adaptive_grade_amount(cool, cool_faithful)
+    check("adaptive grade stays subtle for palette-native colours",
+          float(np.mean(native_amount)) < 0.18,
+          f"mean strength={float(np.mean(native_amount)):.3f}")
+    check("adaptive grade grows when unsupported hues dominate",
+          float(np.mean(cool_amount)) > 3.0 * float(np.mean(native_amount)),
+          f"native={native_meta['mean_effective_strength']}, "
+          f"cool={cool_meta['mean_effective_strength']}")
 
 
 def test_pipeline_outputs() -> None:
@@ -437,6 +513,7 @@ def main() -> int:
         test_halftone_model,
         test_tone_lut,
         test_bluenoise,
+        test_palette_grade,
         test_calibration_chart,
         test_mark_detection,
         test_recipe_serialisation,

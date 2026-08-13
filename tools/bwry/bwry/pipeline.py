@@ -2,7 +2,7 @@
 
 Stage order, and why it is this order:
 
-1. **decode / fit**            -- 400x300, EXIF-corrected, letterboxed on white.
+1. **decode / fit**            -- 400x300, EXIF-corrected, contain or cover.
 2. **sRGB -> Lab**             -- everything downstream is perceptual.
 3. **tone curve**              -- autocontrast, exposure, S-curve, shadow lift,
                                   highlight roll-off; monotone LUT so no
@@ -11,17 +11,19 @@ Stage order, and why it is this order:
                                   of sRGB's, so global contrast has to be given
                                   up; local contrast is how the image keeps its
                                   apparent detail anyway.
-5. **fit to panel L\\* range**  -- map 0..100 onto the profile's black..white.
-6. **gamut compression**       -- project into the tetrahedron the four inks can
+5. **palette grade (opt-in)**  -- image-adaptive warm translation for hues a
+                                  B/W/R/Y panel cannot faithfully reproduce.
+6. **fit to panel L\\* range**  -- map 0..100 onto the profile's black..white.
+7. **gamut compression**       -- project into the tetrahedron the four inks can
                                   actually reach. Doing this *before* dithering
                                   is what stops a saturated blue sky from
                                   dumping its unrepresentable residual into the
                                   error buffer and coming back as red confetti.
-7. **chroma gate**             -- near-neutral content is pushed fully onto the
+8. **chroma gate**             -- near-neutral content is pushed fully onto the
                                   black/white axis so it can never buy colour ink.
-8. **halftone**                -- error diffusion or ordered blue noise, with
+9. **halftone**                -- error diffusion or ordered blue noise, with
                                   edge-aware attenuation.
-9. **pack**                    -- 2bpp, 30,000 bytes, unchanged device encoding.
+10. **pack**                   -- 2bpp, 30,000 bytes, unchanged device encoding.
 """
 
 from __future__ import annotations
@@ -38,7 +40,8 @@ from . import legacy as legacy_mod
 from . import metrics as metrics_mod
 from . import pack as pack_mod
 from .dither import DitherParams, dither
-from .gamut import GamutHull, compress_into_gamut
+from .grade import adaptive_grade_amount, apply_palette_grade
+from .gamut import GamutHull, map_into_gamut
 from .palette import PaletteProfile
 from .tone import ChromaGate, ToneParams, apply_tone, fit_to_device_range
 
@@ -62,6 +65,9 @@ class Recipe:
     description: str = ""
     profile: str = "note4c-measured-v1"
     fit: str = "contain"
+    color_style: str = "natural"
+    color_style_strength: float = 0.88
+    color_style_adaptive: bool = True
 
     tone: ToneParams = field(default_factory=ToneParams)
     gate: ChromaGate = field(default_factory=ChromaGate)
@@ -70,6 +76,9 @@ class Recipe:
 
     gamut_knee: float = 0.80
     gamut_l_adapt: float = 0.35
+    gamut_intent: str = "hue-preserving"
+    gamut_vivid_strength: float = 0.80
+    gamut_vivid_hue_weight: float = 0.10
     l_headroom: float = 0.0
 
     #: Bypass everything and run the algorithm that ships today. A/B baseline.
@@ -81,9 +90,15 @@ class Recipe:
             "description": self.description,
             "profile": self.profile,
             "fit": self.fit,
+            "color_style": self.color_style,
+            "color_style_strength": self.color_style_strength,
+            "color_style_adaptive": self.color_style_adaptive,
             "legacy": self.legacy,
             "gamut_knee": self.gamut_knee,
             "gamut_l_adapt": self.gamut_l_adapt,
+            "gamut_intent": self.gamut_intent,
+            "gamut_vivid_strength": self.gamut_vivid_strength,
+            "gamut_vivid_hue_weight": self.gamut_vivid_hue_weight,
             "l_headroom": self.l_headroom,
             "tone": self.tone.to_dict(),
             "gate": self.gate.to_dict(),
@@ -98,9 +113,15 @@ class Recipe:
             description=data.get("description", ""),
             profile=data.get("profile", "note4c-measured-v1"),
             fit=data.get("fit", "contain"),
+            color_style=data.get("color_style", "natural"),
+            color_style_strength=data.get("color_style_strength", 0.88),
+            color_style_adaptive=data.get("color_style_adaptive", True),
             legacy=data.get("legacy", False),
             gamut_knee=data.get("gamut_knee", 0.80),
             gamut_l_adapt=data.get("gamut_l_adapt", 0.35),
+            gamut_intent=data.get("gamut_intent", "hue-preserving"),
+            gamut_vivid_strength=data.get("gamut_vivid_strength", 0.80),
+            gamut_vivid_hue_weight=data.get("gamut_vivid_hue_weight", 0.10),
             l_headroom=data.get("l_headroom", 0.0),
             tone=ToneParams(**data.get("tone", {})),
             gate=ChromaGate(**data.get("gate", {})),
@@ -148,7 +169,7 @@ class Result:
 def _reference_lab(source_lab: np.ndarray, profile: PaletteProfile, hull: GamutHull) -> np.ndarray:
     """Neutral yardstick: source, range-fitted and gamut-clipped, nothing else."""
     ref = fit_to_device_range(source_lab, profile.l_black, profile.l_white)
-    return compress_into_gamut(ref, hull, knee=1.0, l_adapt=0.0, iterations=12)
+    return map_into_gamut(ref, hull, intent="hue-preserving", knee=1.0, l_adapt=0.0)
 
 
 def convert(
@@ -172,9 +193,12 @@ def convert(
         rgb = pack_mod.load_and_fit(source, fit=recipe.fit)
 
     source_lab = C.srgb_to_lab(rgb / 255.0)
-    hull = GamutHull(profile)
+    mix_n = profile.yule_nielsen_n if recipe.dither.dot_gain_compensation else 1.0
+    hull = GamutHull(profile, mixing_n=mix_n)
     # The yardstick lives in the *panel's* gamut, not the recipe's model of it.
-    reference_lab = _reference_lab(source_lab, render, GamutHull(render))
+    reference_lab = _reference_lab(
+        source_lab, render, GamutHull(render, mixing_n=render.yule_nielsen_n)
+    )
 
     meta: dict = {"profile": profile.to_dict(), "recipe": recipe.to_dict()}
     if render is not profile:
@@ -193,12 +217,41 @@ def convert(
     toned, tone_meta = apply_tone(source_lab, recipe.tone)
     meta["tone"] = tone_meta
 
-    ranged = fit_to_device_range(toned, profile.l_black, profile.l_white, recipe.l_headroom)
+    grade_strength: float | np.ndarray = recipe.color_style_strength
+    grade_adaptive_meta = None
+    if recipe.color_style != "natural" and recipe.color_style_adaptive:
+        diagnostic_source = fit_to_device_range(
+            toned, profile.l_black, profile.l_white, recipe.l_headroom
+        )
+        faithful = map_into_gamut(
+            diagnostic_source, hull, intent="hue-preserving", knee=1.0, l_adapt=0.0
+        )
+        grade_strength, grade_adaptive_meta = adaptive_grade_amount(
+            diagnostic_source, faithful, max_strength=recipe.color_style_strength
+        )
+    graded, grade_meta = apply_palette_grade(
+        toned,
+        profile,
+        style=recipe.color_style,
+        strength=grade_strength,
+        adaptive_meta=grade_adaptive_meta,
+    )
+    meta["color_grade"] = grade_meta
 
-    mapped = compress_into_gamut(
-        ranged, hull, knee=recipe.gamut_knee, l_adapt=recipe.gamut_l_adapt
+    ranged = fit_to_device_range(graded, profile.l_black, profile.l_white, recipe.l_headroom)
+
+    mapped = map_into_gamut(
+        ranged,
+        hull,
+        intent=recipe.gamut_intent,
+        knee=recipe.gamut_knee,
+        l_adapt=recipe.gamut_l_adapt,
+        vivid_strength=recipe.gamut_vivid_strength,
+        vivid_hue_weight=recipe.gamut_vivid_hue_weight,
     )
     meta["gamut"] = {
+        "intent": recipe.gamut_intent,
+        "mixing_n": round(mix_n, 3),
         "in_gamut_before": round(float(np.mean(hull.contains(C.lab_to_xyz(ranged)))), 4),
         "mean_chroma_before": round(float(np.mean(C.chroma(ranged))), 2),
         "mean_chroma_after": round(float(np.mean(C.chroma(mapped))), 2),

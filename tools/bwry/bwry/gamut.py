@@ -1,13 +1,16 @@
 """Gamut mapping into the reachable colour set of a four-ink palette.
 
-Key fact this module rests on: a halftone made of four inks integrates
-**linearly in reflectance**, so the set of colours the panel can actually
-produce (once the eye averages over a small neighbourhood) is exactly the
-convex hull of the four ink colours *in XYZ* -- a tetrahedron.
+Key fact this module rests on: a halftone made of four inks is additive in its
+optical mixing domain.  For an ideal panel that is linear XYZ; for the measured
+Note4C it is the Yule-Nielsen domain fitted by the calibration chart.  In that
+domain the reachable set is exactly the convex hull of the four ink colours --
+a tetrahedron.
 
 So instead of clipping saturated sRGB and letting error diffusion smear the
-leftovers into red/yellow confetti, we first project every pixel onto that
-tetrahedron, preserving hue, and only then dither.
+leftovers into red/yellow confetti, we first map every pixel into that
+tetrahedron and only then dither.  Two intents are available: hue-preserving
+compression for fidelity, and a vivid intent which may trade hue accuracy for
+visible colourfulness on a palette with only red and yellow chromatic inks.
 """
 
 from __future__ import annotations
@@ -19,20 +22,24 @@ from .palette import PaletteProfile
 
 
 class GamutHull:
-    """Tetrahedral hull of a 4-ink palette in XYZ, with barycentric tests."""
+    """Tetrahedral 4-ink hull in an optical additive mixing domain."""
 
-    def __init__(self, profile: PaletteProfile):
+    def __init__(self, profile: PaletteProfile, mixing_n: float = 1.0):
         self.profile = profile
-        v = profile.xyz  # (4, 3)
+        self.mixing_n = float(mixing_n)
+        v = C.yule_nielsen_encode_xyz(profile.xyz, self.mixing_n)  # (4, 3), additive domain
         if v.shape[0] != 4:
             raise ValueError("GamutHull currently assumes exactly 4 inks")
+        self.vertices = v
         self.v0 = v[0]
         # Column matrix of edge vectors from v0; barycentric solve is one 3x3.
         self._m_inv = np.linalg.inv(np.stack([v[1] - v[0], v[2] - v[0], v[3] - v[0]], axis=1))
 
         # Neutral axis of the *medium*: the black<->white segment.
-        self.black_xyz = v[profile.index_of("black")]
-        self.white_xyz = v[profile.index_of("white")]
+        self.black_mix = v[profile.index_of("black")]
+        self.white_mix = v[profile.index_of("white")]
+        self.black_xyz = profile.xyz[profile.index_of("black")]
+        self.white_xyz = profile.xyz[profile.index_of("white")]
 
         # Hue / lightness of the chromatic inks, used for cusp-aware mapping.
         lab = profile.lab
@@ -40,11 +47,13 @@ class GamutHull:
         self.cusp_hue = C.hue_deg(lab[chromatic])
         self.cusp_l = lab[chromatic, 0]
         self.max_chroma = float(np.max(C.chroma(lab))) if chromatic.any() else 0.0
+        self._sample_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
 
     # ------------------------------------------------------------------
     def barycentric(self, xyz: np.ndarray) -> np.ndarray:
         """(..., 3) XYZ -> (..., 4) barycentric weights over the four inks."""
-        d = np.asarray(xyz, dtype=np.float64) - self.v0
+        mixed = C.yule_nielsen_encode_xyz(xyz, self.mixing_n)
+        d = np.asarray(mixed, dtype=np.float64) - self.v0
         w = d @ self._m_inv.T
         w0 = 1.0 - w.sum(axis=-1, keepdims=True)
         return np.concatenate([w0, w], axis=-1)
@@ -66,11 +75,40 @@ class GamutHull:
         """Point on the black<->white segment whose L* is ``l`` (clamped)."""
         lab_k = C.xyz_to_lab(self.black_xyz)
         lab_w = C.xyz_to_lab(self.white_xyz)
-        t = np.clip((l - lab_k[0]) / max(lab_w[0] - lab_k[0], 1e-9), 0.0, 1.0)[..., None]
-        # Interpolate in XYZ (physically what a black/white halftone does),
-        # then report in Lab.
-        xyz = self.black_xyz + t * (self.white_xyz - self.black_xyz)
+        if self.mixing_n == 1.0:
+            t = np.clip((l - lab_k[0]) / max(lab_w[0] - lab_k[0], 1e-9), 0.0, 1.0)[..., None]
+        else:
+            # L* is a function of Y only. Solve for the requested physical Y,
+            # encode it into the additive Yule-Nielsen domain, then interpolate
+            # between the measured black/white vertices in that domain.
+            fy = (np.asarray(l, dtype=np.float64) + 16.0) / 116.0
+            target_y = np.where(
+                fy > 6.0 / 29.0,
+                fy**3,
+                (fy - 4.0 / 29.0) * 3.0 * (6.0 / 29.0) ** 2,
+            )
+            target_mix_y = np.power(np.maximum(target_y, 0.0), 1.0 / self.mixing_n)
+            denom = max(float(self.white_mix[1] - self.black_mix[1]), 1e-9)
+            t = np.clip((target_mix_y - self.black_mix[1]) / denom, 0.0, 1.0)[..., None]
+        mixed = self.black_mix + t * (self.white_mix - self.black_mix)
+        xyz = C.yule_nielsen_decode_xyz(mixed, self.mixing_n)
         return C.xyz_to_lab(xyz)
+
+    def sample(self, steps: int = 18) -> tuple[np.ndarray, np.ndarray]:
+        """Uniform barycentric samples of the physical gamut as ``(XYZ, Lab)``."""
+        steps = max(2, int(steps))
+        if steps not in self._sample_cache:
+            weights = []
+            for a in range(steps + 1):
+                for b in range(steps + 1 - a):
+                    for c in range(steps + 1 - a - b):
+                        d = steps - a - b - c
+                        weights.append((a, b, c, d))
+            w = np.asarray(weights, dtype=np.float64) / steps
+            mixed = w @ self.vertices
+            xyz = C.yule_nielsen_decode_xyz(mixed, self.mixing_n)
+            self._sample_cache[steps] = (xyz, C.xyz_to_lab(xyz))
+        return self._sample_cache[steps]
 
     def cusp_lightness(self, hue: np.ndarray, sigma: float = 55.0) -> np.ndarray:
         """L* of the most-saturated reachable colour near ``hue`` (degrees).
@@ -161,6 +199,104 @@ def compress_into_gamut(
     # Chroma-free pixels have no direction to compress; keep them on the axis.
     achromatic = c < 1e-6
     return np.where(achromatic[..., None], anchor, out)
+
+
+def map_vivid_into_gamut(
+    lab: np.ndarray,
+    hull: GamutHull,
+    *,
+    strength: float = 0.80,
+    lightness_weight: float = 4.0,
+    hue_weight: float = 0.10,
+    chroma_weight: float = 0.65,
+    neutral_lo: float = 4.0,
+    neutral_hi: float = 22.0,
+    sample_steps: int = 18,
+    knee: float = 0.80,
+    l_adapt: float = 0.35,
+) -> np.ndarray:
+    """Saturation-style mapping for extremely narrow destination gamuts.
+
+    A hue-preserving map is the right default for faithful reproduction, but a
+    B/W/R/Y panel has no blue or green cusp at all: strict hue preservation
+    collapses most cool colours onto the neutral axis.  This intent searches
+    the *measured physical gamut* for a point with similar lightness and chroma,
+    while deliberately discounting hue error.  It then blends that point with
+    the ordinary hue-preserving result in the additive optical domain.
+
+    Neutrals never move.  ``strength`` controls the preference trade-off, while
+    ``hue_weight`` controls how readily blue/green content is represented by
+    the available red/yellow inks.  This is analogous to an ICC saturation
+    intent and is therefore an opt-in aesthetic rendering, not colorimetry.
+    """
+    source = np.asarray(lab, dtype=np.float64)
+    base = compress_into_gamut(source, hull, knee=knee, l_adapt=l_adapt)
+    if strength <= 0.0:
+        return base
+
+    source_lch = C.lab_to_lch(source)
+    source_c = source_lch[..., 1]
+    blend = np.clip((source_c - neutral_lo) / max(neutral_hi - neutral_lo, 1e-9), 0.0, 1.0)
+    blend = blend * blend * (3.0 - 2.0 * blend) * np.clip(strength, 0.0, 1.0)
+    active = blend > 1e-6
+    if not np.any(active):
+        return base
+
+    candidate_xyz, candidate_lab = hull.sample(sample_steps)
+    candidate_lch = C.lab_to_lch(candidate_lab)
+    c_l = candidate_lch[:, 0]
+    c_c = candidate_lch[:, 1]
+    c_h = candidate_lch[:, 2]
+
+    target = source_lch[active]
+    chosen = np.empty(target.shape[0], dtype=np.int32)
+    # Keep peak working memory bounded: 1024 x 1330 candidates is ~11 MB per
+    # score plane with the default sample grid.
+    for start in range(0, target.shape[0], 1024):
+        stop = min(start + 1024, target.shape[0])
+        t = target[start:stop]
+        t_l = t[:, 0, None]
+        t_c = np.minimum(t[:, 1, None], hull.max_chroma)
+        t_h = t[:, 2, None]
+
+        dl2 = (t_l - c_l[None, :]) ** 2
+        dc2 = (t_c - c_c[None, :]) ** 2
+        dh = np.radians(C.hue_distance(t_h, c_h[None, :]))
+        # Chroma-weighted angular distance is the hue component of a Lab
+        # distance. Discounting it is the deliberate saturation-intent trade.
+        dh2 = 4.0 * t_c * c_c[None, :] * np.sin(0.5 * dh) ** 2
+        score = lightness_weight * dl2 + chroma_weight * dc2 + hue_weight * dh2
+        chosen[start:stop] = np.argmin(score, axis=1)
+
+    vivid_xyz = C.lab_to_xyz(base)
+    vivid_xyz[active] = candidate_xyz[chosen]
+    base_mix = C.yule_nielsen_encode_xyz(C.lab_to_xyz(base), hull.mixing_n)
+    vivid_mix = C.yule_nielsen_encode_xyz(vivid_xyz, hull.mixing_n)
+    out_mix = base_mix + blend[..., None] * (vivid_mix - base_mix)
+    return C.xyz_to_lab(C.yule_nielsen_decode_xyz(out_mix, hull.mixing_n))
+
+
+def map_into_gamut(
+    lab: np.ndarray,
+    hull: GamutHull,
+    *,
+    intent: str = "hue-preserving",
+    knee: float = 0.80,
+    l_adapt: float = 0.35,
+    vivid_strength: float = 0.80,
+    vivid_hue_weight: float = 0.10,
+) -> np.ndarray:
+    if intent == "hue-preserving":
+        return compress_into_gamut(lab, hull, knee=knee, l_adapt=l_adapt)
+    if intent == "vivid":
+        return map_vivid_into_gamut(
+            lab, hull,
+            strength=vivid_strength,
+            hue_weight=vivid_hue_weight,
+            knee=knee,
+            l_adapt=l_adapt,
+        )
+    raise ValueError(f"unknown gamut intent {intent!r}; try 'hue-preserving' or 'vivid'")
 
 
 def gamut_report(hull: GamutHull) -> str:
