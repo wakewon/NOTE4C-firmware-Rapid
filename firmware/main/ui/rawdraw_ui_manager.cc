@@ -482,6 +482,12 @@ void RawDrawUiManager::SwitchPage(RawDrawPageId page) {
 
     // Switch current page
     current_page_ = page;
+    if (page == RawDrawPageId::Gallery) {
+        // A photo becoming visible is a new dwell interval. Without resetting
+        // here, returning to a fullscreen gallery inherits whatever fraction
+        // of the old timer happened to remain while another page was open.
+        ResetGallerySlideshowTimer();
+    }
     if (page_switch_cb_) {
         page_switch_cb_(page);
     }
@@ -833,6 +839,13 @@ bool RawDrawUiManager::HandleInput(const rawdraw::ButtonEvent& event) {
     bool handled = renderer->HandleInput(event);
 
     if (handled) {
+        if (current_page_ == RawDrawPageId::Gallery && navigation_click) {
+            // Manual UP/DN selection and BOOT fullscreen transitions start a
+            // fresh dwell interval. Clear a callback that may already have
+            // fired as well as rearming the one-shot timer; rearming alone
+            // would still allow PumpClockRefresh() to advance immediately.
+            ResetGallerySlideshowTimer();
+        }
         if (navigation_click && !queue_input_during_refresh) {
             input_refresh_locked_.store(true, std::memory_order_release);
         }
@@ -1330,6 +1343,9 @@ bool RawDrawUiManager::ShowPhotoById(const std::string& photo_id) {
     }
     photo_gallery_renderer_->EnterFullscreenMode();
     SwitchPage(RawDrawPageId::Gallery);
+    // SwitchPage is a no-op when the web request changes a photo while the
+    // gallery is already active, so reset explicitly for every /photo/show.
+    ResetGallerySlideshowTimer();
     ESP_LOGI(kTag, "Show photo fullscreen from HTTP: id=%s", photo_id.c_str());
     return true;
 }
@@ -1348,18 +1364,41 @@ void RawDrawUiManager::SetGallerySlideshowIntervalMinutes(int minutes) {
 void RawDrawUiManager::ArmGallerySlideshowTimer() {
     if (gallery_slideshow_timer_ == nullptr) return;
     esp_timer_stop(gallery_slideshow_timer_);
-    if (gallery_slideshow_interval_minutes_ <= 0) return;
+    if (gallery_slideshow_interval_minutes_ <= 0) {
+        gallery_slideshow_deadline_us_.store(0, std::memory_order_release);
+        return;
+    }
 
     const int64_t delay_us = static_cast<int64_t>(gallery_slideshow_interval_minutes_) * 60 * 1000 * 1000;
+    gallery_slideshow_deadline_us_.store(
+        esp_timer_get_time() + delay_us, std::memory_order_release);
     esp_err_t ret = esp_timer_start_once(gallery_slideshow_timer_, delay_us);
     if (ret != ESP_OK) {
+        gallery_slideshow_deadline_us_.store(0, std::memory_order_release);
         ESP_LOGW(kTag, "Failed to arm slideshow timer: %s", esp_err_to_name(ret));
     }
 }
 
+void RawDrawUiManager::ResetGallerySlideshowTimer() {
+    if (gallery_slideshow_timer_ != nullptr) {
+        // Stop first, then clear a callback that may have fired just before the
+        // manual action. ArmGallerySlideshowTimer() starts a fresh one-shot.
+        esp_timer_stop(gallery_slideshow_timer_);
+    }
+    gallery_slideshow_pending_.store(false, std::memory_order_release);
+    ArmGallerySlideshowTimer();
+}
+
 void RawDrawUiManager::OnGallerySlideshowTimer(void* arg) {
     auto* self = static_cast<RawDrawUiManager*>(arg);
-    if (self != nullptr) {
+    if (self == nullptr) return;
+    const int64_t deadline_us =
+        self->gallery_slideshow_deadline_us_.load(std::memory_order_acquire);
+    if (deadline_us > 0 && esp_timer_get_time() >= deadline_us) {
+        // If a previous callback was already dispatched while a manual action
+        // reset the one-shot, its old callback arrives before the new deadline
+        // and is ignored instead of immediately advancing the freshly selected
+        // photo.
         self->gallery_slideshow_pending_.store(true, std::memory_order_release);
     }
 }

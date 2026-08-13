@@ -468,6 +468,7 @@ private:
     std::atomic<bool> transient_refresh_pending_{false};
     std::atomic<bool> active_page_refresh_pending_{false};
     std::atomic<bool> gallery_slideshow_pending_{false};
+    std::atomic<int64_t> gallery_slideshow_deadline_us_{0};
     std::atomic<bool> input_refresh_locked_{false};
     int last_clock_minute_key_ = -1;
     int gallery_slideshow_interval_minutes_ = 0;
@@ -493,6 +494,7 @@ private:
     static void OnTransientRefreshTimer(void* arg);
     static void OnGallerySlideshowTimer(void* arg);
     void ArmGallerySlideshowTimer();
+    void ResetGallerySlideshowTimer();
     bool AdvanceGallerySlideshow();
     void DrawGlobalPageFrame(uint8_t* fb, int width, int height);
     void DrawQuickSwitchOverlay(uint8_t* fb, int width, int height);
