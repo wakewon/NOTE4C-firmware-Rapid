@@ -1,0 +1,343 @@
+name: One-shot firmware patch and build
+
+on:
+  push:
+    branches: [dev]
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-build:
+    if: ${{ !contains(github.event.head_commit.message, '[one-shot-built]') }}
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v6.0
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply low-power consistency patch
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          def replace_once(text, old, new, label):
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected exactly one match, found {count}")
+              return text.replace(old, new, 1)
+
+          app = Path("firmware/main/application.cc")
+          text = app.read_text(encoding="utf-8")
+
+          text = replace_once(
+              text,
+              'items.push_back({"定时校时",',
+              'items.push_back({"定时联网",',
+              "rename periodic network setting",
+          )
+          text = replace_once(
+              text,
+              'ESP_LOGI(kTag, "Periodic network sync set to %s",',
+              'ESP_LOGI(kTag, "Periodic network session set to %s",',
+              "rename periodic network log",
+          )
+
+          manual_item = '''        items.push_back({"省电模式", "手动进入", nullptr,
+                         rawdraw::SettingsItemType::Action, false,
+                         [this]() {
+                             ESP_LOGI(kTag, "Manual sleep requested from settings");
+                             EnterManualSleep();
+                         }});
+'''
+          text = replace_once(text, manual_item, "", "remove manual sleep settings item")
+
+          old_start = '''void Application::StartScheduledNetworkSync() {
+    if (!wifi_enabled_.load(std::memory_order_acquire)) {
+        ESP_LOGI(kTag, "Scheduled network sync suppressed because Wi-Fi switch is OFF");
+        network_sync_pending_ = false;
+        return;
+    }
+    ESP_LOGI(kTag, "Scheduled network sync: starting Wi-Fi with %lld s timeout",
+             static_cast<long long>(kNetworkSyncTimeoutUs / 1000000));
+    EnsureNetworkInitialized();
+    network_sync_deadline_us_ = esp_timer_get_time() + kNetworkSyncTimeoutUs;
+    WifiManager::GetInstance().StartStation();
+}
+'''
+          new_start = '''void Application::StartScheduledNetworkSync() {
+    if (!wifi_enabled_.load(std::memory_order_acquire)) {
+        ESP_LOGI(kTag, "Scheduled network session suppressed because Wi-Fi switch is OFF");
+        network_sync_pending_ = false;
+        scheduled_network_jobs_pending_ = 0;
+        return;
+    }
+
+    // The timer owns a short-lived online session, not SNTP itself. Today time
+    // synchronization is the only registered job; future weather/news/etc.
+    // jobs can join the same session and keep Wi-Fi alive until all are done.
+    scheduled_network_jobs_pending_ = kScheduledNetworkJobTimeSync;
+    ESP_LOGI(kTag,
+             "Scheduled network session: starting Wi-Fi with %lld s timeout jobs=0x%lx",
+             static_cast<long long>(kNetworkSyncTimeoutUs / 1000000),
+             static_cast<unsigned long>(scheduled_network_jobs_pending_));
+    EnsureNetworkInitialized();
+    network_sync_deadline_us_ = esp_timer_get_time() + kNetworkSyncTimeoutUs;
+    WifiManager::GetInstance().StartStation();
+}
+
+void Application::CompleteScheduledNetworkJob(uint32_t job) {
+    if (!network_sync_pending_) return;
+    scheduled_network_jobs_pending_ &= ~job;
+    ESP_LOGI(kTag, "Scheduled network job complete: job=0x%lx remaining=0x%lx",
+             static_cast<unsigned long>(job),
+             static_cast<unsigned long>(scheduled_network_jobs_pending_));
+    if (scheduled_network_jobs_pending_ == 0) {
+        FinishScheduledNetworkSession("all jobs complete");
+    }
+}
+
+void Application::FinishScheduledNetworkSession(const char* reason) {
+    StopSntpIfStarted();
+    if (network_initialized_) {
+        WifiManager::GetInstance().StopStation();
+    }
+    wifi_connected_.store(false, std::memory_order_release);
+    network_sync_pending_ = false;
+    scheduled_network_jobs_pending_ = 0;
+    network_sync_deadline_us_ = 0;
+    ESP_LOGI(kTag, "Scheduled network session finished: %s; Wi-Fi stopped",
+             reason ? reason : "unspecified");
+}
+'''
+          text = replace_once(text, old_start, new_start, "generalize scheduled network session")
+
+          old_sntp = '''    if (scheduler_timer_wake_) {
+        StopSntpIfStarted();
+        if (network_initialized_) {
+            WifiManager::GetInstance().StopStation();
+        }
+        wifi_connected_.store(false, std::memory_order_release);
+        network_sync_pending_ = false;
+        ESP_LOGI(kTag, "Scheduled network sync complete; Wi-Fi stopped");
+    } else {
+'''
+          new_sntp = '''    if (scheduler_timer_wake_ && network_sync_pending_) {
+        CompleteScheduledNetworkJob(kScheduledNetworkJobTimeSync);
+    } else {
+'''
+          text = replace_once(text, old_sntp, new_sntp, "decouple SNTP completion from network session")
+
+          old_timeout = '''        if (scheduler_timer_wake_ && network_sync_pending_ &&
+            network_sync_deadline_us_ > 0 && now_us >= network_sync_deadline_us_) {
+            ESP_LOGW(kTag, "Scheduled network sync timed out; Wi-Fi stopped until next interval");
+            if (network_initialized_) {
+                WifiManager::GetInstance().StopStation();
+            }
+            wifi_connected_.store(false, std::memory_order_release);
+            network_sync_pending_ = false;
+        }
+'''
+          new_timeout = '''        if (scheduler_timer_wake_ && network_sync_pending_ &&
+            network_sync_deadline_us_ > 0 && now_us >= network_sync_deadline_us_) {
+            ESP_LOGW(kTag, "Scheduled network session timed out; stopping until next interval");
+            FinishScheduledNetworkSession("timeout");
+        }
+'''
+          text = replace_once(text, old_timeout, new_timeout, "route scheduled session timeout")
+
+          text = replace_once(
+              text,
+              '''    network_sync_pending_ = false;
+    network_sync_deadline_us_ = 0;
+    wifi_connect_deadline_us_ = 0;
+''',
+              '''    network_sync_pending_ = false;
+    scheduled_network_jobs_pending_ = 0;
+    network_sync_deadline_us_ = 0;
+    wifi_connect_deadline_us_ = 0;
+''',
+              "clear scheduled jobs during sleep preparation",
+          )
+
+          old_frame = '''    ui::PersistentFramePreparation frame;
+    if (rawdraw_ui_manager_) {
+        frame = rawdraw_ui_manager_->PreparePersistentFrame();
+    }
+'''
+          new_frame = '''    auto* sleep_lcd = static_cast<CustomLcdDisplay*>(Board::GetInstance().GetDisplay());
+    const bool full_color_recovery_needed =
+        sleep_lcd != nullptr && sleep_lcd->NeedsFullColorRecovery();
+
+    ui::PersistentFramePreparation frame;
+    if (rawdraw_ui_manager_) {
+        frame = rawdraw_ui_manager_->PreparePersistentFrame();
+    }
+'''
+          text = replace_once(text, old_frame, new_frame, "query pre-sleep full-color recovery debt")
+
+          old_decision = '''    if (frame.refresh_requested) {
+        ESP_LOGI(kTag,
+                 "[FULL_COLOR] pre-sleep refresh requested; waiting for EPD idle");
+        sleep_phase_ = SleepPhase::WaitingForDisplay;
+    } else {
+        ESP_LOGI(kTag, "Pre-sleep full-color refresh skipped: no visible pixel change");
+        sleep_phase_ = SleepPhase::ReadyToCommit;
+    }
+'''
+          new_decision = '''    if (frame.refresh_requested) {
+        ESP_LOGI(kTag,
+                 "[FULL_COLOR] pre-sleep content refresh requested; waiting for EPD idle");
+        sleep_phase_ = SleepPhase::WaitingForDisplay;
+    } else if (full_color_recovery_needed && sleep_lcd != nullptr) {
+        // Pixel semantics may already match while the physical panel is still
+        // showing a FAST_BW interaction waveform. Deep sleep has no later idle
+        // recovery opportunity, so settle that quality debt immediately.
+        ESP_LOGI(kTag,
+                 "[FULL_COLOR] pre-sleep FAST_BW recovery debt detected; forcing final waveform");
+        sleep_lcd->RequestUrgentFullRefresh();
+        sleep_phase_ = SleepPhase::WaitingForDisplay;
+    } else {
+        ESP_LOGI(kTag,
+                 "Pre-sleep full-color refresh skipped: pixels unchanged and panel already stable");
+        sleep_phase_ = SleepPhase::ReadyToCommit;
+    }
+'''
+          text = replace_once(text, old_decision, new_decision, "enforce final full-color invariant")
+
+          app.write_text(text, encoding="utf-8")
+
+          hdr = Path("firmware/main/application.h")
+          text = hdr.read_text(encoding="utf-8")
+          text = replace_once(text, '#include <atomic>\n', '#include <atomic>\n#include <cstdint>\n', "include cstdint")
+          text = replace_once(
+              text,
+              '''    bool network_sync_pending_ = false;
+    std::atomic<bool> manual_sleep_requested_{false};
+''',
+              '''    // Session-level flag keeps the existing retained/NVS naming stable;
+    // individual online jobs are tracked independently so SNTP does not own
+    // the lifetime of future periodic network work.
+    bool network_sync_pending_ = false;
+    uint32_t scheduled_network_jobs_pending_ = 0;
+    static constexpr uint32_t kScheduledNetworkJobTimeSync = 1u << 0;
+    std::atomic<bool> manual_sleep_requested_{false};
+''',
+              "add scheduled network job state",
+          )
+          text = replace_once(
+              text,
+              '''    void StartScheduledNetworkSync();
+    void EnterLowPowerSleep(const char* reason);
+''',
+              '''    void StartScheduledNetworkSync();
+    void CompleteScheduledNetworkJob(uint32_t job);
+    void FinishScheduledNetworkSession(const char* reason);
+    void EnterLowPowerSleep(const char* reason);
+''',
+              "declare scheduled network session helpers",
+          )
+          hdr.write_text(text, encoding="utf-8")
+
+          lcd_h = Path("firmware/main/boards/zectrix-s3-epaper-4.2/custom_lcd_display.h")
+          text = lcd_h.read_text(encoding="utf-8")
+          text = replace_once(
+              text,
+              '''    // Refresh state for sleep gating
+    bool IsRefreshPending();
+    bool FramebufferDiffersFromLastRefresh();
+''',
+              '''    // Refresh state for sleep gating
+    bool IsRefreshPending();
+    // True after a physical FAST_BW waveform until a complete full-color
+    // waveform has finished. Sleep preflight uses this to bypass the normal
+    // 10/30 s recovery delay and leave a stable persistent E-ink frame.
+    bool NeedsFullColorRecovery();
+    bool FramebufferDiffersFromLastRefresh();
+''',
+              "declare full-color recovery query",
+          )
+          lcd_h.write_text(text, encoding="utf-8")
+
+          lcd_cc = Path("firmware/main/boards/zectrix-s3-epaper-4.2/custom_lcd_display.cc")
+          text = lcd_cc.read_text(encoding="utf-8")
+          marker = '''bool CustomLcdDisplay::FramebufferDiffersFromLastRefresh() {
+'''
+          method = '''bool CustomLcdDisplay::NeedsFullColorRecovery() {
+    if (dirty_mutex) {
+        xSemaphoreTake(dirty_mutex, portMAX_DELAY);
+    }
+    const bool needed = IsFourColorPanel() && fast_bw_since_full_;
+    if (dirty_mutex) {
+        xSemaphoreGive(dirty_mutex);
+    }
+    return needed;
+}
+
+'''
+          text = replace_once(text, marker, method + marker, "implement full-color recovery query")
+          lcd_cc.write_text(text, encoding="utf-8")
+
+          # Guard the intended policy at patch time too.
+          patched = app.read_text(encoding="utf-8")
+          assert 'items.push_back({"定时校时",' not in patched
+          assert 'items.push_back({"省电模式"' not in patched
+          assert 'items.push_back({"定时联网",' in patched
+          assert 'NeedsFullColorRecovery()' in patched
+          assert 'CompleteScheduledNetworkJob(kScheduledNetworkJobTimeSync)' in patched
+          PY
+
+      - name: Review patch
+        shell: bash
+        run: |
+          git diff --check
+          git diff --stat
+          git diff -- firmware/main/application.cc firmware/main/application.h \
+            firmware/main/boards/zectrix-s3-epaper-4.2/custom_lcd_display.h \
+            firmware/main/boards/zectrix-s3-epaper-4.2/custom_lcd_display.cc
+
+      - name: Commit source patch
+        shell: bash
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add firmware/main/application.cc firmware/main/application.h \
+            firmware/main/boards/zectrix-s3-epaper-4.2/custom_lcd_display.h \
+            firmware/main/boards/zectrix-s3-epaper-4.2/custom_lcd_display.cc
+          git commit -m "fix(power): finalize sleep display and network sessions [one-shot-built]"
+          git push origin HEAD:dev
+
+      - name: Build release firmware
+        shell: bash
+        working-directory: firmware
+        run: |
+          bash ./build.sh --rebuild
+
+      - name: Stage firmware artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p firmware-artifacts
+          test -s firmware/build/merged-binary.bin
+          test -s firmware/build/xiaozhi.bin
+          cp firmware/build/merged-binary.bin firmware-artifacts/NOTE4C-full.bin
+          cp firmware/build/xiaozhi.bin firmware-artifacts/NOTE4C-app.bin
+          latest_zip="$(ls -1t firmware/releases/v*_zectrix-s3-epaper-4.2.zip | head -n 1)"
+          cp "$latest_zip" firmware-artifacts/
+          sha256sum firmware-artifacts/* > firmware-artifacts/SHA256SUMS.txt
+          ls -lh firmware-artifacts
+          cat firmware-artifacts/SHA256SUMS.txt
+
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: NOTE4C-dev-firmware
+          path: firmware-artifacts/
+          if-no-files-found: error
+          retention-days: 7
