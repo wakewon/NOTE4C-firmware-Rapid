@@ -74,6 +74,14 @@ int CurrentLocalMinuteKey() {
            tm_buf.tm_hour * 60 + tm_buf.tm_min;
 }
 
+int CurrentLocalDateKey() {
+    time_t now = time(nullptr);
+    struct tm tm_buf = {};
+    localtime_r(&now, &tm_buf);
+    return (tm_buf.tm_year + 1900) * 10000 +
+           (tm_buf.tm_mon + 1) * 100 + tm_buf.tm_mday;
+}
+
 int64_t MsUntilNextMinuteBoundary() {
     time_t now = time(nullptr);
     struct tm tm_buf;
@@ -432,6 +440,7 @@ void RawDrawUiManager::Init(CustomLcdDisplay* lcd, RefreshCallback refresh_cb,
         if (defer_initial_refresh) {
             ESP_LOGI(kTag, "Boot baseline rendered but physical refresh deferred");
         } else {
+            RecordCurrentFrameAsDisplayed();
             ESP_LOGI(kTag, "[FULL_COLOR] request source=boot_baseline");
             lcd_->RequestUrgentFullRefresh();
         }
@@ -569,19 +578,213 @@ rawdraw::PageRenderer* RawDrawUiManager::GetActiveRenderer() const {
     return GetRendererForPage(current_page_);
 }
 
-bool RawDrawUiManager::IsDisplayRefreshPending() const {
-    return lcd_ != nullptr && const_cast<CustomLcdDisplay*>(lcd_)->IsRefreshPending();
+bool RawDrawUiManager::HasGlobalChrome() const {
+    const bool gallery_fullscreen =
+        current_page_ == RawDrawPageId::Gallery &&
+        photo_gallery_renderer_ && photo_gallery_renderer_->IsFullscreenMode();
+    const bool ebook_portrait_reader =
+        current_page_ == RawDrawPageId::Ebook &&
+        ebook_renderer_ && ebook_renderer_->IsPortraitReader();
+    return !gallery_fullscreen && !ebook_portrait_reader;
 }
 
-void RawDrawUiManager::RefreshActivePage(RefreshIntent intent) {
+PersistentDisplayContract RawDrawUiManager::GetCurrentPersistentDisplayContract() const {
+    PersistentDisplayContract contract;
+    if (HasGlobalChrome()) {
+        contract.visible_dependencies =
+            rawdraw::PersistentDisplayDependency::Wifi |
+            rawdraw::PersistentDisplayDependency::Server |
+            rawdraw::PersistentDisplayDependency::Battery |
+            rawdraw::PersistentDisplayDependency::Time;
+        std::lock_guard<std::mutex> lock(ui_state_mutex_);
+        if (status_bar_data_.date_format != "hidden") {
+            contract.visible_dependencies |= rawdraw::PersistentDependencyMask(
+                rawdraw::PersistentDisplayDependency::Date);
+        }
+    }
+    if (auto* renderer = GetActiveRenderer()) {
+        contract.visible_dependencies |= renderer->GetPersistentDisplayDependencies();
+    }
+
+    const bool gallery_restorable =
+        current_page_ == RawDrawPageId::Gallery && photo_gallery_renderer_ &&
+        !photo_gallery_renderer_->IsDeleteDialogOpen() && !quick_switch_open_ &&
+        !rawdraw::VoiceWakeupIsVisible(&voice_wakeup_state_);
+    if (gallery_restorable) {
+        contract.restorable = true;
+        contract.restore_kind = PersistentRestoreKind::Gallery;
+        contract.wake_dependencies = contract.visible_dependencies &
+            (rawdraw::PersistentDependencyMask(
+                 rawdraw::PersistentDisplayDependency::Date) |
+             rawdraw::PersistentDependencyMask(
+                 rawdraw::PersistentDisplayDependency::PageDate));
+    }
+    return contract;
+}
+
+PersistentDisplaySnapshot RawDrawUiManager::CapturePersistentSnapshot() const {
+    PersistentDisplaySnapshot snapshot;
+    snapshot.date_key = CurrentLocalDateKey();
+    snapshot.minute_key = CurrentLocalMinuteKey();
+    std::lock_guard<std::mutex> lock(ui_state_mutex_);
+    snapshot.battery_level = status_bar_data_.battery_level;
+    snapshot.wifi_connected = status_bar_data_.wifi_connected;
+    snapshot.server_connected = status_bar_data_.server_connected;
+    snapshot.battery_charging = status_bar_data_.battery_charging;
+    return snapshot;
+}
+
+void RawDrawUiManager::RecordCurrentFrameAsDisplayed() {
+    displayed_metadata_.contract = GetCurrentPersistentDisplayContract();
+    displayed_metadata_.snapshot = CapturePersistentSnapshot();
+    current_state_matches_display_ = true;
+}
+
+PersistentDisplayMetadata RawDrawUiManager::GetDisplayedPersistentMetadata() const {
+    return displayed_metadata_;
+}
+
+rawdraw::PersistentDisplayDependencies
+RawDrawUiManager::GetVisiblePersistentChanges() const {
+    return GetPersistentChanges() &
+           displayed_metadata_.contract.visible_dependencies;
+}
+
+void RawDrawUiManager::AdoptRetainedPersistentMetadata(
+    const PersistentDisplayMetadata& metadata) {
+    displayed_metadata_ = metadata;
+    current_state_matches_display_ = false;
+}
+
+rawdraw::PersistentDisplayDependencies RawDrawUiManager::GetPersistentChanges() const {
+    const PersistentDisplaySnapshot current = CapturePersistentSnapshot();
+    const auto& displayed = displayed_metadata_.snapshot;
+    rawdraw::PersistentDisplayDependencies changed = 0;
+    if (current.wifi_connected != displayed.wifi_connected) {
+        changed |= rawdraw::PersistentDependencyMask(
+            rawdraw::PersistentDisplayDependency::Wifi);
+    }
+    if (current.server_connected != displayed.server_connected) {
+        changed |= rawdraw::PersistentDependencyMask(
+            rawdraw::PersistentDisplayDependency::Server);
+    }
+    if (current.battery_level != displayed.battery_level ||
+        current.battery_charging != displayed.battery_charging) {
+        changed |= rawdraw::PersistentDependencyMask(
+            rawdraw::PersistentDisplayDependency::Battery);
+    }
+    if (current.date_key != displayed.date_key) {
+        changed |= rawdraw::PersistentDependencyMask(
+            rawdraw::PersistentDisplayDependency::Date);
+        changed |= rawdraw::PersistentDependencyMask(
+            rawdraw::PersistentDisplayDependency::PageDate);
+    }
+    // HH:MM is opportunistic: it is redrawn with another legitimate change,
+    // but it never initiates a panel update or timer wake by itself.
+    return changed;
+}
+
+const char* RawDrawUiManager::DescribePersistentDependencies(
+    rawdraw::PersistentDisplayDependencies dependencies,
+    char* buffer, size_t buffer_size) {
+    if (!buffer || buffer_size == 0) return "";
+    buffer[0] = '\0';
+    struct Entry {
+        rawdraw::PersistentDisplayDependency dependency;
+        const char* name;
+    };
+    static constexpr Entry kEntries[] = {
+        {rawdraw::PersistentDisplayDependency::Wifi, "wifi"},
+        {rawdraw::PersistentDisplayDependency::Server, "server"},
+        {rawdraw::PersistentDisplayDependency::Battery, "battery"},
+        {rawdraw::PersistentDisplayDependency::Date, "date"},
+        {rawdraw::PersistentDisplayDependency::Time, "time"},
+        {rawdraw::PersistentDisplayDependency::PageDate, "page_date"},
+    };
+    size_t used = 0;
+    for (const auto& entry : kEntries) {
+        if ((dependencies & rawdraw::PersistentDependencyMask(entry.dependency)) == 0) {
+            continue;
+        }
+        const int written = snprintf(buffer + used, buffer_size - used, "%s%s",
+                                     used == 0 ? "" : "|", entry.name);
+        if (written < 0 || static_cast<size_t>(written) >= buffer_size - used) {
+            buffer[buffer_size - 1] = '\0';
+            return buffer;
+        }
+        used += static_cast<size_t>(written);
+    }
+    if (used == 0) snprintf(buffer, buffer_size, "none");
+    return buffer;
+}
+
+void RawDrawUiManager::RenderActivePageToFramebuffer() {
     auto* fb = lcd_ ? lcd_->GetFramebuffer() : nullptr;
     if (!fb) return;
-
     auto* mutex = lcd_->GetMutex();
     if (mutex) xSemaphoreTake(mutex, portMAX_DELAY);
     rawdraw::Clear(fb, width_, height_);
     RenderAll(fb, width_, height_);
     if (mutex) xSemaphoreGive(mutex);
+}
+
+PersistentFramePreparation RawDrawUiManager::PreparePersistentFrame() {
+    PersistentFramePreparation result;
+    result.changed_dependencies = GetPersistentChanges();
+    result.visible_changes = result.changed_dependencies &
+                             displayed_metadata_.contract.visible_dependencies;
+    if (result.visible_changes == 0) return result;
+    if (!current_state_matches_display_) {
+        ESP_LOGW(kTag,
+                 "Persistent frame is not reconstructible in this wake; glass left untouched");
+        return result;
+    }
+
+    if (auto* renderer = GetActiveRenderer()) {
+        renderer->RefreshPersistentDisplayData(result.visible_changes);
+    }
+    RenderActivePageToFramebuffer();
+    result.framebuffer_changed = lcd_ && lcd_->FramebufferDiffersFromLastRefresh();
+    if (result.framebuffer_changed) {
+        TriggerRefresh(RefreshIntent::FullColor);
+        result.refresh_requested = true;
+    } else {
+        RecordCurrentFrameAsDisplayed();
+    }
+    return result;
+}
+
+bool RawDrawUiManager::PrepareRetainedDisplayInvalidation(
+    int retained_index, bool retained_fullscreen) {
+    if (!displayed_metadata_.contract.restorable ||
+        displayed_metadata_.contract.restore_kind != PersistentRestoreKind::Gallery ||
+        !photo_gallery_renderer_) {
+        ESP_LOGW(kTag, "Retained display cannot be reconstructed for invalidation");
+        displayed_metadata_.contract.restorable = false;
+        displayed_metadata_.contract.wake_dependencies = 0;
+        return false;
+    }
+    current_page_ = RawDrawPageId::Gallery;
+    photo_gallery_renderer_->SetSelectedIndex(retained_index);
+    if (retained_fullscreen && !photo_gallery_renderer_->EnterFullscreenMode()) {
+        ESP_LOGW(kTag, "Could not restore retained fullscreen photo for invalidation");
+        displayed_metadata_.contract.restorable = false;
+        displayed_metadata_.contract.wake_dependencies = 0;
+        return false;
+    }
+    current_state_matches_display_ = true;
+    status_bar_data_.page_title = GetPageTitle(current_page_);
+    RefreshActivePage(RefreshIntent::FullColor);
+    ESP_LOGI(kTag, "Retained persistent frame rebuilt for scheduled invalidation");
+    return true;
+}
+
+bool RawDrawUiManager::IsDisplayRefreshPending() const {
+    return lcd_ != nullptr && const_cast<CustomLcdDisplay*>(lcd_)->IsRefreshPending();
+}
+
+void RawDrawUiManager::RefreshActivePage(RefreshIntent intent) {
+    RenderActivePageToFramebuffer();
 
     if (!TryDisplayCurrentPhotoRaw4Color()) {
         TriggerRefresh(intent);
@@ -707,6 +910,22 @@ bool RawDrawUiManager::StartLanHttpServer(const std::string& ip_address) {
 
 void RawDrawUiManager::StopLanHttpServer() {
     if (ap_transfer_server_ && ap_transfer_server_->IsLanMode()) {
+        ap_transfer_server_->Stop();
+    }
+}
+
+void RawDrawUiManager::BeginPersistentSleepPreparation() {
+    persistent_sleep_preparing_ = true;
+    active_page_refresh_pending_.store(false, std::memory_order_release);
+    active_page_full_refresh_pending_.store(false, std::memory_order_release);
+    transient_refresh_pending_.store(false, std::memory_order_release);
+    gallery_slideshow_pending_.store(false, std::memory_order_release);
+}
+
+void RawDrawUiManager::StopHttpServicesForSleep() {
+    if (ap_transfer_server_ && ap_transfer_server_->IsRunning()) {
+        // Do not use StopApTransferMode(): its interactive behavior switches
+        // to Gallery and would replace the intentionally persistent page.
         ap_transfer_server_->Stop();
     }
 }
@@ -899,15 +1118,10 @@ void RawDrawUiManager::RenderAll(uint8_t* fb, int width, int height) {
         return;
     }
     std::lock_guard<std::mutex> lock(ui_state_mutex_);
-    const bool gallery_fullscreen =
-        current_page_ == RawDrawPageId::Gallery &&
-        photo_gallery_renderer_ &&
-        photo_gallery_renderer_->IsFullscreenMode();
     const bool ebook_portrait_reader =
         current_page_ == RawDrawPageId::Ebook &&
         ebook_renderer_ &&
         ebook_renderer_->IsPortraitReader();
-    const bool chrome_free_page = false;
 
     // Update central_text based on current page state
     status_bar_data_.central_text.clear();
@@ -934,7 +1148,7 @@ void RawDrawUiManager::RenderAll(uint8_t* fb, int width, int height) {
     // Match the original firmware: fullscreen gallery is completely
     // chrome-free, including no battery overlay. Battery remains available on
     // every page which has the normal status bar.
-    if (!gallery_fullscreen && !ebook_portrait_reader && !chrome_free_page) {
+    if (HasGlobalChrome()) {
         // Status bar is drawn after page content so page renderers cannot
         // accidentally paint into the top menu area.
         DrawStatusBar(fb, width, height);
@@ -1306,6 +1520,8 @@ void RawDrawUiManager::RefreshRect(const rawdraw::Rect& rect, RefreshIntent inte
         xSemaphoreGive(mutex);
         mutex = nullptr;
     }
+    displayed_metadata_.contract = GetCurrentPersistentDisplayContract();
+    current_state_matches_display_ = true;
     refresh_cb_(refresh_rect, intent);
 }
 
@@ -1327,6 +1543,7 @@ void RawDrawUiManager::TriggerRefresh(RefreshIntent intent) {
     full_rect = rawdraw::align_x8(full_rect);
 
     if (refresh_cb_) {
+        RecordCurrentFrameAsDisplayed();
         // Release mutex before calling callback (callback may re-acquire)
         if (mutex) xSemaphoreGive(mutex);
         mutex = nullptr;
@@ -1348,6 +1565,11 @@ void RawDrawUiManager::RequestFullRefresh() {
 }
 
 void RawDrawUiManager::RequestActivePageRefresh(RefreshIntent intent) {
+    if (persistent_sleep_preparing_) {
+        ESP_LOGI(kTag,
+                 "Persistent sleep preparation: logical update retained, async refresh suppressed");
+        return;
+    }
     if (intent == RefreshIntent::FullColor) {
         active_page_full_refresh_pending_.store(true, std::memory_order_release);
     } else {
@@ -1403,6 +1625,7 @@ bool RawDrawUiManager::PrepareGallerySlideshowFrame(int retained_index, bool adv
         return false;
     }
     current_page_ = RawDrawPageId::Gallery;
+    current_state_matches_display_ = true;
     photo_gallery_renderer_->SetSelectedIndex(retained_index);
     if (!photo_gallery_renderer_->EnterFullscreenMode()) {
         return false;
@@ -1422,6 +1645,7 @@ bool RawDrawUiManager::PrepareGalleryInteractiveWakeFrame(
         return false;
     }
     current_page_ = RawDrawPageId::Gallery;
+    current_state_matches_display_ = true;
     photo_gallery_renderer_->SetSelectedIndex(retained_index);
     if (retained_fullscreen &&
         !photo_gallery_renderer_->EnterFullscreenMode()) {
@@ -1537,9 +1761,13 @@ bool RawDrawUiManager::UpdateStatusBar(const RawDrawStatusBarData& data) {
                          status_bar_data_.server_connected != data.server_connected ||
                          status_bar_data_.bluetooth_enabled != data.bluetooth_enabled ||
                          status_bar_data_.battery_level != data.battery_level ||
+                         status_bar_data_.battery_charging != data.battery_charging ||
                          status_bar_data_.battery_vertical != data.battery_vertical ||
                          status_bar_data_.page_title != data.page_title ||
-                         status_bar_data_.central_text != data.central_text;
+                         status_bar_data_.central_text != data.central_text ||
+                         status_bar_data_.date_format != data.date_format ||
+                         status_bar_data_.server_date != data.server_date ||
+                         status_bar_data_.server_weekday != data.server_weekday;
     if (!data.page_title.empty()) {
         status_bar_data_.page_title = data.page_title;
     }

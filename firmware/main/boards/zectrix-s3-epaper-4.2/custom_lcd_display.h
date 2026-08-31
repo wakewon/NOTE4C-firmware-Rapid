@@ -85,6 +85,7 @@ public:
 
     // Refresh state for sleep gating
     bool IsRefreshPending();
+    bool FramebufferDiffersFromLastRefresh();
 
     // Notify when refresh transitions from busy to idle.
     void SetOnRefreshIdle(std::function<void()> cb);

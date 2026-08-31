@@ -25,6 +25,9 @@ public:
     void Init(int width, int height) override;
     void Render(uint8_t* fb, int width, int height) override;
     bool HandleInput(const ButtonEvent& event) override;
+    PersistentDisplayDependencies GetPersistentDisplayDependencies() const override;
+    void RefreshPersistentDisplayData(
+        PersistentDisplayDependencies dependencies) override;
 
 private:
     void DrawTitleBar(uint8_t* fb, int width);
@@ -46,6 +49,7 @@ private:
     const char* solar_term_ = nullptr;
     const char** yi_ = nullptr;
     const char** ji_ = nullptr;
+    bool showing_today_ = true;
 };
 
 }  // namespace rawdraw

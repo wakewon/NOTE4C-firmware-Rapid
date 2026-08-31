@@ -68,21 +68,32 @@ private:
     bool scheduler_timer_wake_ = false;
     bool slideshow_due_ = false;
     bool slideshow_refresh_requested_ = false;
+    bool display_invalidation_due_ = false;
+    bool display_invalidation_refresh_requested_ = false;
     bool network_sync_pending_ = false;
     std::atomic<bool> manual_sleep_requested_{false};
-    bool refresh_seen_busy_ = false;
     int slideshow_interval_minutes_ = 0;
     int network_sync_interval_minutes_ = 0;
     int64_t network_sync_deadline_us_ = 0;
     int64_t wifi_connect_deadline_us_ = 0;
     int64_t interactive_sleep_deadline_us_ = 0;
     int64_t external_power_probe_deadline_us_ = 0;
+    int64_t display_freshness_probe_deadline_us_ = 0;
     bool external_power_present_ = false;
+
+    enum class SleepPhase {
+        Awake,
+        WaitingForDisplay,
+        ReadyToCommit,
+    };
+    SleepPhase sleep_phase_ = SleepPhase::Awake;
+    const char* pending_sleep_reason_ = nullptr;
 
     void EnsureNetworkInitialized();
     void StartInteractiveWifiAttempt();
     void StartScheduledNetworkSync();
     void EnterLowPowerSleep(const char* reason);
+    void CommitLowPowerSleep();
     void EnterScheduledSleep();
     void EnterManualSleep();
     void NoteButtonActivity();

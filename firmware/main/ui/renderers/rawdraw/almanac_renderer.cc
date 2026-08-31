@@ -135,6 +135,22 @@ void AlmanacRenderer::RefreshData() {
     int ji_idx = (lunar_.lunar_day) % 10;
     yi_ = kYiTable[yi_idx];
     ji_ = kJiTable[ji_idx];
+    showing_today_ = true;
+}
+
+PersistentDisplayDependencies
+AlmanacRenderer::GetPersistentDisplayDependencies() const {
+    return showing_today_
+        ? PersistentDependencyMask(PersistentDisplayDependency::PageDate)
+        : PersistentDependencyMask(PersistentDisplayDependency::None);
+}
+
+void AlmanacRenderer::RefreshPersistentDisplayData(
+    PersistentDisplayDependencies dependencies) {
+    if ((dependencies & PersistentDependencyMask(
+             PersistentDisplayDependency::PageDate)) != 0) {
+        RefreshData();
+    }
 }
 
 void AlmanacRenderer::Render(uint8_t* fb, int width, int height) {
@@ -268,6 +284,7 @@ bool AlmanacRenderer::HandleInput(const ButtonEvent& event) {
             }
             lunar_ = Calendar::ToLunarDate(year_, month_, day_);
             solar_term_ = GetSolarTerm(month_, day_);
+            showing_today_ = false;
             needs_full_refresh_ = true;
             return true;
 

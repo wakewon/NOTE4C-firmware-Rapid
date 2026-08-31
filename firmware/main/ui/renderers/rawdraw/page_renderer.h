@@ -8,10 +8,38 @@
 
 #include "rawdraw/framebuffer.h"
 #include "rawdraw/font_engine.h"
+#include <cstdint>
 #include <functional>
 #include <string>
 
 namespace rawdraw {
+
+enum class PersistentDisplayDependency : uint32_t {
+    None = 0,
+    Wifi = 1U << 0,
+    Server = 1U << 1,
+    Battery = 1U << 2,
+    Date = 1U << 3,
+    Time = 1U << 4,
+    PageDate = 1U << 5,
+};
+
+using PersistentDisplayDependencies = uint32_t;
+
+constexpr PersistentDisplayDependencies PersistentDependencyMask(
+    PersistentDisplayDependency dependency) {
+    return static_cast<PersistentDisplayDependencies>(dependency);
+}
+
+constexpr PersistentDisplayDependencies operator|(
+    PersistentDisplayDependency lhs, PersistentDisplayDependency rhs) {
+    return PersistentDependencyMask(lhs) | PersistentDependencyMask(rhs);
+}
+
+constexpr PersistentDisplayDependencies operator|(
+    PersistentDisplayDependencies lhs, PersistentDisplayDependency rhs) {
+    return lhs | PersistentDependencyMask(rhs);
+}
 
 /**
  * @brief Button event types
@@ -73,6 +101,21 @@ public:
      * @return Rect that needs refresh, or {0,0,0,0} for full refresh
      */
     virtual Rect GetDirtyRect() const { return {0, 0, 0, 0}; }
+
+    /**
+     * Dynamic inputs used by this page's content (excluding the global shell).
+     * Power management consumes the aggregate contract from RawDrawUiManager;
+     * it never needs to know individual page IDs.
+     */
+    virtual PersistentDisplayDependencies GetPersistentDisplayDependencies() const {
+        return PersistentDependencyMask(PersistentDisplayDependency::None);
+    }
+
+    /** Refresh cached data before rendering after a relevant dependency changed. */
+    virtual void RefreshPersistentDisplayData(
+        PersistentDisplayDependencies dependencies) {
+        (void)dependencies;
+    }
 
     /**
      * @brief Check if page needs full refresh

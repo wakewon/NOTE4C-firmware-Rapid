@@ -111,6 +111,39 @@ enum class RefreshIntent {
     FastBwDeferredInteraction,
 };
 
+enum class PersistentRestoreKind : uint8_t {
+    None = 0,
+    Gallery = 1,
+};
+
+struct PersistentDisplayContract {
+    rawdraw::PersistentDisplayDependencies visible_dependencies = 0;
+    rawdraw::PersistentDisplayDependencies wake_dependencies = 0;
+    PersistentRestoreKind restore_kind = PersistentRestoreKind::None;
+    bool restorable = false;
+};
+
+struct PersistentDisplaySnapshot {
+    int date_key = -1;
+    int minute_key = -1;
+    int battery_level = -1;
+    bool wifi_connected = false;
+    bool server_connected = false;
+    bool battery_charging = false;
+};
+
+struct PersistentDisplayMetadata {
+    PersistentDisplayContract contract;
+    PersistentDisplaySnapshot snapshot;
+};
+
+struct PersistentFramePreparation {
+    rawdraw::PersistentDisplayDependencies changed_dependencies = 0;
+    rawdraw::PersistentDisplayDependencies visible_changes = 0;
+    bool framebuffer_changed = false;
+    bool refresh_requested = false;
+};
+
 using RefreshCallback =
     std::function<void(const rawdraw::Rect& dirty_rect, RefreshIntent intent)>;
 using PageSwitchCallback = std::function<void(RawDrawPageId page)>;
@@ -235,6 +268,19 @@ public:
     // push state (network events, periodic polls) use this to avoid ordering a
     // refresh for a frame that would come out pixel-identical.
     bool UpdateStatusBar(const RawDrawStatusBarData& data);
+
+    PersistentDisplayContract GetCurrentPersistentDisplayContract() const;
+    PersistentDisplayMetadata GetDisplayedPersistentMetadata() const;
+    rawdraw::PersistentDisplayDependencies GetVisiblePersistentChanges() const;
+    void AdoptRetainedPersistentMetadata(const PersistentDisplayMetadata& metadata);
+    bool PrepareRetainedDisplayInvalidation(int retained_index,
+                                            bool retained_fullscreen);
+    PersistentFramePreparation PreparePersistentFrame();
+    void BeginPersistentSleepPreparation();
+    void StopHttpServicesForSleep();
+    static const char* DescribePersistentDependencies(
+        rawdraw::PersistentDisplayDependencies dependencies,
+        char* buffer, size_t buffer_size);
 
     /**
      * @brief Get current status bar data (non-const copy)
@@ -500,6 +546,9 @@ private:
     int last_clock_minute_key_ = -1;
     int gallery_slideshow_interval_minutes_ = 0;
     bool low_power_slideshow_mode_ = false;
+    bool persistent_sleep_preparing_ = false;
+    bool current_state_matches_display_ = true;
+    PersistentDisplayMetadata displayed_metadata_{};
     std::mutex gallery_storage_sync_mutex_;
     std::string gallery_preferred_photo_id_;
     std::string gallery_show_photo_id_;
@@ -541,6 +590,11 @@ private:
                      RefreshIntent intent = RefreshIntent::FullColor);
     static const std::array<QuickSwitchItem, 2>& GetQuickSwitchItems();
     void MarkAllRenderersFullRefresh();
+    PersistentDisplaySnapshot CapturePersistentSnapshot() const;
+    rawdraw::PersistentDisplayDependencies GetPersistentChanges() const;
+    void RecordCurrentFrameAsDisplayed();
+    void RenderActivePageToFramebuffer();
+    bool HasGlobalChrome() const;
 };
 
 }  // namespace ui

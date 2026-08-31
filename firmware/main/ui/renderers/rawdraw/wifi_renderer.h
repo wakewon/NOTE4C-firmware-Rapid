@@ -54,6 +54,10 @@ public:
     void Init(int width, int height) override;
     void Render(uint8_t* fb, int width, int height) override;
     bool HandleInput(const ButtonEvent& event) override;
+    PersistentDisplayDependencies GetPersistentDisplayDependencies() const override {
+        return PersistentDisplayDependency::Wifi |
+               PersistentDisplayDependency::Server;
+    }
 
     // Data interface
     void Update(const WifiStatus& status);

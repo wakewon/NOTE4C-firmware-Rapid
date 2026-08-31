@@ -83,6 +83,31 @@ void CalendarRenderer::Render(uint8_t* fb, int width, int height) {
     needs_full_refresh_ = false;
 }
 
+PersistentDisplayDependencies
+CalendarRenderer::GetPersistentDisplayDependencies() const {
+    time_t now = time(nullptr);
+    struct tm tm_buf = {};
+    localtime_r(&now, &tm_buf);
+    return year_ == tm_buf.tm_year + 1900 && month_ == tm_buf.tm_mon + 1
+        ? PersistentDependencyMask(PersistentDisplayDependency::PageDate)
+        : PersistentDependencyMask(PersistentDisplayDependency::None);
+}
+
+void CalendarRenderer::RefreshPersistentDisplayData(
+    PersistentDisplayDependencies dependencies) {
+    if ((dependencies & PersistentDependencyMask(
+             PersistentDisplayDependency::PageDate)) == 0) {
+        return;
+    }
+    time_t now = time(nullptr);
+    struct tm tm_buf = {};
+    localtime_r(&now, &tm_buf);
+    today_year_ = tm_buf.tm_year + 1900;
+    today_month_ = tm_buf.tm_mon + 1;
+    today_day_ = tm_buf.tm_mday;
+    cal_.RefreshToday();
+}
+
 // ============================================================
 // Input handling
 // ============================================================

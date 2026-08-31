@@ -437,6 +437,19 @@ bool CustomLcdDisplay::IsRefreshPending() {
     return busy;
 }
 
+bool CustomLcdDisplay::FramebufferDiffersFromLastRefresh() {
+    if (dirty_mutex) {
+        xSemaphoreTake(dirty_mutex, portMAX_DELAY);
+    }
+    const bool differs = !prev_buffer_synced || prev_buffer == nullptr ||
+                         buffer == nullptr ||
+                         memcmp(buffer, prev_buffer, lcd_spi_data.buffer_len) != 0;
+    if (dirty_mutex) {
+        xSemaphoreGive(dirty_mutex);
+    }
+    return differs;
+}
+
 bool CustomLcdDisplay::AllowsInputDuringRefresh() const {
 #if CONFIG_ZECTRIX_EPD_FAST_BW
     return IsFourColorPanel();

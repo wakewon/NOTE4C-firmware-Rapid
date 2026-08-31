@@ -308,6 +308,16 @@ Calendar::Calendar(int x, int y, int w, int h)
 
 Calendar::~Calendar() {}
 
+void Calendar::RefreshToday() {
+    time_t now = time(nullptr);
+    struct tm tm_buf = {};
+    localtime_r(&now, &tm_buf);
+    today_year_ = tm_buf.tm_year + 1900;
+    today_month_ = tm_buf.tm_mon + 1;
+    today_day_ = tm_buf.tm_mday;
+    needs_full_refresh_ = true;
+}
+
 // ============================================================
 // Configuration
 // ============================================================

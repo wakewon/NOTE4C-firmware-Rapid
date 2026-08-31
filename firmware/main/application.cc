@@ -20,6 +20,7 @@
 
 #include <ctime>
 #include <algorithm>
+#include <sys/time.h>
 
 namespace {
 
@@ -34,14 +35,14 @@ constexpr int kSettingsNetworkSyncIndex = 5;
 constexpr int kSettingsWifiIndex = 6;
 constexpr int kSettingsHttpServerIndex = 7;
 constexpr int kSettingsLanIpIndex = 8;
-constexpr uint32_t kRetainedMagic = 0x4E344351;  // "N4CQ" (layout v2)
+constexpr uint32_t kRetainedMagic = 0x4E344352;  // "N4CR" (layout v3)
 constexpr int64_t kInteractiveAwakeUs = 120LL * 1000 * 1000;
 constexpr int64_t kNetworkSyncTimeoutUs = 35LL * 1000 * 1000;
 
 constexpr bool ShouldRunScheduledNetworkSync(bool wifi_enabled,
                                              int interval_minutes,
-                                             int remaining_minutes) {
-    return wifi_enabled && interval_minutes > 0 && remaining_minutes <= 0;
+                                             int remaining_seconds) {
+    return wifi_enabled && interval_minutes > 0 && remaining_seconds <= 0;
 }
 
 // The periodic setting is only a schedule. It must never override the user's
@@ -70,10 +71,11 @@ struct RetainedSchedule {
     uint32_t magic;
     int slideshow_config_minutes;
     int sync_config_minutes;
-    int slideshow_remaining_minutes;
-    int sync_remaining_minutes;
+    int slideshow_remaining_seconds;
+    int sync_remaining_seconds;
     int selected_photo_index;
     int gallery_fullscreen;
+    ui::PersistentDisplayMetadata display_metadata;
 };
 
 RTC_DATA_ATTR RetainedSchedule s_retained_schedule{};
@@ -82,6 +84,56 @@ bool s_sntp_started = false;
 extern "C" RtcPcf8563* ZectrixGetRtc();
 extern "C" void ZectrixPrepareForDeepSleep();
 extern "C" bool ZectrixIsExternalPowerPresent();
+
+int CurrentLocalDateKey() {
+    time_t now = time(nullptr);
+    struct tm local_tm = {};
+    localtime_r(&now, &local_tm);
+    return (local_tm.tm_year + 1900) * 10000 +
+           (local_tm.tm_mon + 1) * 100 + local_tm.tm_mday;
+}
+
+int SecondsUntilNextLocalMidnight() {
+    time_t now = time(nullptr);
+    struct tm next_tm = {};
+    localtime_r(&now, &next_tm);
+    if (next_tm.tm_year + 1900 < 2020) return 0;
+    next_tm.tm_hour = 0;
+    next_tm.tm_min = 0;
+    next_tm.tm_sec = 0;
+    next_tm.tm_mday += 1;
+    next_tm.tm_isdst = -1;
+    const time_t next_midnight = mktime(&next_tm);
+    if (next_midnight <= now) return 0;
+    return static_cast<int>(next_midnight - now);
+}
+
+bool HasDateWakeDependency(const ui::PersistentDisplayContract& contract) {
+    const auto date_dependencies =
+        rawdraw::PersistentDependencyMask(rawdraw::PersistentDisplayDependency::Date) |
+        rawdraw::PersistentDependencyMask(rawdraw::PersistentDisplayDependency::PageDate);
+    return contract.restorable &&
+           (contract.wake_dependencies & date_dependencies) != 0;
+}
+
+void InitializeLocalClockFromRtc() {
+    setenv("TZ", "CST-8", 1);
+    tzset();
+    auto* rtc = ZectrixGetRtc();
+    if (!rtc) return;
+    struct tm rtc_tm = {};
+    if (!rtc->GetTime(rtc_tm) || rtc_tm.tm_year + 1900 < 2020) {
+        ESP_LOGW(kTag, "RTC time unavailable or invalid; midnight scheduling deferred");
+        return;
+    }
+    rtc_tm.tm_isdst = -1;
+    const time_t rtc_epoch = mktime(&rtc_tm);
+    if (rtc_epoch <= 0) return;
+    const timeval tv{.tv_sec = rtc_epoch, .tv_usec = 0};
+    settimeofday(&tv, nullptr);
+    ESP_LOGI(kTag, "System clock restored from PCF8563: date_key=%d",
+             CurrentLocalDateKey());
+}
 
 std::string FormatMinutesLabel(int minutes) {
     if (minutes <= 0) return "关闭";
@@ -224,6 +276,8 @@ void Application::Initialize() {
     if (!IsValidNetworkSyncInterval(network_sync_interval_minutes_)) {
         network_sync_interval_minutes_ = 0;
     }
+    auto& board = Board::GetInstance();
+    InitializeLocalClockFromRtc();
 
     const uint32_t wakeup_causes = esp_sleep_get_wakeup_causes();
     const bool timer_wakeup =
@@ -247,8 +301,8 @@ void Application::Initialize() {
             .magic = kRetainedMagic,
             .slideshow_config_minutes = slideshow_interval_minutes_,
             .sync_config_minutes = network_sync_interval_minutes_,
-            .slideshow_remaining_minutes = slideshow_interval_minutes_,
-            .sync_remaining_minutes = network_sync_interval_minutes_,
+            .slideshow_remaining_seconds = slideshow_interval_minutes_ * 60,
+            .sync_remaining_seconds = network_sync_interval_minutes_ * 60,
             .selected_photo_index = 0,
             .gallery_fullscreen = 0,
         };
@@ -256,26 +310,33 @@ void Application::Initialize() {
     }
     if (scheduler_timer_wake_) {
         slideshow_due_ = slideshow_interval_minutes_ > 0 &&
-                         s_retained_schedule.slideshow_remaining_minutes <= 0;
+                         s_retained_schedule.slideshow_remaining_seconds <= 0;
         network_sync_pending_ = ShouldRunScheduledNetworkSync(
             wifi_enabled_.load(std::memory_order_acquire),
             network_sync_interval_minutes_,
-            s_retained_schedule.sync_remaining_minutes);
+            s_retained_schedule.sync_remaining_seconds);
         if (slideshow_due_) {
-            s_retained_schedule.slideshow_remaining_minutes = slideshow_interval_minutes_;
+            s_retained_schedule.slideshow_remaining_seconds =
+                slideshow_interval_minutes_ * 60;
         }
         if (network_sync_pending_) {
-            s_retained_schedule.sync_remaining_minutes = network_sync_interval_minutes_;
+            s_retained_schedule.sync_remaining_seconds =
+                network_sync_interval_minutes_ * 60;
         }
-        ESP_LOGI(kTag, "Scheduled wake: slideshow_due=%d network_due=%d photo=%d",
+        display_invalidation_due_ =
+            HasDateWakeDependency(s_retained_schedule.display_metadata.contract) &&
+            s_retained_schedule.display_metadata.snapshot.date_key !=
+                CurrentLocalDateKey();
+        ESP_LOGI(kTag,
+                 "Timer wake reason: slideshow=%d network=%d display_invalidation=%d photo=%d",
                  slideshow_due_ ? 1 : 0, network_sync_pending_ ? 1 : 0,
+                 display_invalidation_due_ ? 1 : 0,
                  s_retained_schedule.selected_photo_index);
     }
     ESP_LOGI(kTag, "Network policy: wifi_enabled=%d sync_interval=%d scheduled_sync=%d",
              wifi_enabled_.load(std::memory_order_acquire) ? 1 : 0,
              network_sync_interval_minutes_, network_sync_pending_ ? 1 : 0);
 
-    auto& board = Board::GetInstance();
     SetDeviceState(kDeviceStateStarting);
 
     if (!scheduler_timer_wake_) {
@@ -324,6 +385,8 @@ void Application::Initialize() {
     external_power_present_ = !initial_discharging;
     external_power_probe_deadline_us_ =
         esp_timer_get_time() + 1000LL * 1000;
+    display_freshness_probe_deadline_us_ =
+        esp_timer_get_time() + 30LL * 1000 * 1000;
     ESP_LOGI(kTag,
              "Initial battery sample: level=%d charging=%d external_power=%d",
              initial_battery_level, initial_charging ? 1 : 0,
@@ -344,6 +407,11 @@ void Application::Initialize() {
             lcd->RequestUrgentFullRefresh();
         }
     }, scheduler_timer_wake_ || interactive_button_wake);
+    if ((scheduler_timer_wake_ || interactive_button_wake) &&
+        s_retained_schedule.magic == kRetainedMagic) {
+        rawdraw_ui_manager_->AdoptRetainedPersistentMetadata(
+            s_retained_schedule.display_metadata);
+    }
     rawdraw_ui_manager_->SetLowPowerSlideshowMode(true);
     rawdraw_ui_manager_->SetGallerySlideshowIntervalMinutes(slideshow_interval_minutes_);
     if (scheduler_timer_wake_ && slideshow_due_) {
@@ -351,6 +419,14 @@ void Application::Initialize() {
             s_retained_schedule.selected_photo_index, true);
         ESP_LOGI(kTag, "Scheduled slideshow frame requested=%d",
                  slideshow_refresh_requested_ ? 1 : 0);
+    } else if (scheduler_timer_wake_ && display_invalidation_due_) {
+        display_invalidation_refresh_requested_ =
+            rawdraw_ui_manager_->PrepareRetainedDisplayInvalidation(
+                s_retained_schedule.selected_photo_index,
+                s_retained_schedule.gallery_fullscreen != 0);
+        ESP_LOGI(kTag,
+                 "Scheduled display invalidation caused refresh=%d",
+                 display_invalidation_refresh_requested_ ? 1 : 0);
     } else if (interactive_button_wake) {
         const bool down_wake =
             (button_wakeup_mask & (1ULL << TODO_DOWN_BUTTON_GPIO)) != 0;
@@ -389,7 +465,7 @@ void Application::Initialize() {
                              nvs.SetInt(kSlideshowIntervalKey, next);
                              slideshow_interval_minutes_ = next;
                              s_retained_schedule.slideshow_config_minutes = next;
-                             s_retained_schedule.slideshow_remaining_minutes = next;
+                             s_retained_schedule.slideshow_remaining_seconds = next * 60;
                              if (rawdraw_ui_manager_) {
                                  rawdraw_ui_manager_->SetGallerySlideshowIntervalMinutes(next);
                              }
@@ -409,7 +485,7 @@ void Application::Initialize() {
                              nvs.SetInt(kSyncIntervalKey, next);
                              network_sync_interval_minutes_ = next;
                              s_retained_schedule.sync_config_minutes = next;
-                             s_retained_schedule.sync_remaining_minutes = next;
+                             s_retained_schedule.sync_remaining_seconds = next * 60;
                              sr->UpdateItem(kSettingsNetworkSyncIndex,
                                             FormatNetworkSyncLabel(
                                                 next,
@@ -448,8 +524,8 @@ void Application::Initialize() {
                                  ESP_LOGI(kTag, "Wi-Fi setting toggled ON");
                                  wifi_enabled_.store(true, std::memory_order_release);
                                  nvs.SetBool(kWifiEnabledKey, true);
-                                 s_retained_schedule.sync_remaining_minutes =
-                                     network_sync_interval_minutes_;
+                                 s_retained_schedule.sync_remaining_seconds =
+                                     network_sync_interval_minutes_ * 60;
                                  UpdateWifiSettingsItem(sr, true, false, "连接中");
                                  StartInteractiveWifiAttempt();
                              }
@@ -515,7 +591,7 @@ void Application::Initialize() {
     }
 
     ESP_LOGI(kTag, "Rawdraw gallery UI initialized");
-    if (esp_reset_reason() == ESP_RST_DEEPSLEEP && !scheduler_timer_wake_) {
+    if (interactive_button_wake) {
         ESP_LOGI(kTag, "Interactive wake from deep sleep");
         board.FlashActivityLed();
     }
@@ -714,9 +790,12 @@ void Application::OnBootLongPress() {
 }
 
 void Application::NoteButtonActivity() {
-    Board::GetInstance().FlashActivityLed();
     interactive_sleep_deadline_us_ = esp_timer_get_time() + kInteractiveAwakeUs;
     manual_sleep_requested_.store(false, std::memory_order_release);
+    // Fold a fresh battery/network sample into the button handler's one
+    // already-planned render. This is opportunistic and never queues another
+    // refresh of its own (fullscreen photos still have no such dependency).
+    UpdateStatusBarForUi(false, false);
     // The actual button handler renders the resulting UI state with its
     // explicit FAST_BW intent. Queueing an additional background redraw here
     // used to turn long presses into a same-content automatic refresh and,
@@ -774,6 +853,9 @@ void Application::StartScheduledNetworkSync() {
 }
 
 void Application::EnterScheduledSleep() {
+    ESP_LOGI(kTag, "Scheduled wake caused display refresh=%d",
+             (slideshow_refresh_requested_ ||
+              display_invalidation_refresh_requested_) ? 1 : 0);
     EnterLowPowerSleep("scheduled work complete");
 }
 
@@ -793,20 +875,63 @@ void Application::RequestManualSleep(bool disable_wifi) {
 }
 
 void Application::EnterLowPowerSleep(const char* reason) {
-    ESP_LOGI(kTag, "Preparing deep sleep: %s", reason ? reason : "unspecified");
+    if (sleep_phase_ != SleepPhase::Awake) return;
+    pending_sleep_reason_ = reason ? reason : "unspecified";
+    input_ready_.store(false, std::memory_order_release);
+    ESP_LOGI(kTag, "Sleep preparation beginning: %s", pending_sleep_reason_);
 
     if (rawdraw_ui_manager_) {
-        s_retained_schedule.selected_photo_index =
-            rawdraw_ui_manager_->GetGallerySelectedIndex();
-        s_retained_schedule.gallery_fullscreen =
-            rawdraw_ui_manager_->IsGalleryFullscreen() ? 1 : 0;
-        if (rawdraw_ui_manager_->IsHttpServerRunning()) {
-            rawdraw_ui_manager_->StopApTransferMode();
-        }
+        char dependencies[96];
+        const auto metadata = rawdraw_ui_manager_->GetDisplayedPersistentMetadata();
+        ESP_LOGI(kTag,
+                 "Current display dependencies=%s wake=0x%lx restorable=%d kind=%d",
+                 ui::RawDrawUiManager::DescribePersistentDependencies(
+                     metadata.contract.visible_dependencies,
+                     dependencies, sizeof(dependencies)),
+                 static_cast<unsigned long>(metadata.contract.wake_dependencies),
+                 metadata.contract.restorable ? 1 : 0,
+                 static_cast<int>(metadata.contract.restore_kind));
+        rawdraw_ui_manager_->BeginPersistentSleepPreparation();
+        rawdraw_ui_manager_->StopHttpServicesForSleep();
     }
-    if (network_initialized_) {
-        WifiManager::GetInstance().StopStation();
+    if (network_initialized_) WifiManager::GetInstance().StopStation();
+    wifi_connected_.store(false, std::memory_order_release);
+    network_sync_pending_ = false;
+    network_sync_deadline_us_ = 0;
+    wifi_connect_deadline_us_ = 0;
+    StopSntpIfStarted();
+    esp_wifi_disconnect();
+    esp_wifi_stop();
+    UpdateStatusBarForUi(false, false);
+
+    ui::PersistentFramePreparation frame;
+    if (rawdraw_ui_manager_) {
+        frame = rawdraw_ui_manager_->PreparePersistentFrame();
     }
+    char changed[96];
+    char visible[96];
+    ESP_LOGI(kTag,
+             "Final visible synchronization: changed=%s visible=%s framebuffer_changed=%d",
+             ui::RawDrawUiManager::DescribePersistentDependencies(
+                 frame.changed_dependencies, changed, sizeof(changed)),
+             ui::RawDrawUiManager::DescribePersistentDependencies(
+                 frame.visible_changes, visible, sizeof(visible)),
+             frame.framebuffer_changed ? 1 : 0);
+    if (frame.refresh_requested) {
+        ESP_LOGI(kTag,
+                 "[FULL_COLOR] pre-sleep refresh requested; waiting for EPD idle");
+        sleep_phase_ = SleepPhase::WaitingForDisplay;
+    } else {
+        ESP_LOGI(kTag, "Pre-sleep full-color refresh skipped: no visible pixel change");
+        sleep_phase_ = SleepPhase::ReadyToCommit;
+    }
+}
+
+void Application::CommitLowPowerSleep() {
+    // A late station callback may race the asynchronous EPD waveform. Reassert
+    // the final radio state immediately before power is committed; the glass
+    // already contains the disconnected state selected by preflight.
+    if (network_initialized_) WifiManager::GetInstance().StopStation();
     wifi_connected_.store(false, std::memory_order_release);
     StopSntpIfStarted();
     esp_wifi_disconnect();
@@ -819,48 +944,75 @@ void Application::EnterLowPowerSleep(const char* reason) {
     s_retained_schedule.magic = kRetainedMagic;
     s_retained_schedule.slideshow_config_minutes = slideshow_interval_minutes_;
     s_retained_schedule.sync_config_minutes = network_sync_interval_minutes_;
+    if (!scheduler_timer_wake_ || slideshow_refresh_requested_ ||
+        display_invalidation_refresh_requested_) {
+        s_retained_schedule.selected_photo_index =
+            rawdraw_ui_manager_ ? rawdraw_ui_manager_->GetGallerySelectedIndex() : 0;
+        s_retained_schedule.gallery_fullscreen =
+            rawdraw_ui_manager_ && rawdraw_ui_manager_->IsGalleryFullscreen() ? 1 : 0;
+    }
+    if (rawdraw_ui_manager_) {
+        s_retained_schedule.display_metadata =
+            rawdraw_ui_manager_->GetDisplayedPersistentMetadata();
+    }
     if (slideshow_interval_minutes_ <= 0) {
-        s_retained_schedule.slideshow_remaining_minutes = 0;
-    } else if (s_retained_schedule.slideshow_remaining_minutes <= 0) {
-        s_retained_schedule.slideshow_remaining_minutes = slideshow_interval_minutes_;
+        s_retained_schedule.slideshow_remaining_seconds = 0;
+    } else if (s_retained_schedule.slideshow_remaining_seconds <= 0) {
+        s_retained_schedule.slideshow_remaining_seconds =
+            slideshow_interval_minutes_ * 60;
     }
     if (network_sync_interval_minutes_ <= 0) {
-        s_retained_schedule.sync_remaining_minutes = 0;
-    } else if (s_retained_schedule.sync_remaining_minutes <= 0) {
-        s_retained_schedule.sync_remaining_minutes = network_sync_interval_minutes_;
+        s_retained_schedule.sync_remaining_seconds = 0;
+    } else if (s_retained_schedule.sync_remaining_seconds <= 0) {
+        s_retained_schedule.sync_remaining_seconds =
+            network_sync_interval_minutes_ * 60;
     }
 
-    int next_wake_minutes = 0;
-    auto consider_deadline = [&next_wake_minutes](int remaining) {
-        if (remaining > 0 && (next_wake_minutes == 0 || remaining < next_wake_minutes)) {
-            next_wake_minutes = remaining;
+    int display_invalidation_seconds = 0;
+    if (HasDateWakeDependency(s_retained_schedule.display_metadata.contract)) {
+        display_invalidation_seconds =
+            s_retained_schedule.display_metadata.snapshot.date_key !=
+                    CurrentLocalDateKey()
+                ? 1
+                : SecondsUntilNextLocalMidnight();
+    }
+    ESP_LOGI(kTag, "Calculated display invalidation deadline: %d seconds",
+             display_invalidation_seconds);
+
+    int next_wake_seconds = 0;
+    auto consider_deadline = [&next_wake_seconds](int remaining) {
+        if (remaining > 0 &&
+            (next_wake_seconds == 0 || remaining < next_wake_seconds)) {
+            next_wake_seconds = remaining;
         }
     };
-    consider_deadline(s_retained_schedule.slideshow_remaining_minutes);
+    consider_deadline(s_retained_schedule.slideshow_remaining_seconds);
     if (wifi_enabled_.load(std::memory_order_acquire)) {
-        consider_deadline(s_retained_schedule.sync_remaining_minutes);
+        consider_deadline(s_retained_schedule.sync_remaining_seconds);
     }
+    consider_deadline(display_invalidation_seconds);
 
     esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
-    if (next_wake_minutes > 0) {
+    if (next_wake_seconds > 0) {
         if (slideshow_interval_minutes_ > 0) {
-            s_retained_schedule.slideshow_remaining_minutes = std::max(
-                0, s_retained_schedule.slideshow_remaining_minutes - next_wake_minutes);
+            s_retained_schedule.slideshow_remaining_seconds = std::max(
+                0, s_retained_schedule.slideshow_remaining_seconds - next_wake_seconds);
         }
         if (wifi_enabled_.load(std::memory_order_acquire) &&
             network_sync_interval_minutes_ > 0) {
-            s_retained_schedule.sync_remaining_minutes = std::max(
-                0, s_retained_schedule.sync_remaining_minutes - next_wake_minutes);
+            s_retained_schedule.sync_remaining_seconds = std::max(
+                0, s_retained_schedule.sync_remaining_seconds - next_wake_seconds);
         }
         ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(
-            static_cast<uint64_t>(next_wake_minutes) * 60ULL * 1000000ULL));
-        ESP_LOGI(kTag, "Next scheduled wake in %d minutes (slide_remaining=%d sync_remaining=%d)",
-                 next_wake_minutes,
-                 s_retained_schedule.slideshow_remaining_minutes,
-                 s_retained_schedule.sync_remaining_minutes);
-    } else {
+            static_cast<uint64_t>(next_wake_seconds) * 1000000ULL));
         ESP_LOGI(kTag,
-                 "All schedules disabled; sleeping until BOOT or DOWN key wake");
+                 "Next wake in %d seconds (slide_remaining=%d sync_remaining=%d display=%d)",
+                 next_wake_seconds,
+                 s_retained_schedule.slideshow_remaining_seconds,
+                 s_retained_schedule.sync_remaining_seconds,
+                 display_invalidation_seconds);
+    } else {
+        ESP_LOGI(kTag, "All schedules disabled; sleeping until GPIO wake");
     }
     // BOOT, DOWN and the charger's active-low CHARGE output can share EXT1.
     // The active-high FULL output uses EXT0 so USB insertion also wakes a
@@ -875,6 +1027,8 @@ void Application::EnterLowPowerSleep(const char* reason) {
     ESP_ERROR_CHECK(esp_sleep_enable_ext0_wakeup(
         static_cast<gpio_num_t>(CHARGE_FULL_GPIO), 1));
 
+    ESP_LOGI(kTag, "Final deep-sleep commit: %s",
+             pending_sleep_reason_ ? pending_sleep_reason_ : "unspecified");
     // Shut down the rails only after all users (display, Wi-Fi, audio and NFC)
     // have become idle. Per-pin holds already configured by the board BSP are
     // then made effective throughout deep sleep on ESP32-S3.
@@ -913,13 +1067,42 @@ void Application::OnSntpSynchronized() {
 
 void Application::Run() {
     while (true) {
-        if (rawdraw_ui_manager_) {
+        if (rawdraw_ui_manager_ && sleep_phase_ == SleepPhase::Awake) {
             rawdraw_ui_manager_->PumpClockRefresh();
         }
         auto* lcd = static_cast<CustomLcdDisplay*>(Board::GetInstance().GetDisplay());
-        const bool display_busy = lcd != nullptr && lcd->IsRefreshPending();
-        refresh_seen_busy_ = refresh_seen_busy_ || display_busy;
+        bool display_busy = lcd != nullptr && lcd->IsRefreshPending();
         const int64_t now_us = esp_timer_get_time();
+
+        if (!scheduler_timer_wake_ && sleep_phase_ == SleepPhase::Awake &&
+            now_us >= display_freshness_probe_deadline_us_) {
+            display_freshness_probe_deadline_us_ = now_us + 30LL * 1000 * 1000;
+            const auto date_dependencies =
+                rawdraw::PersistentDependencyMask(
+                    rawdraw::PersistentDisplayDependency::Date) |
+                rawdraw::PersistentDependencyMask(
+                    rawdraw::PersistentDisplayDependency::PageDate);
+            if (!display_busy && rawdraw_ui_manager_ &&
+                (rawdraw_ui_manager_->GetVisiblePersistentChanges() &
+                 date_dependencies) != 0) {
+                const auto refresh = rawdraw_ui_manager_->PreparePersistentFrame();
+                ESP_LOGI(kTag,
+                         "Awake display invalidation: refresh=%d visible=0x%lx",
+                         refresh.refresh_requested ? 1 : 0,
+                         static_cast<unsigned long>(refresh.visible_changes));
+                display_busy = lcd != nullptr && lcd->IsRefreshPending();
+            }
+        }
+
+        if (sleep_phase_ == SleepPhase::WaitingForDisplay) {
+            if (!display_busy) {
+                ESP_LOGI(kTag, "EPD idle after final full-color refresh");
+                sleep_phase_ = SleepPhase::ReadyToCommit;
+            }
+        }
+        if (sleep_phase_ == SleepPhase::ReadyToCommit) {
+            CommitLowPowerSleep();
+        }
 
         if (!scheduler_timer_wake_ &&
             now_us >= external_power_probe_deadline_us_) {
@@ -970,9 +1153,7 @@ void Application::Run() {
         }
 
         if (scheduler_timer_wake_) {
-            const bool refresh_done = !slideshow_refresh_requested_ ||
-                                      (refresh_seen_busy_ && !display_busy);
-            if (refresh_done && !network_sync_pending_) {
+            if (!display_busy && !network_sync_pending_) {
                 EnterScheduledSleep();
             }
         } else {
@@ -983,9 +1164,11 @@ void Application::Run() {
             const bool local_service_running =
                 IsLocalHttpServiceRunning(rawdraw_ui_manager_.get()) ||
                 (network_initialized_ && WifiManager::GetInstance().IsConfigMode());
-            if ((manual_sleep_requested || ShouldEnterIdleSleep(
-                     idle_deadline_reached, external_power_present_)) &&
-                !display_busy && !local_service_running) {
+            const bool idle_sleep_allowed =
+                ShouldEnterIdleSleep(idle_deadline_reached,
+                                     external_power_present_) &&
+                !local_service_running;
+            if ((manual_sleep_requested || idle_sleep_allowed) && !display_busy) {
                 EnterLowPowerSleep(manual_sleep_requested ? "manual request"
                                                           : "interactive idle timeout");
             }
@@ -1036,9 +1219,6 @@ void Application::UpdateStatusBarForUi() {
 
 void Application::UpdateStatusBarForUi(bool request_refresh,
                                        bool fast_refresh) {
-    if (scheduler_timer_wake_) {
-        return;
-    }
     auto& board = Board::GetInstance();
     int battery_level = -1;
     bool charging = false;
@@ -1077,7 +1257,11 @@ void Application::UpdateStatusBarForUi(bool request_refresh,
         //   - nothing rendered actually changed, so a repaint would be a
         //     pixel-identical frame (repeat Scanning/Connecting events, or a
         //     battery poll that landed on the same percentage).
-        if (dirty && request_refresh && !InInputScope()) {
+        const auto visible_changes =
+            rawdraw_ui_manager_->GetVisiblePersistentChanges();
+        if (dirty && visible_changes != 0 && request_refresh &&
+            !scheduler_timer_wake_ && sleep_phase_ == SleepPhase::Awake &&
+            !InInputScope()) {
             rawdraw_ui_manager_->RequestActivePageRefresh(
                 fast_refresh
                     ? ui::RefreshIntent::FastBwDeferredInteraction

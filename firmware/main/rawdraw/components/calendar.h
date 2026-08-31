@@ -131,6 +131,9 @@ public:
      */
     bool JumpToToday();
 
+    /** Refresh the cached current-day highlight without changing viewed month. */
+    void RefreshToday();
+
     // ============================================================
     // Date selection cursor
     // ============================================================
