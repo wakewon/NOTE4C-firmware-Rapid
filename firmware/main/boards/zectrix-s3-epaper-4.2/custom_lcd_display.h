@@ -85,6 +85,7 @@ public:
 
     // Refresh state for sleep gating
     bool IsRefreshPending();
+    bool NeedsFullColorRecovery();
     bool FramebufferDiffersFromLastRefresh();
 
     // Notify when refresh transitions from busy to idle.

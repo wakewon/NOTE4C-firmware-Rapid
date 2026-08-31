@@ -2,6 +2,7 @@
 #define _APPLICATION_H_
 
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string_view>
@@ -71,6 +72,8 @@ private:
     bool display_invalidation_due_ = false;
     bool display_invalidation_refresh_requested_ = false;
     bool network_sync_pending_ = false;
+    uint32_t scheduled_network_jobs_pending_ = 0;
+    static constexpr uint32_t kScheduledNetworkJobTimeSync = 1u << 0;
     std::atomic<bool> manual_sleep_requested_{false};
     int slideshow_interval_minutes_ = 0;
     int network_sync_interval_minutes_ = 0;
@@ -92,6 +95,8 @@ private:
     void EnsureNetworkInitialized();
     void StartInteractiveWifiAttempt();
     void StartScheduledNetworkSync();
+    void CompleteScheduledNetworkJob(uint32_t job);
+    void FinishScheduledNetworkSession(const char* reason);
     void EnterLowPowerSleep(const char* reason);
     void CommitLowPowerSleep();
     void EnterScheduledSleep();

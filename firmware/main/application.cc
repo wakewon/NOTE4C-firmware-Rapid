@@ -472,7 +472,7 @@ void Application::Initialize() {
                              sr->UpdateItem(kSettingsSlideshowIndex, FormatMinutesLabel(next));
                          }});
         items.push_back({"网络", "", nullptr, rawdraw::SettingsItemType::Section, false});
-        items.push_back({"定时校时",
+        items.push_back({"定时联网",
                          FormatNetworkSyncLabel(
                              network_sync_interval_minutes_,
                              wifi_enabled_.load(std::memory_order_acquire)),
@@ -491,7 +491,7 @@ void Application::Initialize() {
                                                 next,
                                                 wifi_enabled_.load(
                                                     std::memory_order_acquire)));
-                             ESP_LOGI(kTag, "Periodic network sync set to %s",
+                             ESP_LOGI(kTag, "Periodic network session set to %s",
                                       FormatMinutesLabel(next).c_str());
                          }});
         items.push_back({"Wi-Fi",
@@ -570,12 +570,6 @@ void Application::Initialize() {
                              UpdateStatusBarForUi();
                          }});
         items.push_back({"局域网IP", "未获取", nullptr, rawdraw::SettingsItemType::Normal, false});
-        items.push_back({"省电模式", "手动进入", nullptr,
-                         rawdraw::SettingsItemType::Action, false,
-                         [this]() {
-                             ESP_LOGI(kTag, "Manual sleep requested from settings");
-                             EnterManualSleep();
-                         }});
         items.push_back({"关于", "", nullptr, rawdraw::SettingsItemType::Section, false});
         items.push_back({"固件", PROJECT_VER, nullptr, rawdraw::SettingsItemType::Normal, false});
         sr->SetItems(items);
@@ -841,15 +835,47 @@ void Application::StartInteractiveWifiAttempt() {
 
 void Application::StartScheduledNetworkSync() {
     if (!wifi_enabled_.load(std::memory_order_acquire)) {
-        ESP_LOGI(kTag, "Scheduled network sync suppressed because Wi-Fi switch is OFF");
+        ESP_LOGI(kTag, "Scheduled network session suppressed because Wi-Fi switch is OFF");
         network_sync_pending_ = false;
+        scheduled_network_jobs_pending_ = 0;
         return;
     }
-    ESP_LOGI(kTag, "Scheduled network sync: starting Wi-Fi with %lld s timeout",
-             static_cast<long long>(kNetworkSyncTimeoutUs / 1000000));
+
+    // The timer owns a short-lived online session, not SNTP itself. Today time
+    // synchronization is the only registered job; future weather/news/etc.
+    // jobs can join the same session and keep Wi-Fi alive until all are done.
+    scheduled_network_jobs_pending_ = kScheduledNetworkJobTimeSync;
+    ESP_LOGI(kTag,
+             "Scheduled network session: starting Wi-Fi with %lld s timeout jobs=0x%lx",
+             static_cast<long long>(kNetworkSyncTimeoutUs / 1000000),
+             static_cast<unsigned long>(scheduled_network_jobs_pending_));
     EnsureNetworkInitialized();
     network_sync_deadline_us_ = esp_timer_get_time() + kNetworkSyncTimeoutUs;
     WifiManager::GetInstance().StartStation();
+}
+
+void Application::CompleteScheduledNetworkJob(uint32_t job) {
+    if (!network_sync_pending_) return;
+    scheduled_network_jobs_pending_ &= ~job;
+    ESP_LOGI(kTag, "Scheduled network job complete: job=0x%lx remaining=0x%lx",
+             static_cast<unsigned long>(job),
+             static_cast<unsigned long>(scheduled_network_jobs_pending_));
+    if (scheduled_network_jobs_pending_ == 0) {
+        FinishScheduledNetworkSession("all jobs complete");
+    }
+}
+
+void Application::FinishScheduledNetworkSession(const char* reason) {
+    StopSntpIfStarted();
+    if (network_initialized_) {
+        WifiManager::GetInstance().StopStation();
+    }
+    wifi_connected_.store(false, std::memory_order_release);
+    network_sync_pending_ = false;
+    scheduled_network_jobs_pending_ = 0;
+    network_sync_deadline_us_ = 0;
+    ESP_LOGI(kTag, "Scheduled network session finished: %s; Wi-Fi stopped",
+             reason ? reason : "unspecified");
 }
 
 void Application::EnterScheduledSleep() {
@@ -897,12 +923,17 @@ void Application::EnterLowPowerSleep(const char* reason) {
     if (network_initialized_) WifiManager::GetInstance().StopStation();
     wifi_connected_.store(false, std::memory_order_release);
     network_sync_pending_ = false;
+    scheduled_network_jobs_pending_ = 0;
     network_sync_deadline_us_ = 0;
     wifi_connect_deadline_us_ = 0;
     StopSntpIfStarted();
     esp_wifi_disconnect();
     esp_wifi_stop();
     UpdateStatusBarForUi(false, false);
+
+    auto* sleep_lcd = static_cast<CustomLcdDisplay*>(Board::GetInstance().GetDisplay());
+    const bool full_color_recovery_needed =
+        sleep_lcd != nullptr && sleep_lcd->NeedsFullColorRecovery();
 
     ui::PersistentFramePreparation frame;
     if (rawdraw_ui_manager_) {
@@ -919,10 +950,19 @@ void Application::EnterLowPowerSleep(const char* reason) {
              frame.framebuffer_changed ? 1 : 0);
     if (frame.refresh_requested) {
         ESP_LOGI(kTag,
-                 "[FULL_COLOR] pre-sleep refresh requested; waiting for EPD idle");
+                 "[FULL_COLOR] pre-sleep content refresh requested; waiting for EPD idle");
+        sleep_phase_ = SleepPhase::WaitingForDisplay;
+    } else if (full_color_recovery_needed && sleep_lcd != nullptr) {
+        // Pixel semantics may already match while the physical panel is still
+        // showing a FAST_BW interaction waveform. Deep sleep has no later idle
+        // recovery opportunity, so settle that quality debt immediately.
+        ESP_LOGI(kTag,
+                 "[FULL_COLOR] pre-sleep FAST_BW recovery debt detected; forcing final waveform");
+        sleep_lcd->RequestUrgentFullRefresh();
         sleep_phase_ = SleepPhase::WaitingForDisplay;
     } else {
-        ESP_LOGI(kTag, "Pre-sleep full-color refresh skipped: no visible pixel change");
+        ESP_LOGI(kTag,
+                 "Pre-sleep full-color refresh skipped: pixels unchanged and panel already stable");
         sleep_phase_ = SleepPhase::ReadyToCommit;
     }
 }
@@ -1050,14 +1090,8 @@ void Application::OnSntpSynchronized() {
             ESP_LOGI(kTag, "PCF8563 updated from SNTP");
         }
     }
-    if (scheduler_timer_wake_) {
-        StopSntpIfStarted();
-        if (network_initialized_) {
-            WifiManager::GetInstance().StopStation();
-        }
-        wifi_connected_.store(false, std::memory_order_release);
-        network_sync_pending_ = false;
-        ESP_LOGI(kTag, "Scheduled network sync complete; Wi-Fi stopped");
+    if (scheduler_timer_wake_ && network_sync_pending_) {
+        CompleteScheduledNetworkJob(kScheduledNetworkJobTimeSync);
     } else {
         // Clock and status-bar text are monochrome. A successful sync must not
         // turn a background network event into an expensive color refresh.
@@ -1124,12 +1158,8 @@ void Application::Run() {
 
         if (scheduler_timer_wake_ && network_sync_pending_ &&
             network_sync_deadline_us_ > 0 && now_us >= network_sync_deadline_us_) {
-            ESP_LOGW(kTag, "Scheduled network sync timed out; Wi-Fi stopped until next interval");
-            if (network_initialized_) {
-                WifiManager::GetInstance().StopStation();
-            }
-            wifi_connected_.store(false, std::memory_order_release);
-            network_sync_pending_ = false;
+            ESP_LOGW(kTag, "Scheduled network session timed out; stopping until next interval");
+            FinishScheduledNetworkSession("timeout");
         }
 
         if (!scheduler_timer_wake_ && wifi_connect_deadline_us_ > 0 &&

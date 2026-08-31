@@ -437,6 +437,17 @@ bool CustomLcdDisplay::IsRefreshPending() {
     return busy;
 }
 
+bool CustomLcdDisplay::NeedsFullColorRecovery() {
+    if (dirty_mutex) {
+        xSemaphoreTake(dirty_mutex, portMAX_DELAY);
+    }
+    const bool needed = IsFourColorPanel() && fast_bw_since_full_;
+    if (dirty_mutex) {
+        xSemaphoreGive(dirty_mutex);
+    }
+    return needed;
+}
+
 bool CustomLcdDisplay::FramebufferDiffersFromLastRefresh() {
     if (dirty_mutex) {
         xSemaphoreTake(dirty_mutex, portMAX_DELAY);
