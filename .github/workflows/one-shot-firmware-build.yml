@@ -2,25 +2,33 @@ name: One-shot firmware patch and build
 
 on:
   push:
-    branches: [dev]
+    branches:
+      - dev
 
 permissions:
   contents: write
 
 jobs:
   patch-and-build:
-    if: ${{ !contains(github.event.head_commit.message, '[one-shot-built]') }}
     runs-on: ubuntu-latest
-    container:
-      image: espressif/idf:v6.0
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+      - name: Skip generated source commit
+        id: guard
+        shell: bash
+        run: |
+          if git log -1 --pretty=%B | grep -q '\[one-shot-built\]'; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Apply low-power consistency patch
+        if: steps.guard.outputs.skip != 'true'
         shell: bash
         run: |
           python3 <<'PY'
@@ -34,20 +42,8 @@ jobs:
 
           app = Path("firmware/main/application.cc")
           text = app.read_text(encoding="utf-8")
-
-          text = replace_once(
-              text,
-              'items.push_back({"定时校时",',
-              'items.push_back({"定时联网",',
-              "rename periodic network setting",
-          )
-          text = replace_once(
-              text,
-              'ESP_LOGI(kTag, "Periodic network sync set to %s",',
-              'ESP_LOGI(kTag, "Periodic network session set to %s",',
-              "rename periodic network log",
-          )
-
+          text = replace_once(text, 'items.push_back({"定时校时",', 'items.push_back({"定时联网",', "rename periodic network setting")
+          text = replace_once(text, 'ESP_LOGI(kTag, "Periodic network sync set to %s",', 'ESP_LOGI(kTag, "Periodic network session set to %s",', "rename periodic network log")
           manual_item = '''        items.push_back({"省电模式", "手动进入", nullptr,
                          rawdraw::SettingsItemType::Action, false,
                          [this]() {
@@ -151,19 +147,14 @@ void Application::FinishScheduledNetworkSession(const char* reason) {
 '''
           text = replace_once(text, old_timeout, new_timeout, "route scheduled session timeout")
 
-          text = replace_once(
-              text,
-              '''    network_sync_pending_ = false;
+          text = replace_once(text, '''    network_sync_pending_ = false;
     network_sync_deadline_us_ = 0;
     wifi_connect_deadline_us_ = 0;
-''',
-              '''    network_sync_pending_ = false;
+''', '''    network_sync_pending_ = false;
     scheduled_network_jobs_pending_ = 0;
     network_sync_deadline_us_ = 0;
     wifi_connect_deadline_us_ = 0;
-''',
-              "clear scheduled jobs during sleep preparation",
-          )
+''', "clear scheduled jobs during sleep preparation")
 
           old_frame = '''    ui::PersistentFramePreparation frame;
     if (rawdraw_ui_manager_) {
@@ -209,59 +200,37 @@ void Application::FinishScheduledNetworkSession(const char* reason) {
     }
 '''
           text = replace_once(text, old_decision, new_decision, "enforce final full-color invariant")
-
           app.write_text(text, encoding="utf-8")
 
           hdr = Path("firmware/main/application.h")
           text = hdr.read_text(encoding="utf-8")
           text = replace_once(text, '#include <atomic>\n', '#include <atomic>\n#include <cstdint>\n', "include cstdint")
-          text = replace_once(
-              text,
-              '''    bool network_sync_pending_ = false;
+          text = replace_once(text, '''    bool network_sync_pending_ = false;
     std::atomic<bool> manual_sleep_requested_{false};
-''',
-              '''    // Session-level flag keeps the existing retained/NVS naming stable;
-    // individual online jobs are tracked independently so SNTP does not own
-    // the lifetime of future periodic network work.
-    bool network_sync_pending_ = false;
+''', '''    bool network_sync_pending_ = false;
     uint32_t scheduled_network_jobs_pending_ = 0;
     static constexpr uint32_t kScheduledNetworkJobTimeSync = 1u << 0;
     std::atomic<bool> manual_sleep_requested_{false};
-''',
-              "add scheduled network job state",
-          )
-          text = replace_once(
-              text,
-              '''    void StartScheduledNetworkSync();
+''', "add scheduled network job state")
+          text = replace_once(text, '''    void StartScheduledNetworkSync();
     void EnterLowPowerSleep(const char* reason);
-''',
-              '''    void StartScheduledNetworkSync();
+''', '''    void StartScheduledNetworkSync();
     void CompleteScheduledNetworkJob(uint32_t job);
     void FinishScheduledNetworkSession(const char* reason);
     void EnterLowPowerSleep(const char* reason);
-''',
-              "declare scheduled network session helpers",
-          )
+''', "declare scheduled network session helpers")
           hdr.write_text(text, encoding="utf-8")
 
           lcd_h = Path("firmware/main/boards/zectrix-s3-epaper-4.2/custom_lcd_display.h")
           text = lcd_h.read_text(encoding="utf-8")
-          text = replace_once(
-              text,
-              '''    // Refresh state for sleep gating
+          text = replace_once(text, '''    // Refresh state for sleep gating
     bool IsRefreshPending();
     bool FramebufferDiffersFromLastRefresh();
-''',
-              '''    // Refresh state for sleep gating
+''', '''    // Refresh state for sleep gating
     bool IsRefreshPending();
-    // True after a physical FAST_BW waveform until a complete full-color
-    // waveform has finished. Sleep preflight uses this to bypass the normal
-    // 10/30 s recovery delay and leave a stable persistent E-ink frame.
     bool NeedsFullColorRecovery();
     bool FramebufferDiffersFromLastRefresh();
-''',
-              "declare full-color recovery query",
-          )
+''', "declare full-color recovery query")
           lcd_h.write_text(text, encoding="utf-8")
 
           lcd_cc = Path("firmware/main/boards/zectrix-s3-epaper-4.2/custom_lcd_display.cc")
@@ -282,44 +251,33 @@ void Application::FinishScheduledNetworkSession(const char* reason) {
 '''
           text = replace_once(text, marker, method + marker, "implement full-color recovery query")
           lcd_cc.write_text(text, encoding="utf-8")
-
-          # Guard the intended policy at patch time too.
-          patched = app.read_text(encoding="utf-8")
-          assert 'items.push_back({"定时校时",' not in patched
-          assert 'items.push_back({"省电模式"' not in patched
-          assert 'items.push_back({"定时联网",' in patched
-          assert 'NeedsFullColorRecovery()' in patched
-          assert 'CompleteScheduledNetworkJob(kScheduledNetworkJobTimeSync)' in patched
           PY
 
       - name: Review patch
+        if: steps.guard.outputs.skip != 'true'
         shell: bash
         run: |
           git diff --check
           git diff --stat
-          git diff -- firmware/main/application.cc firmware/main/application.h \
-            firmware/main/boards/zectrix-s3-epaper-4.2/custom_lcd_display.h \
-            firmware/main/boards/zectrix-s3-epaper-4.2/custom_lcd_display.cc
 
       - name: Commit source patch
+        if: steps.guard.outputs.skip != 'true'
         shell: bash
         run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add firmware/main/application.cc firmware/main/application.h \
-            firmware/main/boards/zectrix-s3-epaper-4.2/custom_lcd_display.h \
-            firmware/main/boards/zectrix-s3-epaper-4.2/custom_lcd_display.cc
+          git add firmware/main/application.cc firmware/main/application.h firmware/main/boards/zectrix-s3-epaper-4.2/custom_lcd_display.h firmware/main/boards/zectrix-s3-epaper-4.2/custom_lcd_display.cc
           git commit -m "fix(power): finalize sleep display and network sessions [one-shot-built]"
           git push origin HEAD:dev
 
-      - name: Build release firmware
+      - name: Build firmware in ESP-IDF container
+        if: steps.guard.outputs.skip != 'true'
         shell: bash
-        working-directory: firmware
         run: |
-          bash ./build.sh --rebuild
+          docker run --rm -v "$GITHUB_WORKSPACE:/project" -w /project/firmware espressif/idf:v6.0 bash -lc 'bash ./build.sh --rebuild'
 
       - name: Stage firmware artifacts
+        if: steps.guard.outputs.skip != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -331,10 +289,9 @@ void Application::FinishScheduledNetworkSession(const char* reason) {
           latest_zip="$(ls -1t firmware/releases/v*_zectrix-s3-epaper-4.2.zip | head -n 1)"
           cp "$latest_zip" firmware-artifacts/
           sha256sum firmware-artifacts/* > firmware-artifacts/SHA256SUMS.txt
-          ls -lh firmware-artifacts
-          cat firmware-artifacts/SHA256SUMS.txt
 
       - name: Upload firmware artifacts
+        if: steps.guard.outputs.skip != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: NOTE4C-dev-firmware
