@@ -15,26 +15,25 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    container:
-      image: espressif/idf:v6.0
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Verify pinned ESP-IDF
+      - name: Build with pinned ESP-IDF v6.0
         shell: bash
         run: |
           set -euo pipefail
-          echo "IDF_PATH=${IDF_PATH:-}"
-          idf.py --version
-          grep -A3 '^  idf:$' firmware/dependencies.lock
-
-      - name: Build and package firmware
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 firmware/scripts/package.py --clean
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/project" \
+            -w /project \
+            espressif/idf:v6.0 \
+            bash -lc '
+              set -euo pipefail
+              idf.py --version
+              grep -A3 "^  idf:$" firmware/dependencies.lock
+              python3 firmware/scripts/package.py --clean
+            '
 
       - name: Stage artifacts
         shell: bash
