@@ -16,6 +16,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -178,25 +179,54 @@ def idf_python_version(tools: Path | None) -> str | None:
     return None
 
 
+def _python_version(exe: str | Path) -> str | None:
+    """Return an interpreter's major.minor version without importing project code."""
+    try:
+        probe = subprocess.run(
+            [str(exe), "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return probe.stdout.strip() if probe.returncode == 0 else None
+
+
 def find_python(version: str) -> Path | None:
-    """Directory whose ``python3`` is the requested version."""
+    """Directory whose ``python3`` is the requested version.
+
+    Never create the compatibility shim under ``firmware/build``. ``package.py
+    --clean`` calls ``idf.py fullclean`` immediately after environment
+    discovery, and ESP-IDF deliberately refuses to delete a pre-existing build
+    directory that is not already a CMake build tree. Putting the shim there
+    therefore made clean builds fail on Linux while succeeding on macOS where
+    the Homebrew path was found first.
+    """
+    current = shutil.which("python3")
+    if current and _python_version(current) == version:
+        return Path(current).resolve().parent
+
     candidates = [
         Path(f"/opt/homebrew/opt/python@{version}/libexec/bin"),  # unversioned names
         Path(f"/usr/local/opt/python@{version}/libexec/bin"),
     ]
     for path in candidates:
-        if (path / "python3").exists():
+        exe = path / "python3"
+        if exe.exists() and _python_version(exe) == version:
             return path
 
-    # Fall back to a versioned binary anywhere on PATH, via a shim directory.
+    # Fall back to a versioned binary anywhere on PATH. export.sh expects the
+    # executable to be named python3, so expose it through a temp-directory
+    # shim that cannot interfere with ESP-IDF's build-directory validation.
     exe = shutil.which(f"python{version}")
-    if exe:
-        shim = BUILD / ".idf-python-shim"
+    if exe and _python_version(exe) == version:
+        shim = Path(tempfile.gettempdir()) / f"note4c-idf-python-{version}"
         shim.mkdir(parents=True, exist_ok=True)
         link = shim / "python3"
         if link.is_symlink() or link.exists():
             link.unlink()
-        link.symlink_to(exe)
+        link.symlink_to(Path(exe).resolve())
         return shim
     return None
 
