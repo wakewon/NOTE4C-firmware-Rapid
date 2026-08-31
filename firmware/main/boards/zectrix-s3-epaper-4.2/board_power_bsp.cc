@@ -80,7 +80,7 @@ BoardPowerBsp::BoardPowerBsp(int epdPowerPin, int audioPowerPin, int audioAmpPin
     gpio_conf.pull_down_en  = GPIO_PULLDOWN_DISABLE;
     gpio_conf.pull_up_en    = GPIO_PULLUP_ENABLE;
     ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_config(&gpio_conf));
-    xTaskCreatePinnedToCore(PowerLedTask, "PowerLedTask", 3 * 1024, this, 2, NULL, 0);
+    xTaskCreatePinnedToCore(PowerLedTask, "PowerLedTask", 3 * 1024, this, 2, &led_task_, 0);
 }
 
 BoardPowerBsp::~BoardPowerBsp() {
@@ -142,4 +142,18 @@ void BoardPowerBsp::SetFactoryLedOverride(bool enabled, bool blink) {
 
 void BoardPowerBsp::FlashActivityLed() {
     led_activity_pulses_.store(1, std::memory_order_relaxed);
+}
+
+void BoardPowerBsp::PrepareForDeepSleep() {
+    if (led_task_ != nullptr) {
+        TaskHandle_t task = led_task_;
+        led_task_ = nullptr;
+        vTaskDelete(task);
+    }
+    gpio_hold_dis(GPIO_NUM_3);
+    gpio_set_level(GPIO_NUM_3, 1);
+    gpio_hold_en(GPIO_NUM_3);
+    PowerAmpOff();
+    PowerAudioOff();
+    PowerEpdOff();
 }

@@ -4,7 +4,7 @@
  */
 
 #include "ap_transfer_server.h"
-#include "boards/zectrix-s3-epaper-4.2/config.h"
+#include "application.h"
 #include "common/photo_storage.h"
 #include "settings.h"
 #include "wifi_manager.h"
@@ -16,7 +16,6 @@
 #include <esp_mac.h>
 #include <esp_timer.h>
 #include <esp_err.h>
-#include <esp_sleep.h>
 #include <lwip/ip_addr.h>
 #include <cJSON.h>
 
@@ -56,7 +55,7 @@ const char kUploadHtml[] = R"HTML(
 *{box-sizing:border-box}body{margin:0;background:#ece8dc;color:#171717;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:12px}.app{max-width:520px;margin:0 auto;padding:10px}.top{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}.brand{font-weight:800;font-size:16px}.pill{border:1px solid #111;background:#ffd900;border-radius:3px;padding:3px 6px;font-size:11px}.panel{background:#fff;border:2px solid #111;border-radius:6px;box-shadow:3px 3px 0 #111;margin-bottom:10px;padding:9px}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.muted{color:#555}.btn{border:2px solid #111;background:#ff3b30;color:#fff;border-radius:5px;padding:8px 10px;font-weight:800;font-size:12px;box-shadow:2px 2px 0 #111}.btn.secondary{background:#fff;color:#111}.btn.yellow{background:#ffd900;color:#111}.btn.danger{background:#111;color:#fff}.btn.icon{width:32px;height:32px;border-radius:50%;padding:0;font-size:18px;line-height:1}.btn:disabled{opacity:.45}.file{position:absolute;left:-9999px}.radio{display:inline-flex;gap:5px;align-items:center;border:1px solid #111;border-radius:4px;padding:5px 7px;background:#fafafa}.radio input{margin:0}.preview{width:100%;aspect-ratio:4/3;border:2px solid #111;background:#fff;image-rendering:pixelated;margin-top:8px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.card{border:2px solid #111;border-radius:5px;background:#fff;overflow:hidden;position:relative}.thumb{width:100%;aspect-ratio:4/3;background:#f8f8f8;display:block;image-rendering:pixelated}.meta{padding:6px}.title{font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.body{font-size:11px;color:#444;line-height:1.35;height:30px;overflow:hidden}.check{position:absolute;top:5px;left:5px;width:20px;height:20px}.tag{position:absolute;top:5px;right:5px;background:#ffd900;border:1px solid #111;border-radius:3px;padding:2px 4px;font-size:10px}.bar{display:flex;align-items:center;justify-content:space-between;gap:6px;margin:8px 0}.status{min-height:18px;color:#333}.note{border:2px solid #111;background:#fffbe6;border-radius:6px;padding:9px;margin-bottom:10px;box-shadow:3px 3px 0 #111}.note ul{margin:6px 0 0 18px;padding:0;line-height:1.55}.modal{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;align-items:center;justify-content:center;padding:12px}.modal.open{display:flex}.dialog{max-width:520px;width:100%;background:#fff;border:2px solid #111;border-radius:7px;box-shadow:4px 4px 0 #111;position:relative;padding:10px}.close{position:absolute;right:8px;top:8px;border:2px solid #111;background:#fff;border-radius:50%;width:28px;height:28px;font-weight:900}.big{width:100%;aspect-ratio:4/3;border:2px solid #111;image-rendering:pixelated}.empty{padding:18px;text-align:center;border:1px dashed #999;background:#fafafa}.split{display:grid;grid-template-columns:1fr;gap:8px}@media(min-width:460px){.split{grid-template-columns:190px 1fr}.grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
 </style></head><body><main class="app">
 <div class="top"><div><div class="brand">墨水屏传图</div><div class="muted" id="endpoint">读取服务地址...</div></div><div class="row"><button class="btn secondary" id="settingsBtn">设置</button><button class="btn secondary icon" id="helpBtn">!</button><div class="pill">400x300</div></div></div>
-<section class="note" id="helpPanel" style="display:none"><b>功能说明</b><ul><li>支持 1 BP 黑白和 2 BP 四色图片上传，保存后可在设备相册查看。</li><li>轮播关闭后，大图会固定停在当前图片；开启后，设备在相册大图模式按周期自动切换。</li><li>局域网服务开启时，页面顶部会显示设备本地 IP，可用手机或 NAS/本地 server 管理图片。</li><li>关闭服务只停止本地传图网页；关闭并省电会停止服务和 WiFi，进入 deep sleep，按 BOOT 唤醒。</li><li>极致省电建议：选好大图，关闭轮播，再执行关闭并省电，墨水屏会保留最后画面。</li></ul></section>
+<section class="note" id="helpPanel" style="display:none"><b>功能说明</b><ul><li>支持 1 BP 黑白和 2 BP 四色图片上传，保存后可在设备相册查看。</li><li>轮播关闭后，大图会固定停在当前图片；开启后，设备在相册大图模式按周期自动切换。</li><li>局域网服务开启时，页面顶部会显示设备本地 IP，可用手机或 NAS/本地 server 管理图片。</li><li>关闭服务只停止本地传图网页；关闭并省电会停止服务和 WiFi，进入 deep sleep，可按 BOOT/下键或插入 USB 唤醒。</li><li>极致省电建议：选好大图，关闭轮播，再执行关闭并省电，墨水屏会保留最后画面。</li></ul></section>
 <section class="panel split"><div><div class="title">发送图片</div><p class="muted">默认使用实测面板选定的 09k 四色转换。</p><div class="row"><label class="radio"><input name="fmt" type="radio" value="bwry2bpp" checked>2 BP 四色 · 09k</label><label class="radio"><input name="fmt" type="radio" value="1bpp">1 BP 黑白</label></div><div class="row" style="margin-top:8px"><button class="btn yellow" id="pick">选择图片</button><button class="btn" id="send" disabled>发送</button></div><input class="file" id="file" type="file" accept="image/*"><div class="status" id="status">等待选择</div></div><div><canvas class="preview" id="preview" width="400" height="300"></canvas></div></section>
 <section class="panel" id="settingsPanel" style="display:none"><div class="bar"><b>相册轮播周期</b><span class="muted" id="settingsState"></span></div><div class="row"><label class="radio"><input name="slide" type="radio" value="0">关闭</label><label class="radio"><input name="slide" type="radio" value="5">5min</label><label class="radio"><input name="slide" type="radio" value="10">10min</label><label class="radio"><input name="slide" type="radio" value="30">30min</label><button class="btn yellow" id="saveSettings">保存设置</button><button class="btn secondary" id="stopService">关闭服务</button><button class="btn danger" id="sleepNow">关闭并省电</button></div></section>
 <section class="panel"><div class="bar"><div><b>设备图片</b> <span class="muted" id="count"></span></div><div class="row"><button class="btn secondary" id="reload">刷新</button><button class="btn danger" id="batch" disabled>删除选中</button></div></div><div id="photos" class="grid"><div class="empty">读取中...</div></div></section>
@@ -161,15 +160,14 @@ void DeferredControlTask(void* arg) {
     if (request->server) {
         request->server->Stop();
     }
-    if (request->stop_wifi || request->enter_sleep) {
+    if (request->stop_wifi && !request->enter_sleep) {
         ESP_LOGI(kTag, "Stopping WiFi after web control request");
         esp_wifi_disconnect();
         esp_wifi_stop();
     }
     if (request->enter_sleep) {
-        ESP_LOGI(kTag, "Entering deep sleep after web control request");
-        esp_sleep_enable_ext0_wakeup(static_cast<gpio_num_t>(BOOT_BUTTON_GPIO), 0);
-        esp_deep_sleep_start();
+        ESP_LOGI(kTag, "Queuing unified low-power sleep after web control request");
+        Application::GetInstance().RequestManualSleep(request->stop_wifi);
     }
     delete request;
     vTaskDelete(nullptr);

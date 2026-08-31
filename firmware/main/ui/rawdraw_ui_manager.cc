@@ -346,7 +346,8 @@ RawDrawUiManager::~RawDrawUiManager() {
 // Initialization
 // ============================================================
 
-void RawDrawUiManager::Init(CustomLcdDisplay* lcd, RefreshCallback refresh_cb) {
+void RawDrawUiManager::Init(CustomLcdDisplay* lcd, RefreshCallback refresh_cb,
+                            bool defer_initial_refresh) {
     if (!lcd) {
         ESP_LOGE(kTag, "LCD display pointer is null");
         return;
@@ -428,8 +429,12 @@ void RawDrawUiManager::Init(CustomLcdDisplay* lcd, RefreshCallback refresh_cb) {
         // Establish a known full-color baseline at boot. Later page changes,
         // cursor moves and button-driven updates go through the FAST_BW
         // callback and arm the idle recovery timer.
-        ESP_LOGI(kTag, "[FULL_COLOR] request source=boot_baseline");
-        lcd_->RequestUrgentFullRefresh();
+        if (defer_initial_refresh) {
+            ESP_LOGI(kTag, "Boot baseline rendered but physical refresh deferred");
+        } else {
+            ESP_LOGI(kTag, "[FULL_COLOR] request source=boot_baseline");
+            lcd_->RequestUrgentFullRefresh();
+        }
     }
 
     ESP_LOGI(kTag, "RawDraw UI Manager initialized: %dx%d, page=%s",
@@ -926,9 +931,9 @@ void RawDrawUiManager::RenderAll(uint8_t* fb, int width, int height) {
         renderer->Render(fb, width, height);
     }
 
-    // Fullscreen gallery is intentionally chrome-free: BOOT opens the selected
-    // photo as a pure image view with no header/frame. The normal memory-card
-    // gallery page still keeps the global shell with title/status bar.
+    // Match the original firmware: fullscreen gallery is completely
+    // chrome-free, including no battery overlay. Battery remains available on
+    // every page which has the normal status bar.
     if (!gallery_fullscreen && !ebook_portrait_reader && !chrome_free_page) {
         // Status bar is drawn after page content so page renderers cannot
         // accidentally paint into the top menu area.
@@ -1342,7 +1347,13 @@ void RawDrawUiManager::RequestFullRefresh() {
     full_refresh_pending_ = true;
 }
 
-void RawDrawUiManager::RequestActivePageRefresh() {
+void RawDrawUiManager::RequestActivePageRefresh(RefreshIntent intent) {
+    if (intent == RefreshIntent::FullColor) {
+        active_page_full_refresh_pending_.store(true, std::memory_order_release);
+    } else {
+        active_page_fast_refresh_intent_.store(static_cast<int>(intent),
+                                               std::memory_order_release);
+    }
     active_page_refresh_pending_.store(true, std::memory_order_release);
 }
 
@@ -1379,9 +1390,76 @@ void RawDrawUiManager::SetGallerySlideshowIntervalMinutes(int minutes) {
     }
 }
 
+void RawDrawUiManager::SetLowPowerSlideshowMode(bool enabled) {
+    low_power_slideshow_mode_ = enabled;
+    gallery_slideshow_pending_.store(false, std::memory_order_release);
+    ArmGallerySlideshowTimer();
+    ESP_LOGI(kTag, "Low-power slideshow scheduling: %s",
+             enabled ? "deep-sleep wakeup" : "runtime timer");
+}
+
+bool RawDrawUiManager::PrepareGallerySlideshowFrame(int retained_index, bool advance) {
+    if (!photo_gallery_renderer_ || photo_gallery_renderer_->GetPhotoCount() <= 0) {
+        return false;
+    }
+    current_page_ = RawDrawPageId::Gallery;
+    photo_gallery_renderer_->SetSelectedIndex(retained_index);
+    if (!photo_gallery_renderer_->EnterFullscreenMode()) {
+        return false;
+    }
+    if (advance) {
+        photo_gallery_renderer_->SelectNext(true);
+    }
+    status_bar_data_.page_title = GetPageTitle(current_page_);
+    RefreshActivePage(RefreshIntent::FullColor);
+    return true;
+}
+
+bool RawDrawUiManager::PrepareGalleryInteractiveWakeFrame(
+    int retained_index, bool retained_fullscreen,
+    const rawdraw::ButtonEvent& wake_event) {
+    if (!photo_gallery_renderer_) {
+        return false;
+    }
+    current_page_ = RawDrawPageId::Gallery;
+    photo_gallery_renderer_->SetSelectedIndex(retained_index);
+    if (retained_fullscreen &&
+        !photo_gallery_renderer_->EnterFullscreenMode()) {
+        ESP_LOGW(kTag, "Could not restore retained fullscreen photo");
+    }
+
+    // Apply the wake key to the state which was actually visible before
+    // sleeping, then issue one full-color baseline refresh for the final
+    // result. This avoids first drawing the default gallery and then making
+    // the wake key appear to merely repaint the same photo.
+    const bool handled = photo_gallery_renderer_->HandleInput(wake_event);
+    status_bar_data_.page_title = GetPageTitle(current_page_);
+    RefreshActivePage(RefreshIntent::FullColor);
+    ResetGallerySlideshowTimer();
+    ESP_LOGI(kTag,
+             "Interactive wake frame: selected=%d retained_fullscreen=%d key=%d handled=%d",
+             photo_gallery_renderer_->GetSelectedIndex(),
+             retained_fullscreen ? 1 : 0, static_cast<int>(wake_event.type),
+             handled ? 1 : 0);
+    return true;
+}
+
+int RawDrawUiManager::GetGallerySelectedIndex() const {
+    return photo_gallery_renderer_ ? photo_gallery_renderer_->GetSelectedIndex() : 0;
+}
+
+bool RawDrawUiManager::IsGalleryFullscreen() const {
+    return photo_gallery_renderer_ &&
+           photo_gallery_renderer_->IsFullscreenMode();
+}
+
 void RawDrawUiManager::ArmGallerySlideshowTimer() {
     if (gallery_slideshow_timer_ == nullptr) return;
     esp_timer_stop(gallery_slideshow_timer_);
+    if (low_power_slideshow_mode_) {
+        gallery_slideshow_deadline_us_.store(0, std::memory_order_release);
+        return;
+    }
     if (gallery_slideshow_interval_minutes_ <= 0) {
         gallery_slideshow_deadline_us_.store(0, std::memory_order_release);
         return;
@@ -1573,16 +1651,34 @@ void RawDrawUiManager::PumpClockRefresh() {
             ResetGallerySlideshowTimer();
         }
     }
-    const bool page_pending = active_page_refresh_pending_.exchange(false, std::memory_order_acq_rel);
+    const bool page_pending =
+        active_page_refresh_pending_.exchange(false, std::memory_order_acq_rel);
+    RefreshIntent page_intent = RefreshIntent::FastBwDeferredInteraction;
+    if (page_pending) {
+        const bool full_pending =
+            active_page_full_refresh_pending_.exchange(false,
+                                                       std::memory_order_acq_rel);
+        if (full_pending) {
+            page_intent = RefreshIntent::FullColor;
+            active_page_fast_refresh_intent_.store(
+                static_cast<int>(RefreshIntent::FastBwDeferredInteraction),
+                std::memory_order_release);
+        } else {
+            page_intent = static_cast<RefreshIntent>(
+                active_page_fast_refresh_intent_.exchange(
+                    static_cast<int>(RefreshIntent::FastBwDeferredInteraction),
+                    std::memory_order_acq_rel));
+        }
+    }
     const bool transient_pending = transient_refresh_pending_.exchange(false, std::memory_order_acq_rel);
     const bool slideshow_pending = gallery_slideshow_pending_.exchange(false, std::memory_order_acq_rel);
     if (slideshow_pending) {
         AdvanceGallerySlideshow();
     }
     if (page_pending || transient_pending || gallery_page_changed) {
-        const RefreshIntent intent = (page_pending || transient_pending)
+        const RefreshIntent intent = transient_pending
             ? RefreshIntent::FullColor
-            : gallery_refresh_intent;
+            : (page_pending ? page_intent : gallery_refresh_intent);
         RefreshActivePage(intent);
     }
 

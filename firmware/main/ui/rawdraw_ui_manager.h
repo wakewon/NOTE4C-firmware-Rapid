@@ -139,7 +139,8 @@ public:
      * @param lcd Pointer to CustomLcdDisplay for framebuffer access
      * @param refresh_cb Optional callback to trigger EPD refresh after rendering
      */
-    void Init(CustomLcdDisplay* lcd, RefreshCallback refresh_cb = nullptr);
+    void Init(CustomLcdDisplay* lcd, RefreshCallback refresh_cb = nullptr,
+              bool defer_initial_refresh = false);
     void SetPageSwitchCallback(PageSwitchCallback callback) { page_switch_cb_ = std::move(callback); }
 
     /**
@@ -371,9 +372,17 @@ public:
      *
      * Use this from callbacks that may run outside LanMicApp::Run().
      */
-    void RequestActivePageRefresh();
+    void RequestActivePageRefresh(
+        RefreshIntent intent = RefreshIntent::FullColor);
     void SetGallerySlideshowIntervalMinutes(int minutes);
     int GetGallerySlideshowIntervalMinutes() const { return gallery_slideshow_interval_minutes_; }
+    void SetLowPowerSlideshowMode(bool enabled);
+    bool PrepareGallerySlideshowFrame(int retained_index, bool advance);
+    bool PrepareGalleryInteractiveWakeFrame(
+        int retained_index, bool retained_fullscreen,
+        const rawdraw::ButtonEvent& wake_event);
+    int GetGallerySelectedIndex() const;
+    bool IsGalleryFullscreen() const;
     bool ShowPhotoById(const std::string& photo_id);
 
     /**
@@ -481,12 +490,16 @@ private:
     std::atomic<bool> clock_refresh_pending_{false};
     std::atomic<bool> transient_refresh_pending_{false};
     std::atomic<bool> active_page_refresh_pending_{false};
+    std::atomic<bool> active_page_full_refresh_pending_{false};
+    std::atomic<int> active_page_fast_refresh_intent_{
+        static_cast<int>(RefreshIntent::FastBwDeferredInteraction)};
     std::atomic<bool> gallery_storage_sync_pending_{false};
     std::atomic<bool> gallery_slideshow_pending_{false};
     std::atomic<int64_t> gallery_slideshow_deadline_us_{0};
     std::atomic<bool> input_refresh_locked_{false};
     int last_clock_minute_key_ = -1;
     int gallery_slideshow_interval_minutes_ = 0;
+    bool low_power_slideshow_mode_ = false;
     std::mutex gallery_storage_sync_mutex_;
     std::string gallery_preferred_photo_id_;
     std::string gallery_show_photo_id_;

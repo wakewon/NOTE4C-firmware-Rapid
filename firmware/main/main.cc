@@ -35,6 +35,9 @@ static void LogNvsStats() {
 
 extern "C" void app_main(void)
 {
+    // Release the global deep-sleep hold before the board BSP reconfigures its
+    // retained output rails for this wake cycle.
+    gpio_deep_sleep_hold_dis();
     // Some soft/external reset paths leave the Wi-Fi RF state dirty until the
     // next hardware-equivalent reset. For those reset reasons only, perform a
     // brief deep-sleep round-trip once to come back with clean radio state.

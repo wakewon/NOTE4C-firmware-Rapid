@@ -292,22 +292,24 @@ CustomLcdDisplay::CustomLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_p
 #endif
     }
 
-    ESP_LOGI(TAG, "EPD init");
+#if CONFIG_ZECTRIX_EPD_4COLOR_BOOT_TEST_PATTERN
+    ESP_LOGI(TAG, "EPD boot test pattern");
     EPD_Init();
-
-    // buffer init
     EPD_Clear();
     memcpy(prev_buffer, buffer, lcd_spi_data.buffer_len);
-#if CONFIG_ZECTRIX_EPD_4COLOR_BOOT_TEST_PATTERN
     if (IsFourColorPanel()) {
         EPD_DisplayFourColorTestPattern();
     } else {
         EPD_Display();
     }
-#else
-    EPD_Display();
-#endif
     prev_buffer_synced = true;
+#else
+    // Do not erase and refresh the physical panel here. RawDraw renders the
+    // real first frame immediately after board construction; letting that be
+    // the first waveform removes one ~23 s full-color refresh from every wake.
+    ESP_LOGI(TAG, "EPD physical boot refresh deferred until first UI frame");
+    prev_buffer_synced = false;
+#endif
     if (IsFourColorPanel()) {
         last_sample_tick = xTaskGetTickCount();
     }

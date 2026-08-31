@@ -150,13 +150,9 @@ public:
             }
         });
 
-        if (SsidManager::GetInstance().GetSsidList().empty()) {
-            ESP_LOGW(kTag, "No saved WiFi credentials, starting config AP");
-            WifiManager::GetInstance().StartConfigAp();
-        } else {
-            WifiManager::GetInstance().StartStation();
-        }
-
+        // Initialization is deliberately radio-idle. Station mode is started
+        // only for an explicit UI request or a due periodic synchronization;
+        // config AP is started only by the UP+DOWN long-press gesture.
         network_started_ = true;
     }
 
@@ -234,6 +230,11 @@ public:
         return charge_status_.Get();
     }
 
+    bool IsExternalPowerPresent() {
+        charge_status_.Tick(GetNowMs());
+        return charge_status_.Get().power_present;
+    }
+
     bool ReadBatteryPercentForFactoryTest(int* level) {
         if (level == nullptr) {
             return false;
@@ -255,6 +256,15 @@ public:
     void FlashActivityLed() override {
         if (power_ != nullptr) {
             power_->FlashActivityLed();
+        }
+    }
+
+    void PrepareForDeepSleep() {
+        if (nfc_ != nullptr) {
+            nfc_->PowerOff();
+        }
+        if (power_ != nullptr) {
+            power_->PrepareForDeepSleep();
         }
     }
 
@@ -447,6 +457,10 @@ private:
         // CONFIRM (BOOT) short press → forward to factory test (or PTT)
         confirm_button_.OnClick([]() {
             auto& app = Application::GetInstance();
+            if (!app.IsInputReady()) {
+                ESP_LOGI(kTag, "BOOT release ignored while wake action is being restored");
+                return;
+            }
             if (app.GetRawDrawUiManager()) {
                 app.OnBootClick();
                 return;
@@ -457,6 +471,9 @@ private:
         // CONFIRM (BOOT) long press → voice PTT or factory test
         confirm_button_.OnLongPress([]() {
             auto& app = Application::GetInstance();
+            if (!app.IsInputReady()) {
+                return;
+            }
             if (app.GetRawDrawUiManager()) {
                 app.OnBootLongPress();
                 return;
@@ -590,6 +607,11 @@ extern "C" ChargeStatus::Snapshot ZectrixRefreshChargeSnapshotForFactoryTest() {
     return board.RefreshChargeSnapshotForFactoryTest();
 }
 
+extern "C" bool ZectrixIsExternalPowerPresent() {
+    auto& board = static_cast<CustomBoard&>(Board::GetInstance());
+    return board.IsExternalPowerPresent();
+}
+
 extern "C" bool ZectrixReadBatteryPercentForFactoryTest(int* level) {
     auto& board = static_cast<CustomBoard&>(Board::GetInstance());
     return board.ReadBatteryPercentForFactoryTest(level);
@@ -603,4 +625,9 @@ extern "C" void ZectrixSetFactoryLedOverride(bool enabled, bool blink) {
 extern "C" ZectrixNfc* ZectrixGetNfc() {
     auto& board = static_cast<CustomBoard&>(Board::GetInstance());
     return board.GetNfc();
+}
+
+extern "C" void ZectrixPrepareForDeepSleep() {
+    auto& board = static_cast<CustomBoard&>(Board::GetInstance());
+    board.PrepareForDeepSleep();
 }
