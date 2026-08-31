@@ -20,6 +20,7 @@ standalone one.
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import subprocess
 import sys
@@ -40,6 +41,8 @@ from espimage import (  # noqa: E402
 
 MERGED = BUILD / "merged-binary.bin"
 APP = BUILD / "xiaozhi.bin"
+TARGET = "esp32s3"
+SDKCONFIG = FIRMWARE / "sdkconfig"
 
 
 def check_idf_usable(idf: Path, tools: Path | None) -> None:
@@ -64,6 +67,18 @@ def check_idf_usable(idf: Path, tools: Path | None) -> None:
         + f"Install the toolchain first (this downloads several GB):\n"
         f"  {idf}/install.sh esp32s3"
     )
+
+
+def sdkconfig_target() -> str | None:
+    """Return the target recorded in sdkconfig, if one exists."""
+    if not SDKCONFIG.exists():
+        return None
+    match = re.search(
+        r'^CONFIG_IDF_TARGET="([^"]+)"$',
+        SDKCONFIG.read_text(encoding="utf-8", errors="ignore"),
+        re.MULTILINE,
+    )
+    return match.group(1) if match else None
 
 
 def run_in_idf(idf: Path, tools: Path | None, commands: list[str], quiet: bool) -> int:
@@ -107,11 +122,19 @@ def main() -> int:
     print(f"  tools: {tools if tools else '(default ~/.espressif)'}")
     check_idf_usable(idf, tools)
 
+    current_target = sdkconfig_target()
     commands = []
     if args.clean:
         commands.append("idf.py fullclean")
+    if current_target != TARGET:
+        # A developer workstation usually has an ignored sdkconfig that already
+        # records esp32s3. A clean CI checkout has none, and ESP-IDF otherwise
+        # silently defaults to esp32. Pin the NOTE4C hardware target here rather
+        # than requiring a machine-local sdkconfig to make the build correct.
+        commands.append(f"idf.py set-target {TARGET}")
     commands += ["idf.py build", "idf.py merge-bin"]
 
+    print(f"  target: {TARGET}" + (f" (sdkconfig had {current_target})" if current_target else " (fresh sdkconfig)"))
     started = time.time()
     rc = run_in_idf(idf, tools, commands, args.quiet)
     if rc != 0:
