@@ -10,6 +10,7 @@
 #include <freertos/task.h>
 
 #include "application.h"
+#include "common/display_stall_guard.h"
 #include "system_info.h"
 
 #define TAG "main"
@@ -38,17 +39,28 @@ extern "C" void app_main(void)
     // Release the global deep-sleep hold before the board BSP reconfigures its
     // retained output rails for this wake cycle.
     gpio_deep_sleep_hold_dis();
+
+    // Display-stall recovery deliberately uses esp_restart(). Consume its RTC
+    // marker before the generic software-reset workaround below so this boot is
+    // treated as an interactive recovery, not bounced through a timer wake and
+    // mistaken for another scheduled slideshow cycle.
+    const bool display_stall_recovery_boot = ConsumeDisplayStallRecoveryBoot();
+
     // Some soft/external reset paths leave the Wi-Fi RF state dirty until the
     // next hardware-equivalent reset. For those reset reasons only, perform a
     // brief deep-sleep round-trip once to come back with clean radio state.
     {
         const auto reason = esp_reset_reason();
-        ESP_LOGI(TAG, "Boot reset reason=%d bounced=%d", reason, s_sw_reset_bounced ? 1 : 0);
+        ESP_LOGI(TAG, "Boot reset reason=%d bounced=%d display_stall_recovery=%d",
+                 reason, s_sw_reset_bounced ? 1 : 0,
+                 display_stall_recovery_boot ? 1 : 0);
         // Keep this narrowly scoped. External reset after flashing should boot
         // like a normal hardware reset; bouncing that path through deep sleep
         // has proven flaky on this board. Only software-reset paths still get
-        // the one-shot deep-sleep bounce.
-        const bool need_bounce = !s_sw_reset_bounced &&
+        // the one-shot deep-sleep bounce. A display-stall recovery skips the
+        // bounce so the device returns to an input-ready interactive boot.
+        const bool need_bounce = !display_stall_recovery_boot &&
+                                 !s_sw_reset_bounced &&
                                  (reason == ESP_RST_SW);
         if (need_bounce) {
             ESP_LOGI(TAG, "Reset reason %d — bouncing via deep sleep for clean Wi-Fi init", reason);
@@ -71,5 +83,6 @@ extern "C" void app_main(void)
 
     auto& app = Application::GetInstance();
     app.Initialize();
+    StartDisplayStallGuard();
     app.Run();  // This function runs the main event loop and never returns
 }

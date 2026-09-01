@@ -17,6 +17,7 @@ set(SOURCES
     "display/lvgl_display/lvgl_theme.cc"
     "display/lvgl_display/lvgl_font.cc"
     "common/sleep_manager.cc"
+    "common/display_stall_guard.cc"
     "boards/common/board.cc"
     "boards/common/button.cc"
     "boards/common/i2c_bus_lock.cc"
