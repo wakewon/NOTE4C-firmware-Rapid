@@ -82,7 +82,11 @@ extern "C" void app_main(void)
     LogNvsStats();
 
     auto& app = Application::GetInstance();
-    app.Initialize();
+    // Arm liveness protection before constructing board peripherals.  The
+    // guard uses only atomically published state, so it can also recover an
+    // initialization deadlock instead of starting too late to observe it.
+    RuntimeGuardNoteProgress(RuntimeGuardPhase::Initializing);
     StartDisplayStallGuard();
+    app.Initialize();
     app.Run();  // This function runs the main event loop and never returns
 }

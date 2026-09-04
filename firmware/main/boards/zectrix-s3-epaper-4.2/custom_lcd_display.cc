@@ -406,6 +406,7 @@ void CustomLcdDisplay::UpdateDisplayBusyLocked() {
     const bool busy = pending || urgent_refresh || force_full_refresh_ ||
                       fast_bw_refresh_requested_ || idle_full_refresh_pending_ ||
                       refresh_in_progress;
+    refresh_pending_snapshot_.store(busy, std::memory_order_release);
     sm_set_busy(SleepBusySrc::Display, busy);
 }
 
@@ -424,17 +425,8 @@ bool CustomLcdDisplay::CheckRefreshIdleLocked() {
     return true;
 }
 
-bool CustomLcdDisplay::IsRefreshPending() {
-    if (dirty_mutex) {
-        xSemaphoreTake(dirty_mutex, portMAX_DELAY);
-    }
-    const bool busy = pending || urgent_refresh || force_full_refresh_ ||
-                      fast_bw_refresh_requested_ || idle_full_refresh_pending_ ||
-                      refresh_in_progress;
-    if (dirty_mutex) {
-        xSemaphoreGive(dirty_mutex);
-    }
-    return busy;
+bool CustomLcdDisplay::IsRefreshPending() const {
+    return refresh_pending_snapshot_.load(std::memory_order_acquire);
 }
 
 bool CustomLcdDisplay::NeedsFullColorRecovery() {
@@ -763,6 +755,22 @@ void CustomLcdDisplay::refresh_task_loop() {
             if (elapsed < min_ticks) {
                 stat_skip_throttle++;
                 maybe_log_stats(now);
+                // Work was harvested from the shared flags above.  Put it back
+                // before waiting; dropping the local request here used to lose
+                // its refresh intent and could leave refresh_in_progress stuck
+                // true with no notification capable of completing it.
+                xSemaphoreTake(dirty_mutex, portMAX_DELAY);
+                if (rect_area(r) > 0) {
+                    dirty = rect_union(dirty, r);
+                    pending = true;
+                }
+                urgent_refresh = urgent_refresh || urgent;
+                force_full_refresh_ = force_full_refresh_ || force_full;
+                fast_bw_refresh_requested_ = fast_bw_refresh_requested_ || fast_bw;
+                idle_full_refresh_pending_ = idle_full_refresh_pending_ || idle_full;
+                refresh_in_progress = false;
+                UpdateDisplayBusyLocked();
+                xSemaphoreGive(dirty_mutex);
                 // Avoid spinning when notifications arrive too frequently.
                 TickType_t wait_ticks = min_ticks - elapsed;
                 vTaskDelay(wait_ticks > 0 ? wait_ticks : 1);
@@ -860,6 +868,20 @@ void CustomLcdDisplay::refresh_task_loop() {
                          tiny_diff_streak, (unsigned)tiny_diff_accum_bits);
                 stat_skip_tiny++;
                 maybe_log_stats(last_sample_tick);
+                // Keep the dirty work explicit while accumulating tiny changes.
+                // Previously the retry depended on refresh_in_progress staying
+                // true after all actual work flags had been consumed, which was
+                // both fragile and indistinguishable from a genuine stall.
+                xSemaphoreTake(dirty_mutex, portMAX_DELAY);
+                if (rect_area(r) > 0) {
+                    dirty = rect_union(dirty, r);
+                    pending = true;
+                }
+                urgent_refresh = urgent_refresh || urgent;
+                fast_bw_refresh_requested_ = fast_bw_refresh_requested_ || fast_bw;
+                refresh_in_progress = false;
+                UpdateDisplayBusyLocked();
+                xSemaphoreGive(dirty_mutex);
                 vTaskDelay(1);
                 continue;
             }
@@ -1004,6 +1026,9 @@ void CustomLcdDisplay::spi_gpio_init() {
     int dc   = lcd_spi_data.dc;
     int busy = lcd_spi_data.busy;
 
+    // A previous deep-sleep cycle deliberately retained reset low while panel
+    // power was off. Release that per-pin hold before reconfiguring the bus.
+    gpio_hold_dis(static_cast<gpio_num_t>(rst));
     gpio_config_t gpio_conf = {};
     gpio_conf.intr_type     = GPIO_INTR_DISABLE;
     gpio_conf.mode          = GPIO_MODE_OUTPUT;

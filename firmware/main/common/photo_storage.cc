@@ -52,6 +52,16 @@ static std::recursive_mutex s_storage_mutex;
 static int save_index(void);
 static int write_meta_file(const PhotoInfo* info);
 
+static void terminate_photo_info_strings(PhotoInfo* info) {
+    if (!info) return;
+    info->id[sizeof(info->id) - 1] = '\0';
+    info->title[sizeof(info->title) - 1] = '\0';
+    info->date[sizeof(info->date) - 1] = '\0';
+    info->location[sizeof(info->location) - 1] = '\0';
+    info->body[sizeof(info->body) - 1] = '\0';
+    info->path[sizeof(info->path) - 1] = '\0';
+}
+
 static bool is_digits_string(const char* value) {
     if (!value || value[0] == '\0') return false;
     for (const char* p = value; *p; ++p) {
@@ -119,13 +129,13 @@ static bool load_meta_file(const char* meta_path, PhotoInfo* out_info) {
     fseek(f, 0, SEEK_END);
     long len = ftell(f);
     fseek(f, 0, SEEK_SET);
-    if (len <= 0 || len > 4096) {
+    char json_buf[4096];
+    if (len <= 0 || static_cast<size_t>(len) >= sizeof(json_buf)) {
         fclose(f);
         ESP_LOGW(kTag, "Invalid meta file size: %s", meta_path);
         return false;
     }
 
-    char json_buf[4096];
     size_t read_len = fread(json_buf, 1, static_cast<size_t>(len), f);
     fclose(f);
     if (read_len != static_cast<size_t>(len)) {
@@ -342,6 +352,10 @@ static int load_index(void) {
             index_changed = true;
             continue;
         }
+        // The index lives in writable flash and can be truncated/corrupted by
+        // an interrupted update. Never pass unterminated persisted fields to
+        // strcmp/stat/logging routines.
+        terminate_photo_info_strings(&info);
         if (info.id[0] == '\0' || info.path[0] == '\0' ||
             !photo_file_available(info)) {
             ESP_LOGW(kTag, "Pruning unavailable photo from index: %s",
@@ -452,6 +466,7 @@ int photo_save(const PhotoInfo *info, const uint8_t *data_1bpp) {
         entry = &s_photos[s_photo_count];
     }
     memcpy(entry, info, sizeof(PhotoInfo));
+    terminate_photo_info_strings(entry);
     strncpy(entry->path, bin_path, PHOTO_MAX_PATH - 1);
     entry->path[PHOTO_MAX_PATH - 1] = '\0';
     apply_default_metadata(entry);

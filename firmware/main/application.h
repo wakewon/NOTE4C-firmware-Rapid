@@ -5,7 +5,10 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <string>
 #include <string_view>
+#include <vector>
 
 #include "audio_service.h"
 #include "device_state.h"
@@ -13,6 +16,8 @@
 namespace ui {
 class RawDrawUiManager;
 }
+
+enum class NetworkEvent;
 
 class Application {
 public:
@@ -75,6 +80,7 @@ private:
     uint32_t scheduled_network_jobs_pending_ = 0;
     static constexpr uint32_t kScheduledNetworkJobTimeSync = 1u << 0;
     std::atomic<bool> manual_sleep_requested_{false};
+    std::atomic<bool> sntp_sync_pending_{false};
     int slideshow_interval_minutes_ = 0;
     int network_sync_interval_minutes_ = 0;
     int64_t network_sync_deadline_us_ = 0;
@@ -91,6 +97,8 @@ private:
     };
     SleepPhase sleep_phase_ = SleepPhase::Awake;
     const char* pending_sleep_reason_ = nullptr;
+    std::mutex scheduled_callbacks_mutex_;
+    std::vector<std::function<void()>> scheduled_callbacks_;
 
     void EnsureNetworkInitialized();
     void StartInteractiveWifiAttempt();
@@ -103,6 +111,9 @@ private:
     void EnterManualSleep();
     void NoteButtonActivity();
     void EnterWifiConfigMode();
+    void DrainScheduledCallbacks();
+    void HandleNetworkEvent(NetworkEvent event, const std::string& data);
+    void HandleSntpSynchronized();
     void UpdateStatusBarForUi(bool request_refresh, bool fast_refresh);
 
     // Held for the duration of a button handler. Every path reachable from one

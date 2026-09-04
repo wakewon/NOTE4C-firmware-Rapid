@@ -116,6 +116,12 @@ private:
     std::unique_ptr<WifiStation> station_;
     std::unique_ptr<WifiConfigurationAp> config_ap_;
 
+    // Driver start/stop can wait for ESP event handlers to finish. Those
+    // handlers call NotifyEvent(), so lifecycle operations must never hold the
+    // state/callback mutex while entering the driver or a lock inversion can
+    // deadlock shutdown. The lifecycle mutex serializes the slow operations;
+    // mutex_ protects only the short-lived state and callback snapshots.
+    mutable std::mutex lifecycle_mutex_;
     mutable std::mutex mutex_;
     bool initialized_ = false;
     bool station_active_ = false;

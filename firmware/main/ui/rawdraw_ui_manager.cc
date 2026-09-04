@@ -780,7 +780,7 @@ bool RawDrawUiManager::PrepareRetainedDisplayInvalidation(
 }
 
 bool RawDrawUiManager::IsDisplayRefreshPending() const {
-    return lcd_ != nullptr && const_cast<CustomLcdDisplay*>(lcd_)->IsRefreshPending();
+    return lcd_ != nullptr && lcd_->IsRefreshPending();
 }
 
 void RawDrawUiManager::RefreshActivePage(RefreshIntent intent) {
@@ -1489,14 +1489,14 @@ rawdraw::Rect RawDrawUiManager::GetQuickSwitchBounds() const {
 
 void RawDrawUiManager::SnapshotQuickSwitchBacking(uint8_t* fb) {
     if (!fb || width_ <= 0 || height_ <= 0) return;
-    const size_t bytes_per_row = static_cast<size_t>((width_ + 7) / 8);
+    const size_t bytes_per_row = static_cast<size_t>((width_ * 2 + 7) / 8);
     const size_t frame_bytes = bytes_per_row * static_cast<size_t>(height_);
     quick_switch_backing_.assign(fb, fb + frame_bytes);
 }
 
 void RawDrawUiManager::RestoreQuickSwitchBacking(uint8_t* fb) {
     if (!fb || quick_switch_backing_.empty()) return;
-    const size_t bytes_per_row = static_cast<size_t>((width_ + 7) / 8);
+    const size_t bytes_per_row = static_cast<size_t>((width_ * 2 + 7) / 8);
     const size_t frame_bytes = bytes_per_row * static_cast<size_t>(height_);
     if (quick_switch_backing_.size() != frame_bytes) return;
     memcpy(fb, quick_switch_backing_.data(), frame_bytes);
@@ -1680,10 +1680,6 @@ bool RawDrawUiManager::IsGalleryFullscreen() const {
 void RawDrawUiManager::ArmGallerySlideshowTimer() {
     if (gallery_slideshow_timer_ == nullptr) return;
     esp_timer_stop(gallery_slideshow_timer_);
-    if (low_power_slideshow_mode_) {
-        gallery_slideshow_deadline_us_.store(0, std::memory_order_release);
-        return;
-    }
     if (gallery_slideshow_interval_minutes_ <= 0) {
         gallery_slideshow_deadline_us_.store(0, std::memory_order_release);
         return;
@@ -1696,6 +1692,12 @@ void RawDrawUiManager::ArmGallerySlideshowTimer() {
     if (ret != ESP_OK) {
         gallery_slideshow_deadline_us_.store(0, std::memory_order_release);
         ESP_LOGW(kTag, "Failed to arm slideshow timer: %s", esp_err_to_name(ret));
+    } else if (low_power_slideshow_mode_) {
+        // Deep sleep remains the normal scheduler.  This one-shot is a safety
+        // fallback for an unexpectedly prolonged awake session (USB power,
+        // network teardown, or a future sleep-gating regression), so the photo
+        // never freezes forever merely because low-power mode was selected.
+        ESP_LOGD(kTag, "Awake slideshow fallback armed alongside deep-sleep schedule");
     }
 }
 

@@ -277,6 +277,11 @@ void PhotoGalleryRenderer::RefreshPhotoList(const char* preferred_id) {
         memcpy(entry.date, info.date, sizeof(entry.date));
         memcpy(entry.location, info.location, sizeof(entry.location));
         memcpy(entry.body, info.body, sizeof(entry.body));
+        entry.id[sizeof(entry.id) - 1] = '\0';
+        entry.title[sizeof(entry.title) - 1] = '\0';
+        entry.date[sizeof(entry.date) - 1] = '\0';
+        entry.location[sizeof(entry.location) - 1] = '\0';
+        entry.body[sizeof(entry.body) - 1] = '\0';
         entry.width = info.width;
         entry.height = info.height;
         entry.file_size = info.file_size;

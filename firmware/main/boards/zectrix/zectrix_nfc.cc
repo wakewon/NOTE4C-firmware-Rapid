@@ -11,7 +11,7 @@
 #include <cstring>
 #include <utility>
 
-extern "C" void __attribute__((weak)) BoardI2cForcePowerOn() {}
+#include "boards/common/i2c_power_hook.h"
 
 namespace {
 

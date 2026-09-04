@@ -9,6 +9,7 @@
 #include <lvgl.h>
 #endif
 
+#include <atomic>
 #include <functional>
 
 #include <freertos/FreeRTOS.h>
@@ -84,7 +85,10 @@ public:
     void RequestUrgentFullRefresh() override;
 
     // Refresh state for sleep gating
-    bool IsRefreshPending();
+    // Lock-free snapshot used by the application sleep gate and the independent
+    // runtime guard.  Neither caller may wait forever on a wedged render task's
+    // framebuffer mutex while trying to decide whether the panel is idle.
+    bool IsRefreshPending() const;
     bool NeedsFullColorRecovery();
     bool FramebufferDiffersFromLastRefresh();
 
@@ -186,6 +190,7 @@ private:
 
     bool prev_buffer_synced = false;  // 标志：prev_buffer 是否已与屏幕同步
     bool refresh_in_progress = false;
+    std::atomic<bool> refresh_pending_snapshot_{false};
     bool refresh_busy_seen_ = false;
     uint32_t next_kick_ms_ = 0;
     std::function<void()> on_refresh_idle_;

@@ -56,19 +56,27 @@ bool RtcPcf8563::Init(gpio_num_t int_gpio) {
 }
 
 bool RtcPcf8563::SetTime(const tm& local_tm) {
-    WriteReg(kRegSeconds, ToBcd(local_tm.tm_sec) & 0x7F);
-    WriteReg(kRegMinutes, ToBcd(local_tm.tm_min) & 0x7F);
-    WriteReg(kRegHours, ToBcd(local_tm.tm_hour) & 0x3F);
-    WriteReg(kRegDays, ToBcd(local_tm.tm_mday) & 0x3F);
-    WriteReg(kRegWeekdays, ToBcd(local_tm.tm_wday) & 0x07);
-    WriteReg(kRegMonths, ToBcd(local_tm.tm_mon + 1) & 0x1F);
-    WriteReg(kRegYears, ToBcd(local_tm.tm_year % 100));
-    return true;
+    // PCF8563 auto-increments its register pointer. Write the complete time in
+    // one transaction so a transient bus failure cannot leave a mixture of old
+    // and new date fields, and so the newly powered shared I2C rail is not
+    // stressed by seven back-to-back START/STOP sequences.
+    const uint8_t values[] = {
+        static_cast<uint8_t>(ToBcd(local_tm.tm_sec) & 0x7F),
+        static_cast<uint8_t>(ToBcd(local_tm.tm_min) & 0x7F),
+        static_cast<uint8_t>(ToBcd(local_tm.tm_hour) & 0x3F),
+        static_cast<uint8_t>(ToBcd(local_tm.tm_mday) & 0x3F),
+        static_cast<uint8_t>(ToBcd(local_tm.tm_wday) & 0x07),
+        static_cast<uint8_t>(ToBcd(local_tm.tm_mon + 1) & 0x1F),
+        ToBcd(local_tm.tm_year % 100),
+    };
+    return WriteRegs(kRegSeconds, values, sizeof(values)) == ESP_OK;
 }
 
 bool RtcPcf8563::GetTime(tm& out_local_tm) {
     uint8_t buf[7] = {};
-    ReadRegs(kRegSeconds, buf, sizeof(buf));
+    if (ReadRegs(kRegSeconds, buf, sizeof(buf)) != ESP_OK) {
+        return false;
+    }
 
     out_local_tm.tm_sec = FromBcd(buf[0] & 0x7F);
     out_local_tm.tm_min = FromBcd(buf[1] & 0x7F);
@@ -82,76 +90,104 @@ bool RtcPcf8563::GetTime(tm& out_local_tm) {
 }
 
 bool RtcPcf8563::SetAlarm(const tm& target_local_tm) {
-    WriteReg(kRegAlarmMinute, ToBcd(target_local_tm.tm_min) & 0x7F);
-    WriteReg(kRegAlarmHour, ToBcd(target_local_tm.tm_hour) & 0x3F);
-    WriteReg(kRegAlarmDay, ToBcd(target_local_tm.tm_mday) & 0x3F);
-    WriteReg(kRegAlarmWeekday, kAlarmDisableBit);
-
-    ClearAlarmFlag();
-    return EnableInterrupt(true);
+    const uint8_t values[] = {
+        static_cast<uint8_t>(ToBcd(target_local_tm.tm_min) & 0x7F),
+        static_cast<uint8_t>(ToBcd(target_local_tm.tm_hour) & 0x3F),
+        static_cast<uint8_t>(ToBcd(target_local_tm.tm_mday) & 0x3F),
+        kAlarmDisableBit,
+    };
+    return WriteRegs(kRegAlarmMinute, values, sizeof(values)) == ESP_OK &&
+           ClearAlarmFlag() && EnableInterrupt(true);
 }
 
 bool RtcPcf8563::DisableAlarm() {
-    WriteReg(kRegAlarmMinute, kAlarmDisableBit);
-    WriteReg(kRegAlarmHour, kAlarmDisableBit);
-    WriteReg(kRegAlarmDay, kAlarmDisableBit);
-    WriteReg(kRegAlarmWeekday, kAlarmDisableBit);
-    return EnableInterrupt(false);
+    const uint8_t values[] = {
+        kAlarmDisableBit, kAlarmDisableBit, kAlarmDisableBit, kAlarmDisableBit,
+    };
+    return WriteRegs(kRegAlarmMinute, values, sizeof(values)) == ESP_OK &&
+           EnableInterrupt(false);
 }
 
 bool RtcPcf8563::ClearAlarmFlag() {
-    uint8_t ctrl2 = ReadReg(kRegCtrl2) & kCtrl2WritableMask;
+    uint8_t ctrl2 = 0;
+    if (ReadReg(kRegCtrl2, &ctrl2) != ESP_OK) {
+        return false;
+    }
+    ctrl2 &= kCtrl2WritableMask;
     ctrl2 &= ~kCtrl2AlarmFlag; // clear AF(bit3)
-    WriteReg(kRegCtrl2, ctrl2);
-    return true;
+    return WriteReg(kRegCtrl2, ctrl2) == ESP_OK;
 }
 
 bool RtcPcf8563::EnableInterrupt(bool enable) {
-    uint8_t ctrl2 = ReadReg(kRegCtrl2) & kCtrl2WritableMask;
+    uint8_t ctrl2 = 0;
+    if (ReadReg(kRegCtrl2, &ctrl2) != ESP_OK) {
+        return false;
+    }
+    ctrl2 &= kCtrl2WritableMask;
     if (enable) {
         ctrl2 |= kCtrl2AlarmIntEnable;
     } else {
         ctrl2 &= ~kCtrl2AlarmIntEnable;
     }
-    WriteReg(kRegCtrl2, ctrl2);
-    return true;
+    return WriteReg(kRegCtrl2, ctrl2) == ESP_OK;
 }
 
 bool RtcPcf8563::IsAlarmFired() {
-    uint8_t ctrl2 = ReadReg(kRegCtrl2);
+    uint8_t ctrl2 = 0;
+    if (ReadReg(kRegCtrl2, &ctrl2) != ESP_OK) {
+        return false;
+    }
     return (ctrl2 & kCtrl2AlarmFlag) != 0;
 }
 
 bool RtcPcf8563::StartCountdownTimer(uint8_t seconds) {
     const uint8_t timer_value = seconds == 0 ? 1 : seconds;
-    StopCountdownTimer();
-    ClearTimerFlag();
-    WriteReg(kRegTimerValue, timer_value);
-    WriteReg(kRegTimerControl, static_cast<uint8_t>(kTimerEnable | kTimerFreq1Hz));
+    if (!StopCountdownTimer() || !ClearTimerFlag()) {
+        return false;
+    }
+    if (WriteReg(kRegTimerValue, timer_value) != ESP_OK ||
+        WriteReg(kRegTimerControl,
+                 static_cast<uint8_t>(kTimerEnable | kTimerFreq1Hz)) != ESP_OK) {
+        return false;
+    }
 
-    uint8_t ctrl2 = ReadReg(kRegCtrl2) & kCtrl2WritableMask;
+    uint8_t ctrl2 = 0;
+    if (ReadReg(kRegCtrl2, &ctrl2) != ESP_OK) {
+        return false;
+    }
+    ctrl2 &= kCtrl2WritableMask;
     ctrl2 |= kCtrl2TimerIntEnable;
-    WriteReg(kRegCtrl2, ctrl2);
-    return true;
+    return WriteReg(kRegCtrl2, ctrl2) == ESP_OK;
 }
 
 bool RtcPcf8563::StopCountdownTimer() {
-    WriteReg(kRegTimerControl, 0x00);
-    uint8_t ctrl2 = ReadReg(kRegCtrl2) & kCtrl2WritableMask;
+    if (WriteReg(kRegTimerControl, 0x00) != ESP_OK) {
+        return false;
+    }
+    uint8_t ctrl2 = 0;
+    if (ReadReg(kRegCtrl2, &ctrl2) != ESP_OK) {
+        return false;
+    }
+    ctrl2 &= kCtrl2WritableMask;
     ctrl2 &= ~kCtrl2TimerIntEnable;
-    WriteReg(kRegCtrl2, ctrl2);
-    return true;
+    return WriteReg(kRegCtrl2, ctrl2) == ESP_OK;
 }
 
 bool RtcPcf8563::ClearTimerFlag() {
-    uint8_t ctrl2 = ReadReg(kRegCtrl2) & kCtrl2WritableMask;
+    uint8_t ctrl2 = 0;
+    if (ReadReg(kRegCtrl2, &ctrl2) != ESP_OK) {
+        return false;
+    }
+    ctrl2 &= kCtrl2WritableMask;
     ctrl2 &= ~kCtrl2TimerFlag;
-    WriteReg(kRegCtrl2, ctrl2);
-    return true;
+    return WriteReg(kRegCtrl2, ctrl2) == ESP_OK;
 }
 
 bool RtcPcf8563::IsTimerFired() {
-    uint8_t ctrl2 = ReadReg(kRegCtrl2);
+    uint8_t ctrl2 = 0;
+    if (ReadReg(kRegCtrl2, &ctrl2) != ESP_OK) {
+        return false;
+    }
     return (ctrl2 & kCtrl2TimerFlag) != 0;
 }
 

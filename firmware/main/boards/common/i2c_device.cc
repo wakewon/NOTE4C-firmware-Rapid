@@ -1,14 +1,16 @@
 #include "i2c_device.h"
 
 #include <esp_log.h>
+#include <algorithm>
+#include <array>
 
 #include "i2c_bus_lock.h"
+#include "i2c_power_hook.h"
 
 #define TAG "I2cDevice"
 
-extern "C" void __attribute__((weak)) BoardI2cForcePowerOn() {}
-
 constexpr int kI2cTimeoutMs = 100;
+constexpr size_t kMaxRegisterWriteLength = 256;
 
 I2cDevice::I2cDevice(i2c_master_bus_handle_t i2c_bus, uint8_t addr)
     : i2c_bus_(i2c_bus), device_address_(addr) {
@@ -40,54 +42,98 @@ esp_err_t I2cDevice::ResetBus(const char* reason) {
     return ret;
 }
 
-void I2cDevice::WriteReg(uint8_t reg, uint8_t value) {
+esp_err_t I2cDevice::WriteReg(uint8_t reg, uint8_t value) {
+    return WriteRegs(reg, &value, 1);
+}
+
+esp_err_t I2cDevice::WriteRegs(uint8_t start_reg, const uint8_t* values,
+                               size_t length) {
+    if (values == nullptr || length == 0 ||
+        length > kMaxRegisterWriteLength) {
+        return ESP_ERR_INVALID_ARG;
+    }
     ScopedI2cBusLock bus_lock("I2cDevice::WriteReg");
-    ESP_ERROR_CHECK(bus_lock.status());
-    uint8_t buffer[2] = {reg, value};
-    BoardI2cForcePowerOn();
-    esp_err_t ret = i2c_master_transmit(i2c_device_, buffer, sizeof(buffer), kI2cTimeoutMs);
-    if (ret == ESP_ERR_INVALID_STATE || ret == ESP_ERR_TIMEOUT) {
+    if (!bus_lock.locked()) {
+        return bus_lock.status();
+    }
+    std::array<uint8_t, kMaxRegisterWriteLength + 1> buffer{};
+    buffer[0] = start_reg;
+    std::copy(values, values + length, buffer.begin() + 1);
+    esp_err_t ret = ESP_OK;
+    if (BoardI2cForcePowerOn()) {
+        // The external pull-ups disappeared while the rail was off. Reset the
+        // controller FSM after they have settled instead of making the first
+        // real transaction fail and relying on its retry for recovery.
+        ret = i2c_master_bus_reset(i2c_bus_);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "i2c reset after power restore failed: ret=%s",
+                     esp_err_to_name(ret));
+            return ret;
+        }
+        ESP_LOGI(TAG, "i2c bus ready after shared-rail restore");
+    }
+    ret = i2c_master_transmit(i2c_device_, buffer.data(), length + 1,
+                              kI2cTimeoutMs);
+    if (ret != ESP_OK) {
         ESP_LOGW(TAG,
-                 "i2c write failed: addr=0x%02X reg=0x%02X val=0x%02X ret=%s",
+                 "i2c write failed: addr=0x%02X reg=0x%02X len=%u ret=%s",
                  static_cast<unsigned>(device_address_),
-                 static_cast<unsigned>(reg),
-                 static_cast<unsigned>(value),
+                 static_cast<unsigned>(start_reg),
+                 static_cast<unsigned>(length),
                  esp_err_to_name(ret));
         if (ResetBus("write_retry") == ESP_OK) {
             BoardI2cForcePowerOn();
-            ret = i2c_master_transmit(i2c_device_, buffer, sizeof(buffer), kI2cTimeoutMs);
+            ret = i2c_master_transmit(i2c_device_, buffer.data(), length + 1,
+                                      kI2cTimeoutMs);
             ESP_LOGW(TAG,
-                     "i2c write retry result: addr=0x%02X reg=0x%02X val=0x%02X ret=%s",
+                     "i2c write retry result: addr=0x%02X reg=0x%02X len=%u ret=%s",
                      static_cast<unsigned>(device_address_),
-                     static_cast<unsigned>(reg),
-                     static_cast<unsigned>(value),
+                     static_cast<unsigned>(start_reg),
+                     static_cast<unsigned>(length),
                      esp_err_to_name(ret));
         }
     }
-    ESP_ERROR_CHECK(ret);
+    return ret;
 }
 
-uint8_t I2cDevice::ReadReg(uint8_t reg) {
-    uint8_t buffer[1];
-    ReadRegs(reg, buffer, sizeof(buffer));
-    return buffer[0];
+esp_err_t I2cDevice::ReadReg(uint8_t reg, uint8_t* value) {
+    if (value == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return ReadRegs(reg, value, 1);
 }
 
-void I2cDevice::ReadRegs(uint8_t reg, uint8_t* buffer, size_t length) {
+esp_err_t I2cDevice::ReadRegs(uint8_t reg, uint8_t* buffer, size_t length) {
+    if (buffer == nullptr || length == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
     ScopedI2cBusLock bus_lock("I2cDevice::ReadRegs");
-    ESP_ERROR_CHECK(bus_lock.status());
-    BoardI2cForcePowerOn();
-    esp_err_t ret = i2c_master_transmit_receive(i2c_device_, &reg, 1, buffer, length, 100);
-    if (ret == ESP_ERR_INVALID_STATE) {
+    if (!bus_lock.locked()) {
+        return bus_lock.status();
+    }
+    esp_err_t ret = ESP_OK;
+    if (BoardI2cForcePowerOn()) {
+        ret = i2c_master_bus_reset(i2c_bus_);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "i2c reset after power restore failed: ret=%s",
+                     esp_err_to_name(ret));
+            return ret;
+        }
+        ESP_LOGI(TAG, "i2c bus ready after shared-rail restore");
+    }
+    ret = i2c_master_transmit_receive(i2c_device_, &reg, 1, buffer, length,
+                                      kI2cTimeoutMs);
+    if (ret != ESP_OK) {
         ESP_LOGW(TAG,
-                 "i2c read invalid_state: addr=0x%02X reg=0x%02X len=%u ret=%s",
+                 "i2c read failed: addr=0x%02X reg=0x%02X len=%u ret=%s",
                  static_cast<unsigned>(device_address_),
                  static_cast<unsigned>(reg),
                  static_cast<unsigned>(length),
                  esp_err_to_name(ret));
-        if (ResetBus("read_invalid_state") == ESP_OK) {
+        if (ResetBus("read_retry") == ESP_OK) {
             BoardI2cForcePowerOn();
-            ret = i2c_master_transmit_receive(i2c_device_, &reg, 1, buffer, length, 100);
+            ret = i2c_master_transmit_receive(i2c_device_, &reg, 1, buffer,
+                                              length, kI2cTimeoutMs);
             ESP_LOGW(TAG,
                      "i2c read retry result: addr=0x%02X reg=0x%02X len=%u ret=%s",
                      static_cast<unsigned>(device_address_),
@@ -96,5 +142,5 @@ void I2cDevice::ReadRegs(uint8_t reg, uint8_t* buffer, size_t length) {
                      esp_err_to_name(ret));
         }
     }
-    ESP_ERROR_CHECK(ret);
+    return ret;
 }

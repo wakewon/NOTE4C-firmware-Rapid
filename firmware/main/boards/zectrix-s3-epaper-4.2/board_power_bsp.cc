@@ -4,6 +4,7 @@
 #include <freertos/FreeRTOS.h>
 #include "board_power_bsp.h"
 #include "charge_status.h"
+#include "config.h"
 
 void BoardPowerBsp::PowerLedTask(void *arg) {
     auto* self = static_cast<BoardPowerBsp*>(arg);
@@ -80,6 +81,11 @@ BoardPowerBsp::BoardPowerBsp(int epdPowerPin, int audioPowerPin, int audioAmpPin
     gpio_conf.pull_down_en  = GPIO_PULLDOWN_DISABLE;
     gpio_conf.pull_up_en    = GPIO_PULLUP_ENABLE;
     ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_config(&gpio_conf));
+    // BoardI2cForcePowerOn() must be able to observe the actual state of the
+    // shared audio/I2C-pull-up rail. ESP-IDF's gpio_get_level() always returns
+    // zero for output-only pads, so keep input sensing enabled on this pin.
+    ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_set_direction(
+        static_cast<gpio_num_t>(audioPowerPin_), GPIO_MODE_INPUT_OUTPUT));
     xTaskCreatePinnedToCore(PowerLedTask, "PowerLedTask", 3 * 1024, this, 2, &led_task_, 0);
 }
 
@@ -155,5 +161,12 @@ void BoardPowerBsp::PrepareForDeepSleep() {
     gpio_hold_en(GPIO_NUM_3);
     PowerAmpOff();
     PowerAudioOff();
+    // Keep the SSD2683 reset asserted while its supply is held off. This avoids
+    // back-power/leakage through a high reset input and guarantees a known
+    // controller state on the next timer wake.
+    gpio_hold_dis(static_cast<gpio_num_t>(EPD_RST_PIN));
+    gpio_set_direction(static_cast<gpio_num_t>(EPD_RST_PIN), GPIO_MODE_OUTPUT);
+    gpio_set_level(static_cast<gpio_num_t>(EPD_RST_PIN), 0);
+    gpio_hold_en(static_cast<gpio_num_t>(EPD_RST_PIN));
     PowerEpdOff();
 }

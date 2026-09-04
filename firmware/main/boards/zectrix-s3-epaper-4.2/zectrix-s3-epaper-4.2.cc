@@ -56,7 +56,9 @@ void EnterWifiConfigComboOnce() {
         return;
     }
     ESP_LOGI(kTag, "UP+DOWN combo detected, entering WiFi config");
-    Application::GetInstance().OnWifiConfigComboLongPress();
+    Application::GetInstance().Schedule([]() {
+        Application::GetInstance().OnWifiConfigComboLongPress();
+    });
 }
 
 class CustomBoard : public Board {
@@ -268,6 +270,19 @@ public:
         }
     }
 
+    void PrepareForScheduledWake() {
+        // Timer wakes never use voice/audio or NFC. Cut those rails as soon as
+        // the wake is classified instead of leaving them powered throughout a
+        // 20-30 second e-paper refresh/network session.
+        if (nfc_ != nullptr) {
+            nfc_->PowerOff();
+        }
+        if (power_ != nullptr) {
+            power_->PowerAmpOff();
+            power_->PowerAudioOff();
+        }
+    }
+
 private:
     static int64_t GetNowMs() {
         return esp_timer_get_time() / 1000;
@@ -374,10 +389,7 @@ private:
                 return;
             }
             auto& app = Application::GetInstance();
-            if (app.GetRawDrawUiManager()) {
-                app.OnUpClick();
-                return;
-            }
+            app.Schedule([]() { Application::GetInstance().OnUpClick(); });
         });
 
         up_button_.OnPressUp([]() {
@@ -389,7 +401,9 @@ private:
                 if (s_down_held.load()) {
                     EnterWifiConfigComboOnce();
                 } else {
-                    Application::GetInstance().OnUpLongPress();
+                    Application::GetInstance().Schedule([]() {
+                        Application::GetInstance().OnUpLongPress();
+                    });
                 }
             }
             s_up_held.store(false);
@@ -411,10 +425,7 @@ private:
                 return;
             }
             auto& app = Application::GetInstance();
-            if (app.GetRawDrawUiManager()) {
-                app.OnDownClick();
-                return;
-            }
+            app.Schedule([]() { Application::GetInstance().OnDownClick(); });
         });
 
         down_button_.OnPressUp([]() {
@@ -426,7 +437,9 @@ private:
                 if (s_up_held.load()) {
                     EnterWifiConfigComboOnce();
                 } else {
-                    Application::GetInstance().OnDownLongPress();
+                    Application::GetInstance().Schedule([]() {
+                        Application::GetInstance().OnDownLongPress();
+                    });
                 }
             }
             s_down_held.store(false);
@@ -440,7 +453,9 @@ private:
             if (s_down_held.load()) {
                 EnterWifiConfigComboOnce();
             } else {
-                Application::GetInstance().OnUpLongPress();
+                Application::GetInstance().Schedule([]() {
+                    Application::GetInstance().OnUpLongPress();
+                });
             }
         });
 
@@ -450,7 +465,9 @@ private:
             if (s_up_held.load()) {
                 EnterWifiConfigComboOnce();
             } else {
-                Application::GetInstance().OnDownLongPress();
+                Application::GetInstance().Schedule([]() {
+                    Application::GetInstance().OnDownLongPress();
+                });
             }
         });
 
@@ -461,11 +478,15 @@ private:
                 ESP_LOGI(kTag, "BOOT release ignored while wake action is being restored");
                 return;
             }
-            if (app.GetRawDrawUiManager()) {
-                app.OnBootClick();
-                return;
-            }
-            FactoryTestService::Instance().HandleButton(FactoryTestButton::kConfirmClick);
+            app.Schedule([]() {
+                auto& scheduled_app = Application::GetInstance();
+                if (scheduled_app.GetRawDrawUiManager()) {
+                    scheduled_app.OnBootClick();
+                } else {
+                    FactoryTestService::Instance().HandleButton(
+                        FactoryTestButton::kConfirmClick);
+                }
+            });
         });
 
         // CONFIRM (BOOT) long press → voice PTT or factory test
@@ -474,11 +495,15 @@ private:
             if (!app.IsInputReady()) {
                 return;
             }
-            if (app.GetRawDrawUiManager()) {
-                app.OnBootLongPress();
-                return;
-            }
-            FactoryTestService::Instance().HandleButton(FactoryTestButton::kConfirmLongPress);
+            app.Schedule([]() {
+                auto& scheduled_app = Application::GetInstance();
+                if (scheduled_app.GetRawDrawUiManager()) {
+                    scheduled_app.OnBootLongPress();
+                } else {
+                    FactoryTestService::Instance().HandleButton(
+                        FactoryTestButton::kConfirmLongPress);
+                }
+            });
         });
     }
 
@@ -630,4 +655,9 @@ extern "C" ZectrixNfc* ZectrixGetNfc() {
 extern "C" void ZectrixPrepareForDeepSleep() {
     auto& board = static_cast<CustomBoard&>(Board::GetInstance());
     board.PrepareForDeepSleep();
+}
+
+extern "C" void ZectrixPrepareForScheduledWake() {
+    auto& board = static_cast<CustomBoard&>(Board::GetInstance());
+    board.PrepareForScheduledWake();
 }

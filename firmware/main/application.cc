@@ -4,6 +4,7 @@
 #include "boards/zectrix-s3-epaper-4.2/config.h"
 #include "board.h"
 #include "common/photo_storage.h"
+#include "common/display_stall_guard.h"
 #include "display.h"
 #include "settings.h"
 #include "ui/rawdraw_ui_manager.h"
@@ -38,6 +39,10 @@ constexpr int kSettingsLanIpIndex = 8;
 constexpr uint32_t kRetainedMagic = 0x4E344352;  // "N4CR" (layout v3)
 constexpr int64_t kInteractiveAwakeUs = 120LL * 1000 * 1000;
 constexpr int64_t kNetworkSyncTimeoutUs = 35LL * 1000 * 1000;
+
+constexpr int SchedulePeriodSeconds(int interval_minutes) {
+    return interval_minutes > 0 ? interval_minutes * 60 : 0;
+}
 
 constexpr bool ShouldRunScheduledNetworkSync(bool wifi_enabled,
                                              int interval_minutes,
@@ -78,11 +83,23 @@ struct RetainedSchedule {
     ui::PersistentDisplayMetadata display_metadata;
 };
 
+constexpr uint32_t kPowerDiagnosticsMagic = 0x4E345044;  // "N4PD"
+struct PowerLifecycleDiagnostics {
+    uint32_t magic;
+    uint32_t boot_count;
+    uint32_t timer_wake_count;
+    uint32_t sleep_commit_count;
+    uint32_t last_wakeup_causes;
+    int32_t last_photo_index;
+};
+
 RTC_DATA_ATTR RetainedSchedule s_retained_schedule{};
+RTC_DATA_ATTR PowerLifecycleDiagnostics s_power_diagnostics{};
 bool s_sntp_started = false;
 
 extern "C" RtcPcf8563* ZectrixGetRtc();
 extern "C" void ZectrixPrepareForDeepSleep();
+extern "C" void ZectrixPrepareForScheduledWake();
 extern "C" bool ZectrixIsExternalPowerPresent();
 
 int CurrentLocalDateKey() {
@@ -232,13 +249,10 @@ void StartSntpClockSyncOnce() {
     esp_sntp_setservername(1, "cn.pool.ntp.org");
     esp_sntp_setservername(2, "pool.ntp.org");
     esp_sntp_set_time_sync_notification_cb([](struct timeval*) {
-        time_t now = 0;
-        time(&now);
-        struct tm local_tm = {};
-        localtime_r(&now, &local_tm);
-        char time_buf[32] = {};
-        strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &local_tm);
-        ESP_LOGI(kTag, "SNTP time synchronized: %s", time_buf);
+        // This callback runs in lwIP's TCP/IP task.  Publish only an atomic
+        // event here: stopping Wi-Fi, destroying esp-netif, touching UI state,
+        // or performing an I2C RTC transaction from this context can deadlock
+        // the network stack that is currently delivering the callback.
         Application::GetInstance().OnSntpSynchronized();
     });
     esp_sntp_init();
@@ -263,6 +277,7 @@ Application::Application() = default;
 Application::~Application() = default;
 
 void Application::Initialize() {
+    RuntimeGuardNoteProgress(RuntimeGuardPhase::Initializing);
     input_ready_.store(false, std::memory_order_release);
     Settings gallery_nvs(kGalleryNamespace, false);
     slideshow_interval_minutes_ = gallery_nvs.GetInt(kSlideshowIntervalKey, 5);
@@ -277,11 +292,29 @@ void Application::Initialize() {
         network_sync_interval_minutes_ = 0;
     }
     auto& board = Board::GetInstance();
+    RuntimeGuardNoteProgress(RuntimeGuardPhase::Initializing);
     InitializeLocalClockFromRtc();
 
     const uint32_t wakeup_causes = esp_sleep_get_wakeup_causes();
     const bool timer_wakeup =
         (wakeup_causes & (1UL << ESP_SLEEP_WAKEUP_TIMER)) != 0;
+    if (s_power_diagnostics.magic != kPowerDiagnosticsMagic) {
+        s_power_diagnostics = {};
+        s_power_diagnostics.magic = kPowerDiagnosticsMagic;
+        s_power_diagnostics.last_photo_index = -1;
+    }
+    ++s_power_diagnostics.boot_count;
+    if (timer_wakeup) {
+        ++s_power_diagnostics.timer_wake_count;
+    }
+    s_power_diagnostics.last_wakeup_causes = wakeup_causes;
+    ESP_LOGI(kTag,
+             "Power lifecycle: boots=%u timer_wakes=%u sleep_commits=%u last_wake=0x%08lx last_photo=%ld",
+             static_cast<unsigned>(s_power_diagnostics.boot_count),
+             static_cast<unsigned>(s_power_diagnostics.timer_wake_count),
+             static_cast<unsigned>(s_power_diagnostics.sleep_commit_count),
+             static_cast<unsigned long>(s_power_diagnostics.last_wakeup_causes),
+             static_cast<long>(s_power_diagnostics.last_photo_index));
     uint64_t button_wakeup_mask = 0;
     if ((wakeup_causes & (1UL << ESP_SLEEP_WAKEUP_EXT1)) != 0) {
         button_wakeup_mask = esp_sleep_get_ext1_wakeup_status();
@@ -301,13 +334,14 @@ void Application::Initialize() {
             .magic = kRetainedMagic,
             .slideshow_config_minutes = slideshow_interval_minutes_,
             .sync_config_minutes = network_sync_interval_minutes_,
-            .slideshow_remaining_seconds = slideshow_interval_minutes_ * 60,
-            .sync_remaining_seconds = network_sync_interval_minutes_ * 60,
+            .slideshow_remaining_seconds = SchedulePeriodSeconds(slideshow_interval_minutes_),
+            .sync_remaining_seconds = SchedulePeriodSeconds(network_sync_interval_minutes_),
             .selected_photo_index = 0,
             .gallery_fullscreen = 0,
         };
         scheduler_timer_wake_ = false;
     }
+    RuntimeGuardSetScheduledWake(scheduler_timer_wake_);
     if (scheduler_timer_wake_) {
         slideshow_due_ = slideshow_interval_minutes_ > 0 &&
                          s_retained_schedule.slideshow_remaining_seconds <= 0;
@@ -317,11 +351,11 @@ void Application::Initialize() {
             s_retained_schedule.sync_remaining_seconds);
         if (slideshow_due_) {
             s_retained_schedule.slideshow_remaining_seconds =
-                slideshow_interval_minutes_ * 60;
+                SchedulePeriodSeconds(slideshow_interval_minutes_);
         }
         if (network_sync_pending_) {
             s_retained_schedule.sync_remaining_seconds =
-                network_sync_interval_minutes_ * 60;
+                SchedulePeriodSeconds(network_sync_interval_minutes_);
         }
         display_invalidation_due_ =
             HasDateWakeDependency(s_retained_schedule.display_metadata.contract) &&
@@ -350,6 +384,7 @@ void Application::Initialize() {
         audio_service_.Start();
         audio_started_ = true;
     } else {
+        ZectrixPrepareForScheduledWake();
         ESP_LOGI(kTag, "Timer wake: audio codec and audio tasks skipped");
     }
 
@@ -366,6 +401,8 @@ void Application::Initialize() {
     }
 
     auto* lcd = static_cast<CustomLcdDisplay*>(display);
+    RuntimeGuardRegisterDisplay(lcd);
+    RuntimeGuardNoteProgress(RuntimeGuardPhase::Initializing);
     rawdraw_ui_manager_ = std::make_unique<ui::RawDrawUiManager>();
     // Seed the very first framebuffer with a real battery sample. Previously
     // this happened accidentally through the automatic Wi-Fi status callback;
@@ -525,7 +562,7 @@ void Application::Initialize() {
                                  wifi_enabled_.store(true, std::memory_order_release);
                                  nvs.SetBool(kWifiEnabledKey, true);
                                  s_retained_schedule.sync_remaining_seconds =
-                                     network_sync_interval_minutes_ * 60;
+                                     SchedulePeriodSeconds(network_sync_interval_minutes_);
                                  UpdateWifiSettingsItem(sr, true, false, "连接中");
                                  StartInteractiveWifiAttempt();
                              }
@@ -592,77 +629,9 @@ void Application::Initialize() {
 
     // Set up WiFi status callback to update StatusBar
     board.SetNetworkEventCallback([this](NetworkEvent event, const std::string& data) {
-        switch (event) {
-            case NetworkEvent::Connected:
-                ESP_LOGI(kTag, "WiFi connected: %s", data.c_str());
-                if (!wifi_enabled_.load(std::memory_order_acquire)) {
-                    ESP_LOGW(kTag, "Ignoring late Wi-Fi connection because switch is OFF");
-                    WifiManager::GetInstance().StopStation();
-                    break;
-                }
-                wifi_connect_deadline_us_ = 0;
-                wifi_connected_.store(true, std::memory_order_release);
-                StartSntpClockSyncOnce();
-                // LAN transfer is intentionally opt-in. A scheduled sync only
-                // keeps the radio up long enough for SNTP, then turns it off.
-                if (rawdraw_ui_manager_ &&
-                    rawdraw_ui_manager_->GetCurrentPage() == ui::RawDrawPageId::APTransfer &&
-                    !rawdraw_ui_manager_->IsApTransferModeRunning()) {
-                    ESP_LOGI(kTag, "WiFi connected while config page is visible, returning to gallery");
-                    rawdraw_ui_manager_->SwitchPage(ui::RawDrawPageId::Gallery);
-                }
-                UpdateStatusBarForUi(true, true);
-                break;
-            case NetworkEvent::Disconnected:
-                ESP_LOGI(kTag, "WiFi disconnected");
-                wifi_connected_.store(false, std::memory_order_release);
-                if (rawdraw_ui_manager_ && rawdraw_ui_manager_->IsLanHttpServerRunning()) {
-                    rawdraw_ui_manager_->StopLanHttpServer();
-                }
-                UpdateStatusBarForUi(true, true);
-                break;
-            case NetworkEvent::Connecting:
-            case NetworkEvent::Scanning:
-                wifi_connected_.store(false, std::memory_order_release);
-                UpdateStatusBarForUi(false, false);
-                if (rawdraw_ui_manager_) {
-                    UpdateWifiSettingsItem(
-                        rawdraw_ui_manager_->GetSettingsRenderer(),
-                        wifi_enabled_.load(std::memory_order_acquire), false,
-                        "连接中");
-                }
-                break;
-            case NetworkEvent::WifiConfigModeEnter:
-                ESP_LOGI(kTag, "WiFi config mode entered: %s", data.c_str());
-                wifi_connected_.store(false, std::memory_order_release);
-                if (rawdraw_ui_manager_) {
-                    auto& wifi = WifiManager::GetInstance();
-                    rawdraw_ui_manager_->ShowWifiConfigPage(wifi.GetApSsid(),
-                                                            wifi.GetApPassword(),
-                                                            wifi.GetApWebUrl());
-                }
-                UpdateStatusBarForUi();
-                break;
-            case NetworkEvent::WifiConfigModeExit:
-                if (rawdraw_ui_manager_ &&
-                    rawdraw_ui_manager_->GetCurrentPage() == ui::RawDrawPageId::APTransfer &&
-                    !rawdraw_ui_manager_->IsApTransferModeRunning()) {
-                    ESP_LOGI(kTag, "WiFi config AP exited, returning to gallery");
-                    rawdraw_ui_manager_->SwitchPage(ui::RawDrawPageId::Gallery);
-                }
-                wifi_connected_.store(WifiManager::GetInstance().IsConnected(),
-                                      std::memory_order_release);
-                UpdateStatusBarForUi();
-                break;
-            case NetworkEvent::ModemDetecting:
-            case NetworkEvent::ModemErrorNoSim:
-            case NetworkEvent::ModemErrorRegDenied:
-            case NetworkEvent::ModemErrorInitFailed:
-            case NetworkEvent::ModemErrorTimeout:
-                wifi_connected_.store(false, std::memory_order_release);
-                UpdateStatusBarForUi();
-                break;
-        }
+        // Wi-Fi events arrive on an ESP event-loop task. Serialize them with UI,
+        // buttons, SNTP completion, and the sleep state machine on app_main.
+        Schedule([this, event, data]() { HandleNetworkEvent(event, data); });
     });
 
     if (network_sync_pending_) {
@@ -698,6 +667,7 @@ void Application::Initialize() {
     }
 
     SetDeviceState(kDeviceStateIdle);
+    RuntimeGuardNoteProgress(RuntimeGuardPhase::Running);
 }
 
 void Application::OnUpClick() {
@@ -854,6 +824,90 @@ void Application::StartScheduledNetworkSync() {
     WifiManager::GetInstance().StartStation();
 }
 
+void Application::HandleNetworkEvent(NetworkEvent event, const std::string& data) {
+    const bool update_interactive_ui =
+        !scheduler_timer_wake_ && sleep_phase_ == SleepPhase::Awake;
+    switch (event) {
+        case NetworkEvent::Connected:
+            ESP_LOGI(kTag, "WiFi connected: %s", data.c_str());
+            if (!wifi_enabled_.load(std::memory_order_acquire)) {
+                ESP_LOGW(kTag, "Ignoring late Wi-Fi connection because switch is OFF");
+                WifiManager::GetInstance().StopStation();
+                break;
+            }
+            wifi_connect_deadline_us_ = 0;
+            wifi_connected_.store(true, std::memory_order_release);
+            StartSntpClockSyncOnce();
+            if (!update_interactive_ui) {
+                ESP_LOGI(kTag, "Scheduled/background connection kept off the persistent display");
+                break;
+            }
+            // LAN transfer is intentionally opt-in. A scheduled sync only
+            // keeps the radio up long enough for SNTP, then turns it off.
+            if (rawdraw_ui_manager_ &&
+                rawdraw_ui_manager_->GetCurrentPage() == ui::RawDrawPageId::APTransfer &&
+                !rawdraw_ui_manager_->IsApTransferModeRunning()) {
+                ESP_LOGI(kTag, "WiFi connected while config page is visible, returning to gallery");
+                rawdraw_ui_manager_->SwitchPage(ui::RawDrawPageId::Gallery);
+            }
+            UpdateStatusBarForUi(true, true);
+            break;
+        case NetworkEvent::Disconnected:
+            ESP_LOGI(kTag, "WiFi disconnected");
+            wifi_connected_.store(false, std::memory_order_release);
+            if (!update_interactive_ui) break;
+            if (rawdraw_ui_manager_ && rawdraw_ui_manager_->IsLanHttpServerRunning()) {
+                rawdraw_ui_manager_->StopLanHttpServer();
+            }
+            UpdateStatusBarForUi(true, true);
+            break;
+        case NetworkEvent::Connecting:
+        case NetworkEvent::Scanning:
+            wifi_connected_.store(false, std::memory_order_release);
+            if (!update_interactive_ui) break;
+            UpdateStatusBarForUi(false, false);
+            if (rawdraw_ui_manager_) {
+                UpdateWifiSettingsItem(
+                    rawdraw_ui_manager_->GetSettingsRenderer(),
+                    wifi_enabled_.load(std::memory_order_acquire), false,
+                    "连接中");
+            }
+            break;
+        case NetworkEvent::WifiConfigModeEnter:
+            ESP_LOGI(kTag, "WiFi config mode entered: %s", data.c_str());
+            wifi_connected_.store(false, std::memory_order_release);
+            if (!update_interactive_ui) break;
+            if (rawdraw_ui_manager_) {
+                auto& wifi = WifiManager::GetInstance();
+                rawdraw_ui_manager_->ShowWifiConfigPage(wifi.GetApSsid(),
+                                                        wifi.GetApPassword(),
+                                                        wifi.GetApWebUrl());
+            }
+            UpdateStatusBarForUi();
+            break;
+        case NetworkEvent::WifiConfigModeExit:
+            wifi_connected_.store(WifiManager::GetInstance().IsConnected(),
+                                  std::memory_order_release);
+            if (!update_interactive_ui) break;
+            if (rawdraw_ui_manager_ &&
+                rawdraw_ui_manager_->GetCurrentPage() == ui::RawDrawPageId::APTransfer &&
+                !rawdraw_ui_manager_->IsApTransferModeRunning()) {
+                ESP_LOGI(kTag, "WiFi config AP exited, returning to gallery");
+                rawdraw_ui_manager_->SwitchPage(ui::RawDrawPageId::Gallery);
+            }
+            UpdateStatusBarForUi();
+            break;
+        case NetworkEvent::ModemDetecting:
+        case NetworkEvent::ModemErrorNoSim:
+        case NetworkEvent::ModemErrorRegDenied:
+        case NetworkEvent::ModemErrorInitFailed:
+        case NetworkEvent::ModemErrorTimeout:
+            wifi_connected_.store(false, std::memory_order_release);
+            if (update_interactive_ui) UpdateStatusBarForUi();
+            break;
+    }
+}
+
 void Application::CompleteScheduledNetworkJob(uint32_t job) {
     if (!network_sync_pending_) return;
     scheduled_network_jobs_pending_ &= ~job;
@@ -904,6 +958,7 @@ void Application::EnterLowPowerSleep(const char* reason) {
     if (sleep_phase_ != SleepPhase::Awake) return;
     pending_sleep_reason_ = reason ? reason : "unspecified";
     input_ready_.store(false, std::memory_order_release);
+    RuntimeGuardNoteProgress(RuntimeGuardPhase::PreparingSleep);
     ESP_LOGI(kTag, "Sleep preparation beginning: %s", pending_sleep_reason_);
 
     if (rawdraw_ui_manager_) {
@@ -920,15 +975,13 @@ void Application::EnterLowPowerSleep(const char* reason) {
         rawdraw_ui_manager_->BeginPersistentSleepPreparation();
         rawdraw_ui_manager_->StopHttpServicesForSleep();
     }
+    StopSntpIfStarted();
     if (network_initialized_) WifiManager::GetInstance().StopStation();
     wifi_connected_.store(false, std::memory_order_release);
     network_sync_pending_ = false;
     scheduled_network_jobs_pending_ = 0;
     network_sync_deadline_us_ = 0;
     wifi_connect_deadline_us_ = 0;
-    StopSntpIfStarted();
-    esp_wifi_disconnect();
-    esp_wifi_stop();
     UpdateStatusBarForUi(false, false);
 
     auto* sleep_lcd = static_cast<CustomLcdDisplay*>(Board::GetInstance().GetDisplay());
@@ -968,14 +1021,13 @@ void Application::EnterLowPowerSleep(const char* reason) {
 }
 
 void Application::CommitLowPowerSleep() {
+    RuntimeGuardNoteProgress(RuntimeGuardPhase::CommittingSleep);
     // A late station callback may race the asynchronous EPD waveform. Reassert
     // the final radio state immediately before power is committed; the glass
     // already contains the disconnected state selected by preflight.
     if (network_initialized_) WifiManager::GetInstance().StopStation();
     wifi_connected_.store(false, std::memory_order_release);
     StopSntpIfStarted();
-    esp_wifi_disconnect();
-    esp_wifi_stop();
     if (audio_started_) {
         audio_service_.Stop();
         audio_started_ = false;
@@ -999,13 +1051,13 @@ void Application::CommitLowPowerSleep() {
         s_retained_schedule.slideshow_remaining_seconds = 0;
     } else if (s_retained_schedule.slideshow_remaining_seconds <= 0) {
         s_retained_schedule.slideshow_remaining_seconds =
-            slideshow_interval_minutes_ * 60;
+            SchedulePeriodSeconds(slideshow_interval_minutes_);
     }
     if (network_sync_interval_minutes_ <= 0) {
         s_retained_schedule.sync_remaining_seconds = 0;
     } else if (s_retained_schedule.sync_remaining_seconds <= 0) {
         s_retained_schedule.sync_remaining_seconds =
-            network_sync_interval_minutes_ * 60;
+            SchedulePeriodSeconds(network_sync_interval_minutes_);
     }
 
     int display_invalidation_seconds = 0;
@@ -1069,6 +1121,15 @@ void Application::CommitLowPowerSleep() {
 
     ESP_LOGI(kTag, "Final deep-sleep commit: %s",
              pending_sleep_reason_ ? pending_sleep_reason_ : "unspecified");
+    ++s_power_diagnostics.sleep_commit_count;
+    s_power_diagnostics.last_photo_index =
+        s_retained_schedule.selected_photo_index;
+    ESP_LOGI(kTag,
+             "Power lifecycle commit: boots=%u timer_wakes=%u sleep_commits=%u photo=%ld",
+             static_cast<unsigned>(s_power_diagnostics.boot_count),
+             static_cast<unsigned>(s_power_diagnostics.timer_wake_count),
+             static_cast<unsigned>(s_power_diagnostics.sleep_commit_count),
+             static_cast<long>(s_power_diagnostics.last_photo_index));
     // Shut down the rails only after all users (display, Wi-Fi, audio and NFC)
     // have become idle. Per-pin holds already configured by the board BSP are
     // then made effective throughout deep sleep on ESP32-S3.
@@ -1079,10 +1140,17 @@ void Application::CommitLowPowerSleep() {
 }
 
 void Application::OnSntpSynchronized() {
+    sntp_sync_pending_.store(true, std::memory_order_release);
+}
+
+void Application::HandleSntpSynchronized() {
     time_t now = 0;
     time(&now);
     struct tm local_tm = {};
     localtime_r(&now, &local_tm);
+    char time_buf[32] = {};
+    strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &local_tm);
+    ESP_LOGI(kTag, "SNTP time synchronized on main task: %s", time_buf);
     if (auto* rtc = ZectrixGetRtc()) {
         if (!rtc->SetTime(local_tm)) {
             ESP_LOGW(kTag, "SNTP succeeded but writing PCF8563 failed");
@@ -1090,9 +1158,15 @@ void Application::OnSntpSynchronized() {
             ESP_LOGI(kTag, "PCF8563 updated from SNTP");
         }
     }
+    if (scheduler_timer_wake_) {
+        // RTC access temporarily powers the shared I2C/audio rail. No scheduled
+        // job uses audio or NFC, so return those rails to their low-power state
+        // while the display waveform and Wi-Fi teardown finish.
+        ZectrixPrepareForScheduledWake();
+    }
     if (scheduler_timer_wake_ && network_sync_pending_) {
         CompleteScheduledNetworkJob(kScheduledNetworkJobTimeSync);
-    } else {
+    } else if (!scheduler_timer_wake_ && sleep_phase_ == SleepPhase::Awake) {
         // Clock and status-bar text are monochrome. A successful sync must not
         // turn a background network event into an expensive color refresh.
         UpdateStatusBarForUi(true, true);
@@ -1101,6 +1175,14 @@ void Application::OnSntpSynchronized() {
 
 void Application::Run() {
     while (true) {
+        RuntimeGuardNoteProgress(
+            sleep_phase_ == SleepPhase::Awake
+                ? RuntimeGuardPhase::Running
+                : RuntimeGuardPhase::PreparingSleep);
+        DrainScheduledCallbacks();
+        if (sntp_sync_pending_.exchange(false, std::memory_order_acq_rel)) {
+            HandleSntpSynchronized();
+        }
         if (rawdraw_ui_manager_ && sleep_phase_ == SleepPhase::Awake) {
             rawdraw_ui_manager_->PumpClockRefresh();
         }
@@ -1148,7 +1230,8 @@ void Application::Run() {
                                        : "removed; automatic sleep countdown resumed");
             }
             external_power_present_ = power_present;
-            if (external_power_present_) {
+            if (external_power_present_ &&
+                !ShouldEnterIdleSleep(true, external_power_present_)) {
                 // Continuously move the idle deadline forward. After USB is
                 // removed the device gets one normal interaction window, then
                 // returns to the configured deep-sleep schedule.
@@ -1214,8 +1297,19 @@ bool Application::SetDeviceState(DeviceState state) {
 }
 
 void Application::Schedule(std::function<void()>&& callback) {
-    if (callback) {
-        callback();
+    if (!callback) return;
+    std::lock_guard<std::mutex> lock(scheduled_callbacks_mutex_);
+    scheduled_callbacks_.push_back(std::move(callback));
+}
+
+void Application::DrainScheduledCallbacks() {
+    std::vector<std::function<void()>> callbacks;
+    {
+        std::lock_guard<std::mutex> lock(scheduled_callbacks_mutex_);
+        callbacks.swap(scheduled_callbacks_);
+    }
+    for (auto& callback : callbacks) {
+        if (callback) callback();
     }
 }
 

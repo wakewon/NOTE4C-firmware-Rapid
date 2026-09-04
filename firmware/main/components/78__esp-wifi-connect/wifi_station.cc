@@ -29,7 +29,17 @@
 
 #define TAG "WifiStation"
 #define FAST_RC_TAG "FAST_RC"
-static bool kFastRcEnable = true;
+// This cache lives in normal RAM, so it is empty after every deep-sleep wake.
+// Keeping the fast-BSSID timeout armed therefore gives scheduled sessions no
+// benefit, while its esp_timer callback can race Stop() and restart the driver
+// during teardown. A normal scan costs only a few seconds on the rare network
+// wake and has deterministic ownership.
+static constexpr bool kFastRcEnable = false;
+// The cached static-IP verifier runs on a detached task while Stop() can tear
+// down its lwIP netif.  That lifetime race is not worth a sub-second saving on
+// a radio session that runs only periodically; retain fast BSSID association,
+// then let DHCP own IP setup on the event loop.
+static constexpr bool kIpFastEnable = false;
 #define WIFI_EVENT_CONNECTED BIT0
 #define WIFI_EVENT_STOPPED BIT1
 #define WIFI_EVENT_SCAN_DONE_BIT BIT2
@@ -683,6 +693,9 @@ void WifiStation::Stop() {
     force_scan_ = false;
     ip_fast_attempt_ = false;
     ip_fast_ready_ = false;
+    connect_queue_.clear();
+    ip_address_.clear();
+    reconnect_count_ = 0;
 
     // Clear connected bit
     xEventGroupClearBits(event_group_, WIFI_EVENT_CONNECTED);
@@ -819,18 +832,38 @@ bool WifiStation::WaitForConnected(int timeout_ms) {
 
 void WifiStation::HandleScanResult() {
     uint16_t ap_num = 0;
-    esp_wifi_scan_get_ap_num(&ap_num);
-    wifi_ap_record_t *ap_records = (wifi_ap_record_t *)malloc(ap_num * sizeof(wifi_ap_record_t));
-    esp_wifi_scan_get_ap_records(&ap_num, ap_records);
+    esp_err_t ret = esp_wifi_scan_get_ap_num(&ap_num);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to get AP count: %s", esp_err_to_name(ret));
+        if (timer_handle_ != nullptr) {
+            esp_timer_start_once(timer_handle_, scan_current_interval_microseconds_);
+        }
+        UpdateScanInterval();
+        return;
+    }
+
+    std::vector<wifi_ap_record_t> ap_records(ap_num);
+    if (ap_num > 0) {
+        ret = esp_wifi_scan_get_ap_records(&ap_num, ap_records.data());
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to get AP records: %s", esp_err_to_name(ret));
+            if (timer_handle_ != nullptr) {
+                esp_timer_start_once(timer_handle_, scan_current_interval_microseconds_);
+            }
+            UpdateScanInterval();
+            return;
+        }
+        ap_records.resize(ap_num);
+    }
     // sort by rssi descending
-    std::sort(ap_records, ap_records + ap_num, [](const wifi_ap_record_t& a, const wifi_ap_record_t& b) {
+    std::sort(ap_records.begin(), ap_records.end(), [](const wifi_ap_record_t& a,
+                                                       const wifi_ap_record_t& b) {
         return a.rssi > b.rssi;
     });
 
     auto& ssid_manager = SsidManager::GetInstance();
     auto ssid_list = ssid_manager.GetSsidList();
-    for (int i = 0; i < ap_num; i++) {
-        auto ap_record = ap_records[i];
+    for (const auto& ap_record : ap_records) {
         auto it = std::find_if(ssid_list.begin(), ssid_list.end(), [ap_record](const SsidItem& item) {
             return strcmp((char *)ap_record.ssid, item.ssid.c_str()) == 0;
         });
@@ -851,7 +884,6 @@ void WifiStation::HandleScanResult() {
             connect_queue_.push_back(record);
         }
     }
-    free(ap_records);
 
     if (connect_queue_.empty()) {
         ESP_LOGI(TAG, "No AP found, next scan in %d seconds", scan_current_interval_microseconds_ / 1000 / 1000);
@@ -1128,7 +1160,7 @@ void WifiStation::WifiEventHandler(void* arg, esp_event_base_t event_base, int32
         int64_t t_ms = esp_timer_get_time() / 1000;
         ESP_LOGI(FAST_RC_TAG, "stage=wifi event=sta_connected path=slow t_ms=%lld",
                  static_cast<long long>(t_ms));
-        if (kFastRcEnable && !this_->ip_fast_attempt_ && this_->ip_fast_task_handle_ == nullptr) {
+        if (kIpFastEnable && !this_->ip_fast_attempt_ && this_->ip_fast_task_handle_ == nullptr) {
             esp_netif_ip_info_t ip_info{};
             esp_ip4_addr_t dns_info{};
             int64_t ip_ms = 0;
