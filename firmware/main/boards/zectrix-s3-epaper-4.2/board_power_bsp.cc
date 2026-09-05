@@ -34,10 +34,11 @@ void BoardPowerBsp::PowerLedTask(void *arg) {
             continue;
         }
 
+        // Read-only. ChargeStatus is sampled by its own task; this loop's
+        // blink delays are 0.2-3 s and must not set the debounce cadence.
         ChargeStatus::Snapshot snap{};
         const bool has_status = self && self->charge_status_;
         if (has_status) {
-            self->charge_status_->Tick(esp_timer_get_time() / 1000);
             snap = self->charge_status_->Get();
         }
         gpio_hold_dis((gpio_num_t)GPIO_NUM_3);

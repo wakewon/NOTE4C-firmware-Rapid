@@ -50,6 +50,13 @@ public:
 
     void UpdateStatusBarForUi();
     void OnSntpSynchronized();
+
+    // Cross-task request surface. Every one of these may be called from an
+    // HTTP handler, a network event task or the button task; each only
+    // publishes intent, and the app-task supervisor loop applies it. Nothing
+    // outside the app task may drive the radio or the schedule directly.
+    void RequestSlideshowIntervalChange(int minutes);
+    void RequestWifiDisabled(const char* reason);
     void OnUpClick();
     void OnDownClick();
     void OnUpLongPress();
@@ -81,6 +88,10 @@ private:
     static constexpr uint32_t kScheduledNetworkJobTimeSync = 1u << 0;
     std::atomic<bool> manual_sleep_requested_{false};
     std::atomic<bool> sntp_sync_pending_{false};
+    std::atomic<bool> wifi_disable_requested_{false};
+    // -1 means "no request". Written by cross-task requesters, consumed once
+    // by the app task.
+    std::atomic<int> requested_slideshow_interval_{-1};
     int slideshow_interval_minutes_ = 0;
     int network_sync_interval_minutes_ = 0;
     int64_t network_sync_deadline_us_ = 0;
@@ -100,7 +111,22 @@ private:
     std::mutex scheduled_callbacks_mutex_;
     std::vector<std::function<void()>> scheduled_callbacks_;
 
+    // Slideshow / network-sync schedule. One owner (this class), one deadline
+    // per job, expressed in the RTC microsecond counter so a single absolute
+    // value stays correct across deep sleep, an early GPIO wake and a long
+    // awake session alike.
+    void ResetSlideshowDeadline();
+    void ResetNetworkSyncDeadline();
+    void NormalizeScheduleDeadlines();
+    void ApplySlideshowInterval(int minutes);
+    bool IsSlideshowDue() const;
+    int SecondsUntilSlideshow() const;
+    int SecondsUntilNetworkSync() const;
+    void PumpSlideshowSchedule();
+
     void EnsureNetworkInitialized();
+    void ApplyPendingWifiDisableRequest();
+    void DisableWifiAndPersist(const char* reason);
     void StartInteractiveWifiAttempt();
     void StartScheduledNetworkSync();
     void CompleteScheduledNetworkJob(uint32_t job);
@@ -123,12 +149,18 @@ private:
     // and RequestActivePageRefresh() escalates it to FULL_COLOR, preempting the
     // FAST_BW the handler chose.
     //
-    // A flag rather than a parameter because the culprits are nested: calling
-    // WifiManager::StopStation() from the Wi-Fi settings toggle raises
-    // WifiEvent::Disconnected *synchronously*, so the network-event handler
-    // runs inside the button handler, before it has finished applying the new
-    // values -- it sees a genuine state change and cannot be filtered out by
-    // comparing values alone.
+    // A flag rather than a parameter because the suppressed callers are not
+    // the handler itself but everything it reaches: NoteButtonActivity() and
+    // the settings-item callbacks all fold a fresh battery/Wi-Fi sample into
+    // the frame through UpdateStatusBarForUi(), several levels down from the
+    // On*Click() that will repaint on its way out. Those pushes see genuine
+    // state changes, so comparing values cannot filter them out.
+    //
+    // (Board network events used to add a second, harder case by arriving
+    // *inside* a handler: WifiManager::StopStation() raises
+    // WifiEvent::Disconnected synchronously. They are now routed through
+    // Schedule() and drained on a later tick, so only the direct callers above
+    // remain.)
     class InputScope {
     public:
         explicit InputScope(Application& app) : app_(app) {

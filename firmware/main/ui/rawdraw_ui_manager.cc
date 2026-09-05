@@ -34,6 +34,9 @@ static constexpr const char* kRawDrawThemeNvsKey = "rawdraw_theme";
 // it disabled for now. To restore minute-by-minute clock updates later, flip
 // this to true after a safe status-bar-only refresh path exists.
 static constexpr bool kEnableMinuteClockRefresh = false;
+// The render task holds the framebuffer mutex only for a dirty-rect merge or a
+// 30 KB snapshot, never across a waveform. Anything longer is a wedged task.
+static constexpr uint32_t kFramebufferLockTimeoutMs = 500;
 
 namespace ui {
 
@@ -307,11 +310,13 @@ RawDrawUiManager::RawDrawUiManager()
         QueueGalleryStorageSync(photo_id);
     });
     ap_transfer_server_->SetSettingsChangedCallback([this](int slideshow_interval_minutes) {
-        SetGallerySlideshowIntervalMinutes(slideshow_interval_minutes);
-        UpdateSettingsItem(3, slideshow_interval_minutes <= 0
-            ? std::string("关闭")
-            : std::to_string(slideshow_interval_minutes) + "min");
-        RequestActivePageRefresh();
+        // Runs on an HTTP task. The application owns the interval: it holds
+        // the NVS value, the settings-page label and the one slideshow
+        // deadline, so hand the request over instead of updating a renderer
+        // and a timer that the deep-sleep schedule would then disagree with.
+        if (slideshow_interval_changed_cb_) {
+            slideshow_interval_changed_cb_(slideshow_interval_minutes);
+        }
     });
     ap_transfer_server_->SetPhotosChangedCallback([this]() {
         QueueGalleryStorageSync();
@@ -341,11 +346,6 @@ RawDrawUiManager::~RawDrawUiManager() {
         esp_timer_stop(transient_refresh_timer_);
         esp_timer_delete(transient_refresh_timer_);
         transient_refresh_timer_ = nullptr;
-    }
-    if (gallery_slideshow_timer_ != nullptr) {
-        esp_timer_stop(gallery_slideshow_timer_);
-        esp_timer_delete(gallery_slideshow_timer_);
-        gallery_slideshow_timer_ = nullptr;
     }
     ESP_LOGI(kTag, "RawDraw UI Manager destroyed");
 }
@@ -408,19 +408,6 @@ void RawDrawUiManager::Init(CustomLcdDisplay* lcd, RefreshCallback refresh_cb,
             ESP_LOGW(kTag, "Failed to create transient refresh timer: %s", esp_err_to_name(ret));
         }
     }
-
-    if (gallery_slideshow_timer_ == nullptr) {
-        esp_timer_create_args_t timer_args = {};
-        timer_args.callback = &RawDrawUiManager::OnGallerySlideshowTimer;
-        timer_args.arg = this;
-        timer_args.dispatch_method = ESP_TIMER_TASK;
-        timer_args.name = "gallery_slideshow";
-        esp_err_t ret = esp_timer_create(&timer_args, &gallery_slideshow_timer_);
-        if (ret != ESP_OK) {
-            ESP_LOGW(kTag, "Failed to create slideshow timer: %s", esp_err_to_name(ret));
-        }
-    }
-    ArmGallerySlideshowTimer();
 
     // Clear and render initial frame
     auto* fb = lcd_->GetFramebuffer();
@@ -493,8 +480,8 @@ void RawDrawUiManager::SwitchPage(RawDrawPageId page) {
     if (page == RawDrawPageId::Gallery) {
         // A photo becoming visible is a new dwell interval. Without resetting
         // here, returning to a fullscreen gallery inherits whatever fraction
-        // of the old timer happened to remain while another page was open.
-        ResetGallerySlideshowTimer();
+        // of the old dwell happened to remain while another page was open.
+        NotifySlideshowDwellReset();
     }
     if (page_switch_cb_) {
         page_switch_cb_(page);
@@ -718,14 +705,22 @@ const char* RawDrawUiManager::DescribePersistentDependencies(
     return buffer;
 }
 
-void RawDrawUiManager::RenderActivePageToFramebuffer() {
+bool RawDrawUiManager::RenderActivePageToFramebuffer() {
     auto* fb = lcd_ ? lcd_->GetFramebuffer() : nullptr;
-    if (!fb) return;
-    auto* mutex = lcd_->GetMutex();
-    if (mutex) xSemaphoreTake(mutex, portMAX_DELAY);
+    if (!fb) return false;
+    // Bounded because this also runs on the sleep path. The render task only
+    // holds this mutex for short bursts, so a timeout means it is wedged --
+    // and blocking there would trade a clean deep sleep for a stalled main
+    // task and a runtime-guard restart.
+    if (!lcd_->LockFramebuffer(kFramebufferLockTimeoutMs)) {
+        ESP_LOGW(kTag, "Framebuffer busy for %ums; active page not re-rendered",
+                 static_cast<unsigned>(kFramebufferLockTimeoutMs));
+        return false;
+    }
     rawdraw::Clear(fb, width_, height_);
     RenderAll(fb, width_, height_);
-    if (mutex) xSemaphoreGive(mutex);
+    lcd_->UnlockFramebuffer();
+    return true;
 }
 
 PersistentFramePreparation RawDrawUiManager::PreparePersistentFrame() {
@@ -743,7 +738,11 @@ PersistentFramePreparation RawDrawUiManager::PreparePersistentFrame() {
     if (auto* renderer = GetActiveRenderer()) {
         renderer->RefreshPersistentDisplayData(result.visible_changes);
     }
-    RenderActivePageToFramebuffer();
+    if (!RenderActivePageToFramebuffer()) {
+        ESP_LOGW(kTag,
+                 "Persistent frame could not be rendered; glass left untouched");
+        return result;
+    }
     result.framebuffer_changed = lcd_ && lcd_->FramebufferDiffersFromLastRefresh();
     if (result.framebuffer_changed) {
         TriggerRefresh(RefreshIntent::FullColor);
@@ -919,7 +918,6 @@ void RawDrawUiManager::BeginPersistentSleepPreparation() {
     active_page_refresh_pending_.store(false, std::memory_order_release);
     active_page_full_refresh_pending_.store(false, std::memory_order_release);
     transient_refresh_pending_.store(false, std::memory_order_release);
-    gallery_slideshow_pending_.store(false, std::memory_order_release);
 }
 
 void RawDrawUiManager::StopHttpServicesForSleep() {
@@ -1068,10 +1066,8 @@ bool RawDrawUiManager::HandleInput(const rawdraw::ButtonEvent& event) {
     if (handled) {
         if (current_page_ == RawDrawPageId::Gallery && navigation_click) {
             // Manual UP/DN selection and BOOT fullscreen transitions start a
-            // fresh dwell interval. Clear a callback that may already have
-            // fired as well as rearming the one-shot timer; rearming alone
-            // would still allow PumpClockRefresh() to advance immediately.
-            ResetGallerySlideshowTimer();
+            // fresh dwell interval.
+            NotifySlideshowDwellReset();
         }
         if (navigation_click && !queue_input_during_refresh) {
             input_refresh_locked_.store(true, std::memory_order_release);
@@ -1601,23 +1597,10 @@ bool RawDrawUiManager::ShowPhotoById(const std::string& photo_id) {
     return true;
 }
 
-void RawDrawUiManager::SetGallerySlideshowIntervalMinutes(int minutes) {
-    gallery_slideshow_interval_minutes_ = std::max(0, minutes);
-    gallery_slideshow_pending_.store(false, std::memory_order_release);
-    ArmGallerySlideshowTimer();
-    if (gallery_slideshow_interval_minutes_ <= 0) {
-        ESP_LOGI(kTag, "Gallery slideshow disabled");
-    } else {
-        ESP_LOGI(kTag, "Gallery slideshow interval=%d minutes", gallery_slideshow_interval_minutes_);
+void RawDrawUiManager::NotifySlideshowDwellReset() {
+    if (slideshow_dwell_reset_cb_) {
+        slideshow_dwell_reset_cb_();
     }
-}
-
-void RawDrawUiManager::SetLowPowerSlideshowMode(bool enabled) {
-    low_power_slideshow_mode_ = enabled;
-    gallery_slideshow_pending_.store(false, std::memory_order_release);
-    ArmGallerySlideshowTimer();
-    ESP_LOGI(kTag, "Low-power slideshow scheduling: %s",
-             enabled ? "deep-sleep wakeup" : "runtime timer");
 }
 
 bool RawDrawUiManager::PrepareGallerySlideshowFrame(int retained_index, bool advance) {
@@ -1659,7 +1642,7 @@ bool RawDrawUiManager::PrepareGalleryInteractiveWakeFrame(
     const bool handled = photo_gallery_renderer_->HandleInput(wake_event);
     status_bar_data_.page_title = GetPageTitle(current_page_);
     RefreshActivePage(RefreshIntent::FullColor);
-    ResetGallerySlideshowTimer();
+    NotifySlideshowDwellReset();
     ESP_LOGI(kTag,
              "Interactive wake frame: selected=%d retained_fullscreen=%d key=%d handled=%d",
              photo_gallery_renderer_->GetSelectedIndex(),
@@ -1677,40 +1660,6 @@ bool RawDrawUiManager::IsGalleryFullscreen() const {
            photo_gallery_renderer_->IsFullscreenMode();
 }
 
-void RawDrawUiManager::ArmGallerySlideshowTimer() {
-    if (gallery_slideshow_timer_ == nullptr) return;
-    esp_timer_stop(gallery_slideshow_timer_);
-    if (gallery_slideshow_interval_minutes_ <= 0) {
-        gallery_slideshow_deadline_us_.store(0, std::memory_order_release);
-        return;
-    }
-
-    const int64_t delay_us = static_cast<int64_t>(gallery_slideshow_interval_minutes_) * 60 * 1000 * 1000;
-    gallery_slideshow_deadline_us_.store(
-        esp_timer_get_time() + delay_us, std::memory_order_release);
-    esp_err_t ret = esp_timer_start_once(gallery_slideshow_timer_, delay_us);
-    if (ret != ESP_OK) {
-        gallery_slideshow_deadline_us_.store(0, std::memory_order_release);
-        ESP_LOGW(kTag, "Failed to arm slideshow timer: %s", esp_err_to_name(ret));
-    } else if (low_power_slideshow_mode_) {
-        // Deep sleep remains the normal scheduler.  This one-shot is a safety
-        // fallback for an unexpectedly prolonged awake session (USB power,
-        // network teardown, or a future sleep-gating regression), so the photo
-        // never freezes forever merely because low-power mode was selected.
-        ESP_LOGD(kTag, "Awake slideshow fallback armed alongside deep-sleep schedule");
-    }
-}
-
-void RawDrawUiManager::ResetGallerySlideshowTimer() {
-    if (gallery_slideshow_timer_ != nullptr) {
-        // Stop first, then clear a callback that may have fired just before the
-        // manual action. ArmGallerySlideshowTimer() starts a fresh one-shot.
-        esp_timer_stop(gallery_slideshow_timer_);
-    }
-    gallery_slideshow_pending_.store(false, std::memory_order_release);
-    ArmGallerySlideshowTimer();
-}
-
 void RawDrawUiManager::QueueGalleryStorageSync(const char* preferred_photo_id) {
     if (preferred_photo_id && preferred_photo_id[0] != '\0') {
         std::lock_guard<std::mutex> lock(gallery_storage_sync_mutex_);
@@ -1722,22 +1671,7 @@ void RawDrawUiManager::QueueGalleryStorageSync(const char* preferred_photo_id) {
     gallery_storage_sync_pending_.store(true, std::memory_order_release);
 }
 
-void RawDrawUiManager::OnGallerySlideshowTimer(void* arg) {
-    auto* self = static_cast<RawDrawUiManager*>(arg);
-    if (self == nullptr) return;
-    const int64_t deadline_us =
-        self->gallery_slideshow_deadline_us_.load(std::memory_order_acquire);
-    if (deadline_us > 0 && esp_timer_get_time() >= deadline_us) {
-        // If a previous callback was already dispatched while a manual action
-        // reset the one-shot, its old callback arrives before the new deadline
-        // and is ignored instead of immediately advancing the freshly selected
-        // photo.
-        self->gallery_slideshow_pending_.store(true, std::memory_order_release);
-    }
-}
-
 bool RawDrawUiManager::AdvanceGallerySlideshow() {
-    ArmGallerySlideshowTimer();
     if (current_page_ != RawDrawPageId::Gallery || !photo_gallery_renderer_) {
         return false;
     }
@@ -1876,9 +1810,8 @@ void RawDrawUiManager::PumpClockRefresh() {
             }
         }
         if (current_page_ == RawDrawPageId::Gallery) {
-            // A newly uploaded photo or deletion fallback starts a fresh dwell
-            // and cancels an already-fired slideshow callback.
-            ResetGallerySlideshowTimer();
+            // A newly uploaded photo or deletion fallback starts a fresh dwell.
+            NotifySlideshowDwellReset();
         }
     }
     const bool page_pending =
@@ -1901,10 +1834,6 @@ void RawDrawUiManager::PumpClockRefresh() {
         }
     }
     const bool transient_pending = transient_refresh_pending_.exchange(false, std::memory_order_acq_rel);
-    const bool slideshow_pending = gallery_slideshow_pending_.exchange(false, std::memory_order_acq_rel);
-    if (slideshow_pending) {
-        AdvanceGallerySlideshow();
-    }
     if (page_pending || transient_pending || gallery_page_changed) {
         const RefreshIntent intent = transient_pending
             ? RefreshIntent::FullColor

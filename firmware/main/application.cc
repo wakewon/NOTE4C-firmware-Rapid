@@ -15,6 +15,7 @@
 #include <esp_mac.h>
 #include <esp_log.h>
 #include <esp_sleep.h>
+#include <esp_rtc_time.h>
 #include <esp_sntp.h>
 #include <esp_system.h>
 #include <esp_wifi.h>
@@ -36,7 +37,7 @@ constexpr int kSettingsNetworkSyncIndex = 5;
 constexpr int kSettingsWifiIndex = 6;
 constexpr int kSettingsHttpServerIndex = 7;
 constexpr int kSettingsLanIpIndex = 8;
-constexpr uint32_t kRetainedMagic = 0x4E344352;  // "N4CR" (layout v3)
+constexpr uint32_t kRetainedMagic = 0x4E344353;  // "N4CS" (layout v4)
 constexpr int64_t kInteractiveAwakeUs = 120LL * 1000 * 1000;
 constexpr int64_t kNetworkSyncTimeoutUs = 35LL * 1000 * 1000;
 
@@ -44,10 +45,57 @@ constexpr int SchedulePeriodSeconds(int interval_minutes) {
     return interval_minutes > 0 ? interval_minutes * 60 : 0;
 }
 
+int64_t NowRtcUs() {
+    return static_cast<int64_t>(esp_rtc_get_time_us());
+}
+
+// Seconds remaining until an absolute deadline, clamped at 0. Returns -1 for
+// "no deadline" so callers can tell "disabled" from "already due".
+constexpr int SecondsUntilDeadline(uint64_t due_rtc_us, int64_t now_rtc_us) {
+    if (due_rtc_us == 0) return -1;
+    const int64_t remaining_us = static_cast<int64_t>(due_rtc_us) - now_rtc_us;
+    if (remaining_us <= 0) return 0;
+    return static_cast<int>((remaining_us + 999999) / 1000000);
+}
+
+// What an absolute deadline buys over the countdown it replaced, stated as
+// cases. The countdown was decremented by the *planned* sleep length at commit
+// time, so an early GPIO wake credited sleep that never happened, and time
+// spent awake was credited to nothing at all.
+static_assert(SecondsUntilDeadline(0, 1000) == -1, "0 means not scheduled");
+static_assert(SecondsUntilDeadline(300000000, 0) == 300, "freshly armed");
+static_assert(SecondsUntilDeadline(300000000, 30000000) == 270,
+              "a button wake 30 s in leaves 270 s, not a consumed period");
+static_assert(SecondsUntilDeadline(300000000, 150000000) == 150,
+              "120 s of interactive awake time is charged like any other");
+static_assert(SecondsUntilDeadline(300000000, 300000000) == 0, "due");
+static_assert(SecondsUntilDeadline(300000000, 900000000) == 0,
+              "overslept still reads due exactly once");
+
+// A deadline cannot legitimately be further out than one whole period; that
+// only happens when the RTC timebase restarts under a retained schedule.
+constexpr bool ScheduleDeadlineIsImplausible(int remaining_seconds,
+                                             int period_seconds) {
+    return period_seconds > 0 &&
+           (remaining_seconds < 0 || remaining_seconds > period_seconds);
+}
+
+static_assert(!ScheduleDeadlineIsImplausible(0, 300));
+static_assert(!ScheduleDeadlineIsImplausible(300, 300));
+static_assert(ScheduleDeadlineIsImplausible(301, 300), "timebase moved");
+static_assert(ScheduleDeadlineIsImplausible(-1, 300), "interval on, never armed");
+static_assert(!ScheduleDeadlineIsImplausible(-1, 0), "interval off");
+
+int SecondsUntilRtcDeadline(uint64_t due_rtc_us) {
+    return SecondsUntilDeadline(due_rtc_us, NowRtcUs());
+}
+
+// remaining_seconds is the SecondsUntilRtcDeadline() result: -1 unscheduled,
+// 0 due, >0 pending.
 constexpr bool ShouldRunScheduledNetworkSync(bool wifi_enabled,
                                              int interval_minutes,
                                              int remaining_seconds) {
-    return wifi_enabled && interval_minutes > 0 && remaining_seconds <= 0;
+    return wifi_enabled && interval_minutes > 0 && remaining_seconds == 0;
 }
 
 // The periodic setting is only a schedule. It must never override the user's
@@ -55,6 +103,7 @@ constexpr bool ShouldRunScheduledNetworkSync(bool wifi_enabled,
 static_assert(!ShouldRunScheduledNetworkSync(false, 10, 0));
 static_assert(!ShouldRunScheduledNetworkSync(true, 0, 0));
 static_assert(!ShouldRunScheduledNetworkSync(true, 10, 1));
+static_assert(!ShouldRunScheduledNetworkSync(true, 10, -1));
 static_assert(ShouldRunScheduledNetworkSync(true, 10, 0));
 
 constexpr bool ShouldEnterIdleSleep(bool idle_deadline_reached,
@@ -72,12 +121,19 @@ static_assert(CHARGE_FULL_GPIO <= GPIO_NUM_21);
 static_assert(TODO_UP_BUTTON_GPIO > GPIO_NUM_21,
               "UP is not an RTC IO on ESP32-S3 and cannot wake deep sleep");
 
+// Absolute deadlines in the RTC microsecond counter, which keeps running
+// through deep sleep and resets only on power-on. Storing "when", rather than
+// "how many seconds are left", is what makes one value correct for every way a
+// cycle can end: an early GPIO wake no longer credits the full planned sleep,
+// and a long awake session no longer credits nothing at all.
+//
+// 0 means "not scheduled" (interval disabled).
 struct RetainedSchedule {
     uint32_t magic;
     int slideshow_config_minutes;
     int sync_config_minutes;
-    int slideshow_remaining_seconds;
-    int sync_remaining_seconds;
+    uint64_t slideshow_due_rtc_us;
+    uint64_t sync_due_rtc_us;
     int selected_photo_index;
     int gallery_fullscreen;
     ui::PersistentDisplayMetadata display_metadata;
@@ -334,28 +390,41 @@ void Application::Initialize() {
             .magic = kRetainedMagic,
             .slideshow_config_minutes = slideshow_interval_minutes_,
             .sync_config_minutes = network_sync_interval_minutes_,
-            .slideshow_remaining_seconds = SchedulePeriodSeconds(slideshow_interval_minutes_),
-            .sync_remaining_seconds = SchedulePeriodSeconds(network_sync_interval_minutes_),
+            .slideshow_due_rtc_us = 0,
+            .sync_due_rtc_us = 0,
             .selected_photo_index = 0,
             .gallery_fullscreen = 0,
         };
+        ResetSlideshowDeadline();
+        ResetNetworkSyncDeadline();
         scheduler_timer_wake_ = false;
     }
+    NormalizeScheduleDeadlines();
+    // One line per boot describing the single schedule, the way
+    // "Power lifecycle:" describes the single power record. Both deadlines are
+    // absolute, so consecutive boots must show them counting down in real
+    // time; a value that jumps back to a full period, or that does not move
+    // across a cycle, is the desynchronization this replaced.
+    ESP_LOGI(kTag,
+             "Schedule: rtc_now=%llds slideshow=%dmin/%ds sync=%dmin/%ds",
+             static_cast<long long>(NowRtcUs() / 1000000),
+             slideshow_interval_minutes_, SecondsUntilSlideshow(),
+             network_sync_interval_minutes_, SecondsUntilNetworkSync());
     RuntimeGuardSetScheduledWake(scheduler_timer_wake_);
     if (scheduler_timer_wake_) {
-        slideshow_due_ = slideshow_interval_minutes_ > 0 &&
-                         s_retained_schedule.slideshow_remaining_seconds <= 0;
+        slideshow_due_ = IsSlideshowDue();
         network_sync_pending_ = ShouldRunScheduledNetworkSync(
             wifi_enabled_.load(std::memory_order_acquire),
             network_sync_interval_minutes_,
-            s_retained_schedule.sync_remaining_seconds);
+            SecondsUntilNetworkSync());
+        // Consuming a due job re-arms its own deadline, and only its own. The
+        // two schedules previously shared one decrement of the planned sleep
+        // length, so waking for either of them advanced both.
         if (slideshow_due_) {
-            s_retained_schedule.slideshow_remaining_seconds =
-                SchedulePeriodSeconds(slideshow_interval_minutes_);
+            ResetSlideshowDeadline();
         }
         if (network_sync_pending_) {
-            s_retained_schedule.sync_remaining_seconds =
-                SchedulePeriodSeconds(network_sync_interval_minutes_);
+            ResetNetworkSyncDeadline();
         }
         display_invalidation_due_ =
             HasDateWakeDependency(s_retained_schedule.display_metadata.contract) &&
@@ -449,8 +518,12 @@ void Application::Initialize() {
         rawdraw_ui_manager_->AdoptRetainedPersistentMetadata(
             s_retained_schedule.display_metadata);
     }
-    rawdraw_ui_manager_->SetLowPowerSlideshowMode(true);
-    rawdraw_ui_manager_->SetGallerySlideshowIntervalMinutes(slideshow_interval_minutes_);
+    // The UI manager performs the advance; the dwell clock lives here so the
+    // awake path and the deep-sleep wake share one deadline.
+    rawdraw_ui_manager_->SetSlideshowDwellResetCallback(
+        [this]() { ResetSlideshowDeadline(); });
+    rawdraw_ui_manager_->SetSlideshowIntervalChangedCallback(
+        [this](int minutes) { RequestSlideshowIntervalChange(minutes); });
     if (scheduler_timer_wake_ && slideshow_due_) {
         slideshow_refresh_requested_ = rawdraw_ui_manager_->PrepareGallerySlideshowFrame(
             s_retained_schedule.selected_photo_index, true);
@@ -486,7 +559,6 @@ void Application::Initialize() {
         ESP_LOGI(kTag, "Startup gallery fullscreen slideshow: %s, interval=%s",
                  FormatMinutesLogLabel(slideshow_interval),
                  FormatMinutesLabel(slideshow_interval).c_str());
-        rawdraw_ui_manager_->SetGallerySlideshowIntervalMinutes(slideshow_interval);
 
         std::vector<rawdraw::SettingsItemDef> items;
         items.push_back({"系统", "", nullptr, rawdraw::SettingsItemType::Section, false});
@@ -495,18 +567,9 @@ void Application::Initialize() {
         items.push_back({"相册", "", nullptr, rawdraw::SettingsItemType::Section, false});
         items.push_back({"轮播间隔", FormatMinutesLabel(slideshow_interval), nullptr,
                          rawdraw::SettingsItemType::Action, false,
-                         [this, sr]() {
-                             Settings nvs(kGalleryNamespace, true);
-                             const int current = nvs.GetInt(kSlideshowIntervalKey, 5);
-                             const int next = NextSlideshowInterval(current);
-                             nvs.SetInt(kSlideshowIntervalKey, next);
-                             slideshow_interval_minutes_ = next;
-                             s_retained_schedule.slideshow_config_minutes = next;
-                             s_retained_schedule.slideshow_remaining_seconds = next * 60;
-                             if (rawdraw_ui_manager_) {
-                                 rawdraw_ui_manager_->SetGallerySlideshowIntervalMinutes(next);
-                             }
-                             sr->UpdateItem(kSettingsSlideshowIndex, FormatMinutesLabel(next));
+                         [this]() {
+                             ApplySlideshowInterval(
+                                 NextSlideshowInterval(slideshow_interval_minutes_));
                          }});
         items.push_back({"网络", "", nullptr, rawdraw::SettingsItemType::Section, false});
         items.push_back({"定时联网",
@@ -517,12 +580,12 @@ void Application::Initialize() {
                          rawdraw::SettingsItemType::Action, false,
                          [this, sr]() {
                              Settings nvs(kSyncNamespace, true);
-                             const int current = nvs.GetInt(kSyncIntervalKey, 0);
-                             const int next = NextNetworkSyncInterval(current);
+                             const int next =
+                                 NextNetworkSyncInterval(network_sync_interval_minutes_);
                              nvs.SetInt(kSyncIntervalKey, next);
                              network_sync_interval_minutes_ = next;
                              s_retained_schedule.sync_config_minutes = next;
-                             s_retained_schedule.sync_remaining_seconds = next * 60;
+                             ResetNetworkSyncDeadline();
                              sr->UpdateItem(kSettingsNetworkSyncIndex,
                                             FormatNetworkSyncLabel(
                                                 next,
@@ -537,32 +600,21 @@ void Application::Initialize() {
                          nullptr, rawdraw::SettingsItemType::Checkbox,
                          wifi_enabled_.load(std::memory_order_acquire),
                          [this, sr]() {
-                             auto& wifi = WifiManager::GetInstance();
                              const bool enabled =
                                  wifi_enabled_.load(std::memory_order_acquire);
-                             Settings nvs(kSyncNamespace, true);
                              if (enabled) {
-                                 ESP_LOGI(kTag, "Wi-Fi setting toggled OFF");
-                                 // Publish the policy first. StopStation emits a
-                                 // synchronous Disconnected event, which must
-                                 // already observe the switch as disabled.
-                                 wifi_enabled_.store(false, std::memory_order_release);
-                                 nvs.SetBool(kWifiEnabledKey, false);
-                                 wifi_connect_deadline_us_ = 0;
-                                 if (rawdraw_ui_manager_ && rawdraw_ui_manager_->IsLanHttpServerRunning()) {
-                                     rawdraw_ui_manager_->StopLanHttpServer();
-                                     UpdateHttpServerSettingsItem(sr, false);
-                                 }
-                                 wifi.StopStation();
-                                 wifi_connected_.store(false, std::memory_order_release);
+                                 // Same teardown as a remote request, so the
+                                 // two entry points cannot drift apart.
+                                 DisableWifiAndPersist("settings toggle");
+                                 UpdateHttpServerSettingsItem(sr, false);
                                  UpdateWifiSettingsItem(sr, false, false);
                                  UpdateLanIpSettingsItem(sr, "");
                              } else {
                                  ESP_LOGI(kTag, "Wi-Fi setting toggled ON");
                                  wifi_enabled_.store(true, std::memory_order_release);
+                                 Settings nvs(kSyncNamespace, true);
                                  nvs.SetBool(kWifiEnabledKey, true);
-                                 s_retained_schedule.sync_remaining_seconds =
-                                     SchedulePeriodSeconds(network_sync_interval_minutes_);
+                                 ResetNetworkSyncDeadline();
                                  UpdateWifiSettingsItem(sr, true, false, "连接中");
                                  StartInteractiveWifiAttempt();
                              }
@@ -785,6 +837,142 @@ void Application::EnterWifiConfigMode() {
     UpdateStatusBarForUi();
 }
 
+// ---------------------------------------------------------------------------
+// Slideshow / network-sync schedule (single owner)
+// ---------------------------------------------------------------------------
+
+void Application::ResetSlideshowDeadline() {
+    const int period = SchedulePeriodSeconds(slideshow_interval_minutes_);
+    s_retained_schedule.slideshow_config_minutes = slideshow_interval_minutes_;
+    s_retained_schedule.slideshow_due_rtc_us =
+        period > 0 ? static_cast<uint64_t>(NowRtcUs()) +
+                         static_cast<uint64_t>(period) * 1000000ULL
+                   : 0;
+}
+
+// Self-heals a retained schedule whose deadline cannot be true any more.
+// The RTC timebase and the retained schedule normally live and die together --
+// a power cycle clears both -- but they can come apart: an OTA that relocates
+// esp_clk's retain structure restarts the clock while RTC_DATA survives. A
+// deadline further out than one whole period is the observable symptom, and
+// silently parking the slideshow for hours is the cost of ignoring it.
+void Application::NormalizeScheduleDeadlines() {
+    const int slideshow_period = SchedulePeriodSeconds(slideshow_interval_minutes_);
+    if (slideshow_period <= 0) {
+        s_retained_schedule.slideshow_due_rtc_us = 0;
+    } else {
+        const int remaining =
+            SecondsUntilRtcDeadline(s_retained_schedule.slideshow_due_rtc_us);
+        if (ScheduleDeadlineIsImplausible(remaining, slideshow_period)) {
+            ESP_LOGW(kTag, "Re-arming implausible slideshow deadline (remaining=%d period=%d)",
+                     remaining, slideshow_period);
+            ResetSlideshowDeadline();
+        }
+    }
+
+    const int sync_period = SchedulePeriodSeconds(network_sync_interval_minutes_);
+    if (sync_period <= 0) {
+        s_retained_schedule.sync_due_rtc_us = 0;
+    } else {
+        const int remaining =
+            SecondsUntilRtcDeadline(s_retained_schedule.sync_due_rtc_us);
+        if (ScheduleDeadlineIsImplausible(remaining, sync_period)) {
+            ESP_LOGW(kTag, "Re-arming implausible network sync deadline (remaining=%d period=%d)",
+                     remaining, sync_period);
+            ResetNetworkSyncDeadline();
+        }
+    }
+}
+
+void Application::ResetNetworkSyncDeadline() {
+    const int period = SchedulePeriodSeconds(network_sync_interval_minutes_);
+    s_retained_schedule.sync_config_minutes = network_sync_interval_minutes_;
+    s_retained_schedule.sync_due_rtc_us =
+        period > 0 ? static_cast<uint64_t>(NowRtcUs()) +
+                         static_cast<uint64_t>(period) * 1000000ULL
+                   : 0;
+}
+
+int Application::SecondsUntilSlideshow() const {
+    if (slideshow_interval_minutes_ <= 0) return -1;
+    return SecondsUntilRtcDeadline(s_retained_schedule.slideshow_due_rtc_us);
+}
+
+int Application::SecondsUntilNetworkSync() const {
+    if (network_sync_interval_minutes_ <= 0) return -1;
+    return SecondsUntilRtcDeadline(s_retained_schedule.sync_due_rtc_us);
+}
+
+bool Application::IsSlideshowDue() const {
+    return SecondsUntilSlideshow() == 0;
+}
+
+void Application::ApplySlideshowInterval(int minutes) {
+    if (!IsValidSlideshowInterval(minutes)) {
+        ESP_LOGW(kTag, "Ignoring invalid slideshow interval %d", minutes);
+        return;
+    }
+    slideshow_interval_minutes_ = minutes;
+    Settings nvs(kGalleryNamespace, true);
+    nvs.SetInt(kSlideshowIntervalKey, minutes);
+    ResetSlideshowDeadline();
+    if (rawdraw_ui_manager_) {
+        if (auto* sr = rawdraw_ui_manager_->GetSettingsRenderer()) {
+            sr->UpdateItem(kSettingsSlideshowIndex, FormatMinutesLabel(minutes));
+        }
+    }
+    ESP_LOGI(kTag, "Slideshow interval set to %s", FormatMinutesLabel(minutes).c_str());
+}
+
+// Awake advance. Deep sleep is still the normal scheduler; this covers the
+// sessions that stay awake past a deadline (USB power, LAN service, config AP)
+// and keeps them on exactly the same clock rather than a second timer that
+// drifted from the retained one.
+void Application::PumpSlideshowSchedule() {
+    if (!IsSlideshowDue() || !rawdraw_ui_manager_) return;
+    // Re-arm first: a gallery state that cannot advance right now (settings
+    // page open, delete dialog up) must not re-evaluate as due every tick.
+    ResetSlideshowDeadline();
+    if (rawdraw_ui_manager_->AdvanceGallerySlideshow()) {
+        ESP_LOGI(kTag, "Awake slideshow advance");
+    }
+}
+
+void Application::RequestSlideshowIntervalChange(int minutes) {
+    requested_slideshow_interval_.store(minutes, std::memory_order_release);
+}
+
+void Application::RequestWifiDisabled(const char* reason) {
+    ESP_LOGI(kTag, "Wi-Fi disable requested: %s", reason ? reason : "unspecified");
+    wifi_disable_requested_.store(true, std::memory_order_release);
+}
+
+void Application::DisableWifiAndPersist(const char* reason) {
+    wifi_enabled_.store(false, std::memory_order_release);
+    Settings sync_nvs(kSyncNamespace, true);
+    sync_nvs.SetBool(kWifiEnabledKey, false);
+    wifi_connect_deadline_us_ = 0;
+    if (rawdraw_ui_manager_ && rawdraw_ui_manager_->IsLanHttpServerRunning()) {
+        rawdraw_ui_manager_->StopLanHttpServer();
+    }
+    if (network_initialized_) {
+        WifiManager::GetInstance().StopStation();
+    }
+    wifi_connected_.store(false, std::memory_order_release);
+    ESP_LOGI(kTag, "Wi-Fi switch persisted OFF: %s", reason ? reason : "unspecified");
+}
+
+void Application::ApplyPendingWifiDisableRequest() {
+    if (!wifi_disable_requested_.exchange(false, std::memory_order_acq_rel)) return;
+    // Runs even when the switch already reads off: the point of the request is
+    // that some station activity is still up, and only the app task may take
+    // it down.
+    DisableWifiAndPersist("remote request");
+    // Monochrome status-bar/settings text only; never escalate a remote
+    // request into a full-colour waveform.
+    UpdateStatusBarForUi(true, true);
+}
+
 void Application::EnsureNetworkInitialized() {
     if (network_initialized_) return;
     Board::GetInstance().RequestNetwork();
@@ -944,12 +1132,11 @@ void Application::EnterManualSleep() {
     manual_sleep_requested_.store(true, std::memory_order_release);
 }
 
+// Called from the AP/LAN web-control task. Publish intent only: the NVS write,
+// the radio teardown and the sleep transition all belong to the app task.
 void Application::RequestManualSleep(bool disable_wifi) {
     if (disable_wifi) {
-        wifi_enabled_.store(false, std::memory_order_release);
-        Settings sync_nvs(kSyncNamespace, true);
-        sync_nvs.SetBool(kWifiEnabledKey, false);
-        ESP_LOGI(kTag, "Wi-Fi switch persisted OFF for web sleep request");
+        RequestWifiDisabled("web sleep request");
     }
     EnterManualSleep();
 }
@@ -985,6 +1172,10 @@ void Application::EnterLowPowerSleep(const char* reason) {
     UpdateStatusBarForUi(false, false);
 
     auto* sleep_lcd = static_cast<CustomLcdDisplay*>(Board::GetInstance().GetDisplay());
+    // Lock-free snapshot. This runs while the render task may still be
+    // finishing a waveform, and the sleep path must never wait on that task's
+    // framebuffer mutex -- the runtime guard would restart the device before
+    // the wait resolved.
     const bool full_color_recovery_needed =
         sleep_lcd != nullptr && sleep_lcd->NeedsFullColorRecovery();
 
@@ -1047,17 +1238,17 @@ void Application::CommitLowPowerSleep() {
         s_retained_schedule.display_metadata =
             rawdraw_ui_manager_->GetDisplayedPersistentMetadata();
     }
+    // A deadline that has already elapsed while awake is consumed here rather
+    // than turned into a zero-second timer wake.
     if (slideshow_interval_minutes_ <= 0) {
-        s_retained_schedule.slideshow_remaining_seconds = 0;
-    } else if (s_retained_schedule.slideshow_remaining_seconds <= 0) {
-        s_retained_schedule.slideshow_remaining_seconds =
-            SchedulePeriodSeconds(slideshow_interval_minutes_);
+        s_retained_schedule.slideshow_due_rtc_us = 0;
+    } else if (SecondsUntilSlideshow() == 0) {
+        ResetSlideshowDeadline();
     }
     if (network_sync_interval_minutes_ <= 0) {
-        s_retained_schedule.sync_remaining_seconds = 0;
-    } else if (s_retained_schedule.sync_remaining_seconds <= 0) {
-        s_retained_schedule.sync_remaining_seconds =
-            SchedulePeriodSeconds(network_sync_interval_minutes_);
+        s_retained_schedule.sync_due_rtc_us = 0;
+    } else if (SecondsUntilNetworkSync() == 0) {
+        ResetNetworkSyncDeadline();
     }
 
     int display_invalidation_seconds = 0;
@@ -1071,6 +1262,11 @@ void Application::CommitLowPowerSleep() {
     ESP_LOGI(kTag, "Calculated display invalidation deadline: %d seconds",
              display_invalidation_seconds);
 
+    const int slideshow_remaining = SecondsUntilSlideshow();
+    const int sync_remaining = wifi_enabled_.load(std::memory_order_acquire)
+                                   ? SecondsUntilNetworkSync()
+                                   : -1;
+
     int next_wake_seconds = 0;
     auto consider_deadline = [&next_wake_seconds](int remaining) {
         if (remaining > 0 &&
@@ -1078,30 +1274,20 @@ void Application::CommitLowPowerSleep() {
             next_wake_seconds = remaining;
         }
     };
-    consider_deadline(s_retained_schedule.slideshow_remaining_seconds);
-    if (wifi_enabled_.load(std::memory_order_acquire)) {
-        consider_deadline(s_retained_schedule.sync_remaining_seconds);
-    }
+    consider_deadline(slideshow_remaining);
+    consider_deadline(sync_remaining);
     consider_deadline(display_invalidation_seconds);
 
     esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
     if (next_wake_seconds > 0) {
-        if (slideshow_interval_minutes_ > 0) {
-            s_retained_schedule.slideshow_remaining_seconds = std::max(
-                0, s_retained_schedule.slideshow_remaining_seconds - next_wake_seconds);
-        }
-        if (wifi_enabled_.load(std::memory_order_acquire) &&
-            network_sync_interval_minutes_ > 0) {
-            s_retained_schedule.sync_remaining_seconds = std::max(
-                0, s_retained_schedule.sync_remaining_seconds - next_wake_seconds);
-        }
+        // Nothing to decrement: the deadlines are absolute, so an early GPIO
+        // wake, an overlong waveform or a 120 s interactive window all leave
+        // them describing the same instants they described here.
         ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(
             static_cast<uint64_t>(next_wake_seconds) * 1000000ULL));
         ESP_LOGI(kTag,
                  "Next wake in %d seconds (slide_remaining=%d sync_remaining=%d display=%d)",
-                 next_wake_seconds,
-                 s_retained_schedule.slideshow_remaining_seconds,
-                 s_retained_schedule.sync_remaining_seconds,
+                 next_wake_seconds, slideshow_remaining, sync_remaining,
                  display_invalidation_seconds);
     } else {
         ESP_LOGI(kTag, "All schedules disabled; sleeping until GPIO wake");
@@ -1183,7 +1369,25 @@ void Application::Run() {
         if (sntp_sync_pending_.exchange(false, std::memory_order_acq_rel)) {
             HandleSntpSynchronized();
         }
+        // Drained on every tick, including during sleep preparation: both of
+        // these persist to NVS, and dropping one because a sleep started in
+        // the same 250 ms window would lose a setting the user just changed.
+        // Neither can queue a refresh while preparing -- RequestActivePageRefresh()
+        // is suppressed by the UI manager, and UpdateStatusBarForUi() checks
+        // sleep_phase_ itself.
+        const int requested_interval =
+            requested_slideshow_interval_.exchange(-1, std::memory_order_acq_rel);
+        if (requested_interval >= 0) {
+            ApplySlideshowInterval(requested_interval);
+            if (rawdraw_ui_manager_) {
+                rawdraw_ui_manager_->RequestActivePageRefresh();
+            }
+        }
+        ApplyPendingWifiDisableRequest();
         if (rawdraw_ui_manager_ && sleep_phase_ == SleepPhase::Awake) {
+            if (!scheduler_timer_wake_) {
+                PumpSlideshowSchedule();
+            }
             rawdraw_ui_manager_->PumpClockRefresh();
         }
         auto* lcd = static_cast<CustomLcdDisplay*>(Board::GetInstance().GetDisplay());

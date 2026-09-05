@@ -81,9 +81,13 @@ curl -X POST \
 ```json
 {
   "success": true,
-  "id": "ap12345678901"
+  "id": "ap000000042"
 }
 ```
+
+`id` 由设备分配，格式为 `ap` + 9 位序号。序号存放在 NVS（命名空间 `photos`，键
+`next_seq`），跨深睡、重启和断电持续递增，因此同一台设备不会重复使用同一个 id。
+客户端应当原样保存返回的 `id`，不要自行推算或复用。
 
 失败常见原因：
 
@@ -106,7 +110,7 @@ curl "http://192.168.110.238/photos"
 {
   "photos": [
     {
-      "id": "ap12345678901",
+      "id": "ap000000042",
       "title": "WiFi四色图片",
       "date": "2026-05-21",
       "location": "WiFi AP",
@@ -137,7 +141,7 @@ curl "http://192.168.110.238/photos"
 
 ```bash
 curl \
-  "http://192.168.110.238/photo?id=ap12345678901" \
+  "http://192.168.110.238/photo?id=ap000000042" \
   --output image.bin
 ```
 
@@ -147,7 +151,7 @@ curl \
 
 ```bash
 curl -X DELETE \
-  "http://192.168.110.238/photo?id=ap12345678901"
+  "http://192.168.110.238/photo?id=ap000000042"
 ```
 
 成功返回：
@@ -162,7 +166,7 @@ curl -X DELETE \
 curl -X POST "http://192.168.110.238/photo/meta" \
   -H "Content-Type: application/json" \
   -d '{
-    "id": "ap12345678901",
+    "id": "ap000000042",
     "title": "每日照片",
     "date": "2026-05-21",
     "location": "NAS",
@@ -183,7 +187,7 @@ curl -X POST "http://192.168.110.238/photo/meta" \
 ```bash
 curl -X POST "http://192.168.110.238/photos/move" \
   -H "Content-Type: application/json" \
-  -d '{"id":"ap12345678901","delta":-1}'
+  -d '{"id":"ap000000042","delta":-1}'
 ```
 
 下移一位：
@@ -191,7 +195,7 @@ curl -X POST "http://192.168.110.238/photos/move" \
 ```bash
 curl -X POST "http://192.168.110.238/photos/move" \
   -H "Content-Type: application/json" \
-  -d '{"id":"ap12345678901","delta":1}'
+  -d '{"id":"ap000000042","delta":1}'
 ```
 
 ## 设置轮播周期
@@ -223,6 +227,11 @@ curl -X POST "http://192.168.110.238/settings" \
   -d '{"slideshow_interval":5}'
 ```
 
+设备收到请求后会把新周期交给应用主循环统一处理：写入 NVS、刷新设置页显示、并以
+当前时刻为起点重新计时。因此响应返回时新周期已被接受，但落盘和重新计时在随后的
+一个主循环周期（≤ 250 ms）内完成。新周期从"现在"开始算，不会继承上一个周期已经
+走过的时间。
+
 关闭本地 HTTP 服务：
 
 ```bash
@@ -238,6 +247,10 @@ curl -X POST "http://192.168.110.238/settings" \
   -H "Content-Type: application/json" \
   -d '{"service_enabled":false,"wifi_enabled":false,"sleep":true}'
 ```
+
+`wifi_enabled:false` 会持久化关闭设备的 Wi-Fi 开关（等同于在设置页手动关闭），
+而不只是停用当前这次连接；重新上电后 Wi-Fi 仍然是关闭状态，需要在设备设置页重新
+打开。
 
 支持值：
 

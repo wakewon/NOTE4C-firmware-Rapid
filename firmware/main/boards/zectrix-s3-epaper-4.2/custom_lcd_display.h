@@ -84,13 +84,28 @@ public:
     // Force a full e-paper refresh on the next immediate update.
     void RequestUrgentFullRefresh() override;
 
-    // Refresh state for sleep gating
-    // Lock-free snapshot used by the application sleep gate and the independent
-    // runtime guard.  Neither caller may wait forever on a wedged render task's
-    // framebuffer mutex while trying to decide whether the panel is idle.
+    // Refresh state for sleep gating.
+    //
+    // Everything a sleep-critical caller needs to make a decision is published
+    // as a lock-free snapshot.  Neither the application sleep gate nor the
+    // independent runtime guard may wait on the framebuffer mutex to decide
+    // whether the panel is idle: the guard exists precisely to recover from a
+    // wedged render task, and the sleep path blocking there turns a stuck
+    // waveform into a 150 s stall plus a guard restart instead of a clean
+    // deep sleep.
     bool IsRefreshPending() const;
-    bool NeedsFullColorRecovery();
-    bool FramebufferDiffersFromLastRefresh();
+    bool NeedsFullColorRecovery() const;
+
+    // Bounded: the comparison needs the framebuffer mutex, so it can fail.
+    // Reports "differs" on timeout -- the conservative answer, since the only
+    // consequence is one extra full-color waveform.
+    bool FramebufferDiffersFromLastRefresh(uint32_t timeout_ms = 250);
+
+    // Bounded framebuffer access for renderers. Returns false without taking
+    // the mutex if it could not be acquired in time; the caller must then skip
+    // drawing rather than block.
+    bool LockFramebuffer(uint32_t timeout_ms);
+    void UnlockFramebuffer();
 
     // Notify when refresh transitions from busy to idle.
     void SetOnRefreshIdle(std::function<void()> cb);
@@ -191,11 +206,14 @@ private:
     bool prev_buffer_synced = false;  // 标志：prev_buffer 是否已与屏幕同步
     bool refresh_in_progress = false;
     std::atomic<bool> refresh_pending_snapshot_{false};
+    // Mirrors fast_bw_since_full_ for lock-free readers on the sleep path.
+    std::atomic<bool> full_color_recovery_snapshot_{false};
     bool refresh_busy_seen_ = false;
     uint32_t next_kick_ms_ = 0;
     std::function<void()> on_refresh_idle_;
 
     void UpdateDisplayBusyLocked();
+    void PublishRecoveryDebtLocked();
     bool CheckRefreshIdleLocked();
     void ArmIdleFullRefreshLocked(TickType_t now,
                                   ssd2683_fast_bw::RecoveryMode recovery_mode);

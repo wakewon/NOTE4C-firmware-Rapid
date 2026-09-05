@@ -407,7 +407,13 @@ void CustomLcdDisplay::UpdateDisplayBusyLocked() {
                       fast_bw_refresh_requested_ || idle_full_refresh_pending_ ||
                       refresh_in_progress;
     refresh_pending_snapshot_.store(busy, std::memory_order_release);
+    PublishRecoveryDebtLocked();
     sm_set_busy(SleepBusySrc::Display, busy);
+}
+
+void CustomLcdDisplay::PublishRecoveryDebtLocked() {
+    full_color_recovery_snapshot_.store(IsFourColorPanel() && fast_bw_since_full_,
+                                        std::memory_order_release);
 }
 
 bool CustomLcdDisplay::CheckRefreshIdleLocked() {
@@ -429,27 +435,36 @@ bool CustomLcdDisplay::IsRefreshPending() const {
     return refresh_pending_snapshot_.load(std::memory_order_acquire);
 }
 
-bool CustomLcdDisplay::NeedsFullColorRecovery() {
-    if (dirty_mutex) {
-        xSemaphoreTake(dirty_mutex, portMAX_DELAY);
-    }
-    const bool needed = IsFourColorPanel() && fast_bw_since_full_;
+bool CustomLcdDisplay::NeedsFullColorRecovery() const {
+    return full_color_recovery_snapshot_.load(std::memory_order_acquire);
+}
+
+bool CustomLcdDisplay::LockFramebuffer(uint32_t timeout_ms) {
+    if (!dirty_mutex) return true;
+    return xSemaphoreTake(dirty_mutex, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+}
+
+void CustomLcdDisplay::UnlockFramebuffer() {
     if (dirty_mutex) {
         xSemaphoreGive(dirty_mutex);
     }
-    return needed;
 }
 
-bool CustomLcdDisplay::FramebufferDiffersFromLastRefresh() {
-    if (dirty_mutex) {
-        xSemaphoreTake(dirty_mutex, portMAX_DELAY);
+bool CustomLcdDisplay::FramebufferDiffersFromLastRefresh(uint32_t timeout_ms) {
+    if (!LockFramebuffer(timeout_ms)) {
+        // The mutex is only held for short bursts (a dirty-rect merge or the
+        // 30 KB tx_buf snapshot), never across a waveform, so failing here
+        // means the render task is in trouble. Report a difference: one extra
+        // full-color refresh is cheap, and the caller stays non-blocking.
+        ESP_LOGW(TAG,
+                 "[REFRESH] framebuffer compare timed out after %ums; assuming changed",
+                 (unsigned)timeout_ms);
+        return true;
     }
     const bool differs = !prev_buffer_synced || prev_buffer == nullptr ||
                          buffer == nullptr ||
                          memcmp(buffer, prev_buffer, lcd_spi_data.buffer_len) != 0;
-    if (dirty_mutex) {
-        xSemaphoreGive(dirty_mutex);
-    }
+    UnlockFramebuffer();
     return differs;
 }
 
@@ -506,6 +521,7 @@ void CustomLcdDisplay::ArmIdleFullRefreshLocked(
 void CustomLcdDisplay::CompleteFastBwRefreshLocked(TickType_t completed_at) {
 #if CONFIG_ZECTRIX_EPD_FAST_BW
     fast_bw_since_full_ = true;
+    PublishRecoveryDebtLocked();
     // RequestFastBwRefresh() tentatively resets the idle clock as soon as the
     // user acts. Rebase it here so a long complete B/W balance waveform does
     // not consume the entire 10/30 s dwell while BUSY is asserted.
@@ -525,6 +541,7 @@ void CustomLcdDisplay::CompleteFastBwRefreshLocked(TickType_t completed_at) {
 
 void CustomLcdDisplay::CompleteFullColorRefreshLocked() {
     fast_bw_since_full_ = false;
+    PublishRecoveryDebtLocked();
     // A standard waveform clears every kind of FAST_BW debt. Drop both an
     // armed deadline and a callback that became pending while the controller
     // was busy; a later queued FAST_BW request will establish a fresh one when

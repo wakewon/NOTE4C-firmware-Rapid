@@ -420,9 +420,24 @@ public:
      */
     void RequestActivePageRefresh(
         RefreshIntent intent = RefreshIntent::FullColor);
-    void SetGallerySlideshowIntervalMinutes(int minutes);
-    int GetGallerySlideshowIntervalMinutes() const { return gallery_slideshow_interval_minutes_; }
-    void SetLowPowerSlideshowMode(bool enabled);
+    // Slideshow timing is not owned here. Application owns one deadline that
+    // survives deep sleep and drives both the awake and the wake-up advance;
+    // this class only performs the advance and reports the events that should
+    // restart the dwell.
+    //
+    // `dwell_reset` fires whenever a user action makes a new photo visible;
+    // `interval_changed` carries a new interval requested over HTTP, which the
+    // application must validate, persist and re-arm. Both are invoked on the
+    // UI task.
+    void SetSlideshowDwellResetCallback(std::function<void()> callback) {
+        slideshow_dwell_reset_cb_ = std::move(callback);
+    }
+    void SetSlideshowIntervalChangedCallback(std::function<void(int)> callback) {
+        slideshow_interval_changed_cb_ = std::move(callback);
+    }
+    // Advances to the next fullscreen photo. Returns false when the gallery is
+    // not in a state that can advance (wrong page, dialog open, no photos).
+    bool AdvanceGallerySlideshow();
     bool PrepareGallerySlideshowFrame(int retained_index, bool advance);
     bool PrepareGalleryInteractiveWakeFrame(
         int retained_index, bool retained_fullscreen,
@@ -532,7 +547,6 @@ private:
     rawdraw::Clock clock_;
     esp_timer_handle_t clock_refresh_timer_ = nullptr;
     esp_timer_handle_t transient_refresh_timer_ = nullptr;
-    esp_timer_handle_t gallery_slideshow_timer_ = nullptr;
     std::atomic<bool> clock_refresh_pending_{false};
     std::atomic<bool> transient_refresh_pending_{false};
     std::atomic<bool> active_page_refresh_pending_{false};
@@ -540,12 +554,10 @@ private:
     std::atomic<int> active_page_fast_refresh_intent_{
         static_cast<int>(RefreshIntent::FastBwDeferredInteraction)};
     std::atomic<bool> gallery_storage_sync_pending_{false};
-    std::atomic<bool> gallery_slideshow_pending_{false};
-    std::atomic<int64_t> gallery_slideshow_deadline_us_{0};
     std::atomic<bool> input_refresh_locked_{false};
     int last_clock_minute_key_ = -1;
-    int gallery_slideshow_interval_minutes_ = 0;
-    bool low_power_slideshow_mode_ = false;
+    std::function<void()> slideshow_dwell_reset_cb_;
+    std::function<void(int)> slideshow_interval_changed_cb_;
     bool persistent_sleep_preparing_ = false;
     bool current_state_matches_display_ = true;
     PersistentDisplayMetadata displayed_metadata_{};
@@ -574,11 +586,8 @@ private:
     void ArmTransientRefreshTimer(int delay_ms = 2000);
     static void OnClockRefreshTimer(void* arg);
     static void OnTransientRefreshTimer(void* arg);
-    static void OnGallerySlideshowTimer(void* arg);
-    void ArmGallerySlideshowTimer();
-    void ResetGallerySlideshowTimer();
+    void NotifySlideshowDwellReset();
     void QueueGalleryStorageSync(const char* preferred_photo_id = nullptr);
-    bool AdvanceGallerySlideshow();
     void DrawGlobalPageFrame(uint8_t* fb, int width, int height);
     void DrawQuickSwitchOverlay(uint8_t* fb, int width, int height);
     bool HandleQuickSwitchInput(const rawdraw::ButtonEvent& event);
@@ -593,7 +602,10 @@ private:
     PersistentDisplaySnapshot CapturePersistentSnapshot() const;
     rawdraw::PersistentDisplayDependencies GetPersistentChanges() const;
     void RecordCurrentFrameAsDisplayed();
-    void RenderActivePageToFramebuffer();
+    // Returns false if the framebuffer mutex could not be acquired in time.
+    // Sleep-critical callers must treat that as "frame not prepared" rather
+    // than waiting.
+    bool RenderActivePageToFramebuffer();
     bool HasGlobalChrome() const;
 };
 

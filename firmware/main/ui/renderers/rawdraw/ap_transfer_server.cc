@@ -161,9 +161,14 @@ void DeferredControlTask(void* arg) {
         request->server->Stop();
     }
     if (request->stop_wifi && !request->enter_sleep) {
-        ESP_LOGI(kTag, "Stopping WiFi after web control request");
-        esp_wifi_disconnect();
-        esp_wifi_stop();
+        // Never call esp_wifi_disconnect()/esp_wifi_stop() here. Those go
+        // behind WifiManager's back: it keeps station_active_ set, emits no
+        // Disconnected event, and the status bar and settings page go on
+        // showing a connection that no longer exists until something else
+        // happens to correct them. Hand the request to the application, which
+        // owns the radio, and let it tear the station down properly.
+        ESP_LOGI(kTag, "Requesting Wi-Fi off after web control request");
+        Application::GetInstance().RequestWifiDisabled("web control request");
     }
     if (request->enter_sleep) {
         ESP_LOGI(kTag, "Queuing unified low-power sleep after web control request");
@@ -346,6 +351,11 @@ void ApTransferServer::Stop() {
 }
 
 bool ApTransferServer::StartAccessPoint() {
+    // The raw esp_wifi_* calls below are the sanctioned handoff, not a bypass:
+    // Suspend/ResumeStationForExternalAp() unhook WifiManager's event handlers
+    // and reconnect timers for the duration, so the driver has exactly one
+    // owner at a time. Anything that touches esp_wifi_* outside such a pair
+    // desynchronizes WifiManager's view of the radio.
     WifiManager::GetInstance().SuspendStationForExternalAp();
 
     // AP mode is entered from several states: normal STA, user-disabled WiFi,
@@ -606,8 +616,22 @@ esp_err_t ApTransferServer::UploadHandler(httpd_req_t* req) {
     PhotoInfo info = {};
     const uint32_t now = static_cast<uint32_t>(time(nullptr));
     const uint64_t ms = static_cast<uint64_t>(esp_timer_get_time() / 1000);
-    snprintf(info.id, sizeof(info.id), "ap%011llu",
-             static_cast<unsigned long long>(ms % 100000000000ULL));
+    // Photo storage owns ID allocation. This used to format uptime
+    // milliseconds, which restarts near zero on every deep-sleep wake and
+    // every reset, so two uploads made at similar uptimes produced the same
+    // id -- and photo_save() treats a repeated id as an update, silently
+    // replacing the earlier photo's data and metadata.
+    if (photo_alloc_id("ap", info.id, sizeof(info.id)) != 0) {
+        free(buf);
+        ESP_LOGE(kTag, "Could not allocate a photo id for the upload");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_hdr(req, "Connection", "close");
+        self->NotifyState(kError, "Save failed");
+        esp_err_t alloc_ret = httpd_resp_send(
+            req, "{\"success\":false,\"error\":\"保存失败\"}", HTTPD_RESP_USE_STRLEN);
+        CloseCurrentSession(req);
+        return alloc_ret == ESP_OK ? ESP_FAIL : alloc_ret;
+    }
     snprintf(info.title, sizeof(info.title), is_2bpp ? "WiFi四色图片" : "WiFi黑白图片");
     snprintf(info.location, sizeof(info.location), "WiFi AP");
     snprintf(info.body, sizeof(info.body), is_2bpp ? "手机 WiFi 传图 · 2 BP 四色" : "手机 WiFi 传图 · 1 BP 黑白");
@@ -675,7 +699,10 @@ esp_err_t ApTransferServer::StatusHandler(httpd_req_t* req) {
 
 esp_err_t ApTransferServer::SettingsHandler(httpd_req_t* req) {
     auto* self = static_cast<ApTransferServer*>(req->user_ctx);
-    Settings nvs(kGalleryNamespace, req->method == HTTP_POST);
+    // Read-only: the application owns this key. It also owns the slideshow
+    // deadline and the settings-page label, and having an HTTP task write the
+    // value directly left those three disagreeing until the next boot.
+    Settings nvs(kGalleryNamespace, false);
     int interval = nvs.GetInt(kSlideshowIntervalKey, 5);
     bool close_service = false;
     bool stop_wifi = false;
@@ -693,11 +720,10 @@ esp_err_t ApTransferServer::SettingsHandler(httpd_req_t* req) {
             if (interval != 0 && interval != 5 && interval != 10 && interval != 30) {
                 interval = 5;
             }
-            nvs.SetInt(kSlideshowIntervalKey, interval);
             if (self && self->settings_changed_callback_) {
                 self->settings_changed_callback_(interval);
             }
-            ESP_LOGI(kTag, "AP settings updated: slideshow_interval=%d", interval);
+            ESP_LOGI(kTag, "AP settings change requested: slideshow_interval=%d", interval);
         }
         cJSON* service_item = cJSON_GetObjectItemCaseSensitive(root, "service_enabled");
         if (cJSON_IsBool(service_item) && !cJSON_IsTrue(service_item)) {

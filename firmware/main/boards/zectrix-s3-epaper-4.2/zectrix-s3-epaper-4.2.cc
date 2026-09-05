@@ -177,7 +177,6 @@ public:
     }
 
     bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
-        charge_status_.Tick(GetNowMs());
         ChargeStatus::Snapshot snapshot = charge_status_.Get();
         charging = snapshot.charging;
         discharging = !snapshot.power_present;
@@ -228,12 +227,10 @@ public:
     }
 
     ChargeStatus::Snapshot RefreshChargeSnapshotForFactoryTest() {
-        charge_status_.Tick(GetNowMs());
         return charge_status_.Get();
     }
 
     bool IsExternalPowerPresent() {
-        charge_status_.Tick(GetNowMs());
         return charge_status_.Get().power_present;
     }
 
@@ -262,6 +259,9 @@ public:
     }
 
     void PrepareForDeepSleep() {
+        // Stop sampling before the LED task goes away: EXT0/EXT1 on the same
+        // two charger pins take over as the wake sources during deep sleep.
+        charge_status_.StopSampler();
         if (nfc_ != nullptr) {
             nfc_->PowerOff();
         }
@@ -284,10 +284,6 @@ public:
     }
 
 private:
-    static int64_t GetNowMs() {
-        return esp_timer_get_time() / 1000;
-    }
-
     void InitializePower() {
         power_ = std::make_unique<BoardPowerBsp>(EPD_PWR_PIN,
                                                  Audio_PWR_PIN,
@@ -338,7 +334,8 @@ private:
     }
 
     void InitializeChargeStatus() {
-        charge_status_.Init(CHARGE_DETECT_GPIO, CHARGE_FULL_GPIO, GetNowMs());
+        charge_status_.Init(CHARGE_DETECT_GPIO, CHARGE_FULL_GPIO);
+        charge_status_.StartSampler();
     }
 
     void InitializeLcdDisplay() {

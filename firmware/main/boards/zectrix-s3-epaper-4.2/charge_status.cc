@@ -2,9 +2,16 @@
 
 #include <driver/gpio.h>
 #include <esp_err.h>
+#include <esp_log.h>
+#include <esp_timer.h>
 #include "config.h"
 
-void ChargeStatus::Init(gpio_num_t detect_gpio, gpio_num_t full_gpio, int64_t now_ms) {
+namespace {
+constexpr char kTag[] = "ChargeStatus";
+int64_t NowMs() { return esp_timer_get_time() / 1000; }
+}  // namespace
+
+void ChargeStatus::Init(gpio_num_t detect_gpio, gpio_num_t full_gpio) {
     detect_gpio_ = detect_gpio;
     full_gpio_ = full_gpio;
 
@@ -17,14 +24,60 @@ void ChargeStatus::Init(gpio_num_t detect_gpio, gpio_num_t full_gpio, int64_t no
     ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_config(&cfg));
 
     UpdateSnapshot(State::kNoPower, false, false, false);
-    Tick(now_ms);
+    // Publish one real sample before returning. The LED task is constructed
+    // ahead of this call, and the application seeds its first framebuffer from
+    // a battery reading during initialization; both must see measured pins
+    // rather than the kNoPower placeholder above.
+    configured_.store(true, std::memory_order_release);
+    Sample(NowMs());
 }
 
-void ChargeStatus::OnStateChanged(std::function<void(const Snapshot&)> cb) {
-    on_state_changed_ = cb;
+void ChargeStatus::StartSampler() {
+    if (sampler_task_ != nullptr) return;
+    if (!configured_.load(std::memory_order_acquire)) {
+        ESP_LOGE(kTag, "StartSampler() before Init(); pins not configured");
+        return;
+    }
+    sampler_stop_requested_.store(false, std::memory_order_release);
+    const BaseType_t created = xTaskCreatePinnedToCore(
+        SamplerTask, "charge_status", 2048, this, 2, &sampler_task_, 0);
+    if (created != pdPASS) {
+        sampler_task_ = nullptr;
+        ESP_LOGE(kTag, "Failed to start charge sampler; snapshot will not update");
+        return;
+    }
+    ESP_LOGI(kTag, "Charge sampler started at %d ms", kSamplePeriodMs);
 }
 
-void ChargeStatus::Tick(int64_t now_ms) {
+void ChargeStatus::StopSampler() {
+    if (sampler_task_ == nullptr) return;
+    sampler_stop_requested_.store(true, std::memory_order_release);
+    // One sample period plus slack is enough for a cooperative exit. Falling
+    // back to vTaskDelete() is safe -- the sampler owns no lock and no
+    // allocation -- but it should not be the normal path.
+    for (int waited_ms = 0; waited_ms < 300 && sampler_task_ != nullptr; waited_ms += 10) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (sampler_task_ != nullptr) {
+        TaskHandle_t task = sampler_task_;
+        sampler_task_ = nullptr;
+        vTaskDelete(task);
+    }
+}
+
+void ChargeStatus::SamplerTask(void* arg) {
+    auto* self = static_cast<ChargeStatus*>(arg);
+    while (!self->sampler_stop_requested_.load(std::memory_order_acquire)) {
+        self->Sample(NowMs());
+        vTaskDelay(pdMS_TO_TICKS(kSamplePeriodMs));
+    }
+    self->sampler_task_ = nullptr;
+    vTaskDelete(nullptr);
+}
+
+void ChargeStatus::Sample(int64_t now_ms) {
+    if (!configured_.load(std::memory_order_acquire)) return;
+
     const bool detect_high = gpio_get_level(detect_gpio_) == CHARGE_DETECT_CHARGING_LEVEL;
     const bool full_high = gpio_get_level(full_gpio_) == 1;
 
@@ -79,11 +132,8 @@ void ChargeStatus::Tick(int64_t now_ms) {
 
 void ChargeStatus::UpdateSnapshot(State state, bool power_present, bool full, bool no_battery) {
     const bool charging = (state == State::kCharging || state == State::kNoBattery);
-    const uint32_t packed = Pack(state, power_present, charging, full, no_battery);
-    const uint32_t old = snapshot_.exchange(packed, std::memory_order_relaxed);
-    if (old != packed && on_state_changed_) {
-        on_state_changed_(Unpack(packed));
-    }
+    snapshot_.store(Pack(state, power_present, charging, full, no_battery),
+                    std::memory_order_release);
 }
 
 uint32_t ChargeStatus::Pack(State state, bool power_present, bool charging, bool full, bool no_battery) {
@@ -105,5 +155,5 @@ ChargeStatus::Snapshot ChargeStatus::Unpack(uint32_t v) {
 }
 
 ChargeStatus::Snapshot ChargeStatus::Get() const {
-    return Unpack(snapshot_.load(std::memory_order_relaxed));
+    return Unpack(snapshot_.load(std::memory_order_acquire));
 }

@@ -11,6 +11,8 @@
 #include <esp_log.h>
 #include <esp_spiffs.h>
 #include <cJSON.h>
+#include <nvs.h>
+#include <nvs_flash.h>
 
 #include <stdio.h>
 #include <string.h>
@@ -51,6 +53,13 @@ static std::recursive_mutex s_storage_mutex;
 
 static int save_index(void);
 static int write_meta_file(const PhotoInfo* info);
+
+// ID sequence. Kept in NVS rather than derived from the clock: photo IDs must
+// stay unique for the life of the device, and every timebase available at
+// upload time restarts -- esp_timer_get_time() on each boot, and the wall
+// clock is unset until SNTP or the RTC provides it.
+static const char* kIdNamespace = "photos";
+static const char* kIdSeqKey = "next_seq";
 
 static void terminate_photo_info_strings(PhotoInfo* info) {
     if (!info) return;
@@ -414,6 +423,73 @@ int photo_storage_init(void) {
     s_initialized = true;
     ESP_LOGI(kTag, "Photo storage initialized (%d photos)", s_photo_count);
     return 0;
+}
+
+static uint32_t load_next_id_seq(void) {
+    nvs_handle_t handle = 0;
+    if (nvs_open(kIdNamespace, NVS_READONLY, &handle) != ESP_OK) {
+        return 1;
+    }
+    uint32_t seq = 1;
+    if (nvs_get_u32(handle, kIdSeqKey, &seq) != ESP_OK) {
+        seq = 1;
+    }
+    nvs_close(handle);
+    return seq;
+}
+
+static void store_next_id_seq(uint32_t seq) {
+    nvs_handle_t handle = 0;
+    if (nvs_open(kIdNamespace, NVS_READWRITE, &handle) != ESP_OK) {
+        ESP_LOGW(kTag, "Cannot open %s for the photo ID sequence", kIdNamespace);
+        return;
+    }
+    if (nvs_set_u32(handle, kIdSeqKey, seq) == ESP_OK) {
+        nvs_commit(handle);
+    }
+    nvs_close(handle);
+}
+
+int photo_alloc_id(const char *prefix, char *out, size_t out_size) {
+    std::lock_guard<std::recursive_mutex> lock(s_storage_mutex);
+    if (!out || out_size < sizeof(PhotoInfo::id)) {
+        return -1;
+    }
+    if (!s_initialized && photo_storage_init() != 0) {
+        return -1;
+    }
+
+    char tag[5] = "ph";
+    if (prefix && prefix[0] != '\0') {
+        strlcpy(tag, prefix, sizeof(tag));
+    }
+
+    // The sequence is persisted before it is used, so a crash between the
+    // write and the save burns an ID rather than reusing one. The index scan
+    // is the backstop for the remaining case: NVS erased while the SPIFFS
+    // photos survived.
+    uint32_t seq = load_next_id_seq();
+    for (int attempt = 0; attempt < PHOTO_MAX_PHOTOS + 1; ++attempt) {
+        snprintf(out, out_size, "%s%09lu", tag, (unsigned long)seq);
+        seq = (seq == UINT32_MAX) ? 1 : seq + 1;
+        bool taken = false;
+        for (int i = 0; i < s_photo_count; ++i) {
+            if (strcmp(s_photos[i].id, out) == 0) {
+                taken = true;
+                break;
+            }
+        }
+        if (!taken) {
+            store_next_id_seq(seq);
+            return 0;
+        }
+        ESP_LOGW(kTag, "Photo ID %s already present; advancing sequence", out);
+    }
+
+    store_next_id_seq(seq);
+    ESP_LOGE(kTag, "Could not allocate a free photo ID");
+    out[0] = '\0';
+    return -1;
 }
 
 int photo_save(const PhotoInfo *info, const uint8_t *data_1bpp) {
