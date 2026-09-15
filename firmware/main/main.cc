@@ -87,6 +87,6 @@ extern "C" void app_main(void)
     // initialization deadlock instead of starting too late to observe it.
     RuntimeGuardNoteProgress(RuntimeGuardPhase::Initializing);
     StartDisplayStallGuard();
-    app.Initialize();
+    app.Initialize(display_stall_recovery_boot);
     app.Run();  // This function runs the main event loop and never returns
 }

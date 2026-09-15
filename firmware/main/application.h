@@ -29,7 +29,7 @@ public:
     Application(const Application&) = delete;
     Application& operator=(const Application&) = delete;
 
-    void Initialize();
+    void Initialize(bool display_stall_recovery_boot = false);
     void Run();
 
     DeviceState GetDeviceState() const { return state_.load(std::memory_order_acquire); }

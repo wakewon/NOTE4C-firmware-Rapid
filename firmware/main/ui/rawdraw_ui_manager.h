@@ -273,6 +273,8 @@ public:
     PersistentDisplayMetadata GetDisplayedPersistentMetadata() const;
     rawdraw::PersistentDisplayDependencies GetVisiblePersistentChanges() const;
     void AdoptRetainedPersistentMetadata(const PersistentDisplayMetadata& metadata);
+    bool PrepareRetainedGalleryFrame(int retained_index,
+                                     bool retained_fullscreen);
     bool PrepareRetainedDisplayInvalidation(int retained_index,
                                             bool retained_fullscreen);
     PersistentFramePreparation PreparePersistentFrame();

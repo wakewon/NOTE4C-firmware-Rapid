@@ -332,7 +332,7 @@ Application::Application() = default;
 
 Application::~Application() = default;
 
-void Application::Initialize() {
+void Application::Initialize(bool display_stall_recovery_boot) {
     RuntimeGuardNoteProgress(RuntimeGuardPhase::Initializing);
     input_ready_.store(false, std::memory_order_release);
     Settings gallery_nvs(kGalleryNamespace, false);
@@ -400,6 +400,11 @@ void Application::Initialize() {
         scheduler_timer_wake_ = false;
     }
     NormalizeScheduleDeadlines();
+    const bool restore_after_display_stall =
+        display_stall_recovery_boot &&
+        s_retained_schedule.display_metadata.contract.restorable &&
+        s_retained_schedule.display_metadata.contract.restore_kind ==
+            ui::PersistentRestoreKind::Gallery;
     // One line per boot describing the single schedule, the way
     // "Power lifecycle:" describes the single power record. Both deadlines are
     // absolute, so consecutive boots must show them counting down in real
@@ -512,8 +517,10 @@ void Application::Initialize() {
             // Render them correctly once instead of FAST_BW plus a recovery.
             lcd->RequestUrgentFullRefresh();
         }
-    }, scheduler_timer_wake_ || interactive_button_wake);
-    if ((scheduler_timer_wake_ || interactive_button_wake) &&
+    }, scheduler_timer_wake_ || interactive_button_wake ||
+           restore_after_display_stall);
+    if ((scheduler_timer_wake_ || interactive_button_wake ||
+         restore_after_display_stall) &&
         s_retained_schedule.magic == kRetainedMagic) {
         rawdraw_ui_manager_->AdoptRetainedPersistentMetadata(
             s_retained_schedule.display_metadata);
@@ -524,7 +531,19 @@ void Application::Initialize() {
         [this]() { ResetSlideshowDeadline(); });
     rawdraw_ui_manager_->SetSlideshowIntervalChangedCallback(
         [this](int minutes) { RequestSlideshowIntervalChange(minutes); });
-    if (scheduler_timer_wake_ && slideshow_due_) {
+    if (restore_after_display_stall) {
+        // The guard may have interrupted an SSD2683 waveform while the glass
+        // was black or otherwise transitional. Rebuild the last committed
+        // gallery frame in one pass: never expose Init()'s default memory-card
+        // framebuffer and never count recovery as another slideshow advance.
+        const bool restored = rawdraw_ui_manager_->PrepareRetainedGalleryFrame(
+            s_retained_schedule.selected_photo_index,
+            s_retained_schedule.gallery_fullscreen != 0);
+        ESP_LOGW(kTag,
+                 "Display-stall recovery restored retained gallery frame=%d photo=%d fullscreen=%d",
+                 restored ? 1 : 0, s_retained_schedule.selected_photo_index,
+                 s_retained_schedule.gallery_fullscreen != 0 ? 1 : 0);
+    } else if (scheduler_timer_wake_ && slideshow_due_) {
         slideshow_refresh_requested_ = rawdraw_ui_manager_->PrepareGallerySlideshowFrame(
             s_retained_schedule.selected_photo_index, true);
         ESP_LOGI(kTag, "Scheduled slideshow frame requested=%d",

@@ -755,10 +755,21 @@ PersistentFramePreparation RawDrawUiManager::PreparePersistentFrame() {
 
 bool RawDrawUiManager::PrepareRetainedDisplayInvalidation(
     int retained_index, bool retained_fullscreen) {
+    const bool prepared =
+        PrepareRetainedGalleryFrame(retained_index, retained_fullscreen);
+    if (prepared) {
+        ESP_LOGI(kTag,
+                 "Retained persistent frame rebuilt for scheduled invalidation");
+    }
+    return prepared;
+}
+
+bool RawDrawUiManager::PrepareRetainedGalleryFrame(
+    int retained_index, bool retained_fullscreen) {
     if (!displayed_metadata_.contract.restorable ||
         displayed_metadata_.contract.restore_kind != PersistentRestoreKind::Gallery ||
         !photo_gallery_renderer_) {
-        ESP_LOGW(kTag, "Retained display cannot be reconstructed for invalidation");
+        ESP_LOGW(kTag, "Retained gallery display cannot be reconstructed");
         displayed_metadata_.contract.restorable = false;
         displayed_metadata_.contract.wake_dependencies = 0;
         return false;
@@ -774,7 +785,6 @@ bool RawDrawUiManager::PrepareRetainedDisplayInvalidation(
     current_state_matches_display_ = true;
     status_bar_data_.page_title = GetPageTitle(current_page_);
     RefreshActivePage(RefreshIntent::FullColor);
-    ESP_LOGI(kTag, "Retained persistent frame rebuilt for scheduled invalidation");
     return true;
 }
 

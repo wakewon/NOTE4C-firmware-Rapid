@@ -702,33 +702,48 @@ void PhotoGalleryRenderer::RenderDeleteDialog(uint8_t* fb, int width, int height
 }
 
 bool PhotoGalleryRenderer::LoadPhotoData(int index) {
-    if (current_photo_data_) {
-        free(current_photo_data_);
-        current_photo_data_ = nullptr;
+    if (index < 0) {
+        if (current_photo_data_) {
+            free(current_photo_data_);
+            current_photo_data_ = nullptr;
+        }
+        current_photo_size_ = 0;
+        return false;
     }
-    current_photo_size_ = 0;
-
-    if (index < 0 || index >= static_cast<int>(photo_ids_.size())) return false;
+    if (index >= static_cast<int>(photo_ids_.size())) return false;
 
     const PhotoEntry& info = photo_ids_[index];
     if (info.file_size == 0 || info.width == 0 || info.height == 0) return false;
-    current_photo_data_ = static_cast<uint8_t*>(malloc(info.file_size));
-    if (!current_photo_data_) return false;
+    // Load transactionally.  A slideshow advance is allowed to skip a corrupt
+    // or temporarily unreadable entry, but it must not destroy the photo which
+    // is already known to be displayable.  The old implementation freed the
+    // current buffer before every attempt; if every candidate failed (for
+    // example under temporary memory pressure), fullscreen mode was left with
+    // no image and the following forced refresh replaced the good photo with
+    // an empty/intermediate frame.
+    uint8_t* candidate = static_cast<uint8_t*>(malloc(info.file_size));
+    if (!candidate) {
+        ESP_LOGW(kTag, "Keeping current photo: allocation failed for id=%s size=%u",
+                 info.id, static_cast<unsigned>(info.file_size));
+        return false;
+    }
 
-    int bytes_read = photo_load(info.id, current_photo_data_, info.file_size);
+    int bytes_read = photo_load(info.id, candidate, info.file_size);
     if (bytes_read > 0 &&
         (IsBwry2bppImage(info.width, info.height, bytes_read) ||
          IsMono1bppImage(info.width, info.height, bytes_read))) {
+        if (current_photo_data_) {
+            free(current_photo_data_);
+        }
+        current_photo_data_ = candidate;
         current_photo_size_ = bytes_read;
         current_photo_width_ = info.width;
         current_photo_height_ = info.height;
         return true;
-    } else {
-        ESP_LOGW(kTag, "Skipping unreadable photo id=%s bytes=%d expected=%u",
-                 info.id, bytes_read, static_cast<unsigned>(info.file_size));
-        free(current_photo_data_);
-        current_photo_data_ = nullptr;
     }
+    ESP_LOGW(kTag, "Skipping unreadable photo id=%s bytes=%d expected=%u",
+             info.id, bytes_read, static_cast<unsigned>(info.file_size));
+    free(candidate);
     return false;
 }
 
