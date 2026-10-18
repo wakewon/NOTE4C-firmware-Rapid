@@ -78,3 +78,6 @@ CONFIG_LV_BUILD_EXAMPLES=n
 CONFIG_LV_BUILD_DEMOS=n
 CONFIG_LWIP_TCPIP_TASK_STACK_SIZE=16384
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=8192
+# Three servers are configured in application.cc; with the default of 1 lwIP
+# silently dropped all but ntp.aliyun.com.
+CONFIG_LWIP_SNTP_MAX_SERVERS=3
