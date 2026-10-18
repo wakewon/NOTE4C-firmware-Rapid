@@ -13,8 +13,11 @@
 #ifndef AP_TRANSFER_SERVER_H
 #define AP_TRANSFER_SERVER_H
 
+#include <atomic>
+#include <mutex>
 #include <string>
 #include <functional>
+#include <esp_timer.h>
 #include <esp_http_server.h>
 #include <esp_netif.h>
 #include <freertos/FreeRTOS.h>
@@ -41,6 +44,11 @@ public:
 
     // Check if server is running
     bool IsRunning() const { return server_ != nullptr; }
+    // esp_timer time of the last HTTP connection (or of the start), 0 if
+    // never started. Read by the app task for the local-service idle timeout.
+    int64_t LastActivityUs() const {
+        return last_activity_us_.load(std::memory_order_acquire);
+    }
     bool IsApMode() const { return mode_ == TransferMode::kAp; }
     bool IsLanMode() const { return mode_ == TransferMode::kLan; }
 
@@ -71,8 +79,16 @@ private:
         kLan,
     };
 
+    // Start/Stop run on the app task, the ap_web_control task and the AP
+    // start task; this serializes them. Recursive because Stop() may run from
+    // a path that already holds it (a failed start).
+    std::recursive_mutex lifecycle_mutex_;
+    std::atomic<int64_t> last_activity_us_{0};
     httpd_handle_t server_ = nullptr;
     esp_netif_t* ap_netif_ = nullptr;
+    // The AP has taken over the Wi-Fi driver and must hand it back (or stop
+    // it) on release.
+    bool ap_owns_radio_ = false;
     volatile bool running_ = false;
     volatile bool starting_ = false;
     TaskHandle_t start_task_ = nullptr;
@@ -86,9 +102,15 @@ private:
     std::function<bool(const std::string& photo_id)> show_photo_callback_;
 
     bool StartAccessPoint();
+    void ReleaseAccessPoint();
     const std::string& GetApIp() const { return ap_ip_; }
     bool StartHttpServer();
+    bool RegisterHandlers(httpd_handle_t server);
+    void MarkActivity() {
+        last_activity_us_.store(esp_timer_get_time(), std::memory_order_release);
+    }
     static void StartTask(void* arg);
+    void RunStartSequence();
 
     // HTTP handlers
     static esp_err_t IndexHandler(httpd_req_t* req);

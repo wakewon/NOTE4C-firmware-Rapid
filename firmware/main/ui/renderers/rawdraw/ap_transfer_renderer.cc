@@ -12,6 +12,7 @@
 #include <esp_log.h>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 
 extern const lv_font_t SourceHanSansSC_Regular_slim;
 extern const lv_font_t SourceHanSansSC_Medium_slim;
@@ -51,6 +52,7 @@ ApTransferRenderer::~ApTransferRenderer() {
 void ApTransferRenderer::Init(int width, int height) {
     width_ = width;
     height_ = height;
+    std::lock_guard<std::mutex> lock(state_mutex_);
     state_ = kWaitingForConnection;
     status_message_.clear();
     ESP_LOGI(kTag, "ApTransferRenderer initialized: %dx%d", width, height);
@@ -58,6 +60,10 @@ void ApTransferRenderer::Init(int width, int height) {
 
 void ApTransferRenderer::Render(uint8_t* fb, int width, int height) {
     if (!fb) return;
+    // SetState() arrives from the HTTP and AP-start tasks while the UI task
+    // renders; status_message_ is a heap-backed string once it passes the
+    // small-string limit, so an unguarded read could use freed memory.
+    std::lock_guard<std::mutex> lock(state_mutex_);
     const auto& theme = ThemeManager::Get();
     const PaintStyle bg_style = theme.Style(ThemeToken::BackgroundPrimary);
     const PaintStyle title_style = theme.Style(ThemeToken::BackgroundSecondary);
@@ -259,6 +265,7 @@ bool ApTransferRenderer::HandleInput(const ButtonEvent& event) {
 }
 
 void ApTransferRenderer::SetState(TransferState state, const std::string& message) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
     state_ = state;
     status_message_ = message;
     ESP_LOGI(kTag, "SetState: %d, message='%s'", state, message.c_str());

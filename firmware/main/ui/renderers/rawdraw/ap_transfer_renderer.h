@@ -13,6 +13,7 @@
 
 #include "page_renderer.h"
 #include "rawdraw/style.h"
+#include <mutex>
 #include <string>
 
 namespace rawdraw {
@@ -46,8 +47,12 @@ public:
         kError,                 // Error occurred
     };
 
+    // Thread-safe: called from the HTTP and AP-start tasks.
     void SetState(TransferState state, const std::string& message = "");
-    TransferState GetState() const { return state_; }
+    TransferState GetState() const {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        return state_;
+    }
     void UseDefaultTransferInstructions();
     void SetInstructionContent(const std::string& title,
                                const std::string& ssid,
@@ -63,7 +68,8 @@ private:
     void RenderInstructions(uint8_t* fb, int width, int height);
     void RenderStatus(uint8_t* fb, int width, int height);
 
-    // State
+    // State. state_ and status_message_ are guarded by state_mutex_.
+    mutable std::mutex state_mutex_;
     TransferState state_ = kWaitingForConnection;
     std::string status_message_;
     std::string title_text_ = "WiFi 传图";

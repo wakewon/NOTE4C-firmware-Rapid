@@ -21,6 +21,7 @@
 
 #include <cstring>
 #include <cstdio>
+#include <mutex>
 #include <cstdlib>
 #include <ctime>
 #include <new>
@@ -37,6 +38,7 @@ static const char* kTag = "ApTransferServer";
 constexpr const char* kApSsid = "InkScreen-AP";
 constexpr const char* kApPassword = "12345678";
 constexpr const char* kApIp = "192.168.4.1";
+constexpr int64_t kUploadDeadlineUs = 45LL * 1000 * 1000;
 constexpr const char* kGalleryNamespace = "gallery";
 constexpr const char* kSlideshowIntervalKey = "slide_min";
 
@@ -211,12 +213,14 @@ ApTransferServer::~ApTransferServer() {
 }
 
 void ApTransferServer::Start() {
+    std::lock_guard<std::recursive_mutex> lock(lifecycle_mutex_);
     if (running_ || starting_) {
         ESP_LOGW(kTag, "Server already running");
         return;
     }
 
     ESP_LOGI(kTag, "Starting AP Transfer Server async");
+    MarkActivity();
     mode_ = TransferMode::kAp;
     starting_ = true;
     BaseType_t ok = xTaskCreate(&ApTransferServer::StartTask,
@@ -235,10 +239,12 @@ void ApTransferServer::Start() {
 }
 
 bool ApTransferServer::StartLan(const std::string& ip_address) {
+    std::lock_guard<std::recursive_mutex> lock(lifecycle_mutex_);
     if (running_ || starting_) {
         ESP_LOGW(kTag, "Server already running");
         return true;
     }
+    MarkActivity();
     if (ip_address.empty()) {
         ESP_LOGW(kTag, "LAN HTTP server start skipped: empty IP address");
         NotifyState(kError, "No WiFi IP");
@@ -261,102 +267,131 @@ bool ApTransferServer::StartLan(const std::string& ip_address) {
 
 void ApTransferServer::StartTask(void* arg) {
     auto* self = static_cast<ApTransferServer*>(arg);
-    if (!self) {
-        vTaskDelete(nullptr);
-        return;
+    if (self) {
+        ESP_LOGI(kTag, "AP start task running, stack watermark=%u",
+                 static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
+        vTaskDelay(pdMS_TO_TICKS(100));
+        self->RunStartSequence();
+        ESP_LOGI(kTag, "AP start task done, stack watermark=%u",
+                 static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
     }
-
-    ESP_LOGI(kTag, "AP start task running, stack watermark=%u",
-             static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
-    vTaskDelay(pdMS_TO_TICKS(100));
-
-    if (!self->starting_) {
-        ESP_LOGI(kTag, "AP start task cancelled before WiFi init");
-        self->start_task_ = nullptr;
-        vTaskDelete(nullptr);
-        return;
-    }
-
-    if (!self->StartAccessPoint()) {
-        self->running_ = false;
-        self->starting_ = false;
-        self->start_task_ = nullptr;
-        self->mode_ = TransferMode::kNone;
-        self->NotifyState(kError, "AP start failed");
-        vTaskDelete(nullptr);
-        return;
-    }
-    if (!self->starting_) {
-        ESP_LOGI(kTag, "AP start task cancelled after WiFi init");
-        self->start_task_ = nullptr;
-        vTaskDelete(nullptr);
-        return;
-    }
-
-    if (!self->StartHttpServer()) {
-        self->running_ = false;
-        self->starting_ = false;
-        self->start_task_ = nullptr;
-        self->mode_ = TransferMode::kNone;
-        self->NotifyState(kError, "HTTP start failed");
-        vTaskDelete(nullptr);
-        return;
-    }
-
-    self->running_ = true;
-    self->starting_ = false;
-    self->start_task_ = nullptr;
-    self->NotifyState(kApStarted, self->GetApIp());
-    ESP_LOGI(kTag, "AP start task done, stack watermark=%u",
-             static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
+    // Only after RunStartSequence() has returned: vTaskDelete(nullptr) never
+    // returns, so a lock still held here would never be released.
     vTaskDelete(nullptr);
 }
 
+void ApTransferServer::RunStartSequence() {
+    // Held for the whole bring-up so a concurrent Stop() waits for a
+    // consistent state instead of tearing down half of it.
+    std::lock_guard<std::recursive_mutex> lock(lifecycle_mutex_);
+    start_task_ = nullptr;
+    if (!starting_) {
+        ESP_LOGI(kTag, "AP start task cancelled before WiFi init");
+        return;
+    }
+
+    if (!StartAccessPoint()) {
+        // Hand the radio back exactly as it was found; the suspended station
+        // otherwise stays unhooked from its event handlers for good.
+        ReleaseAccessPoint();
+        running_ = false;
+        starting_ = false;
+        mode_ = TransferMode::kNone;
+        NotifyState(kError, "AP start failed");
+        return;
+    }
+
+    if (!StartHttpServer()) {
+        ReleaseAccessPoint();
+        running_ = false;
+        starting_ = false;
+        mode_ = TransferMode::kNone;
+        NotifyState(kError, "HTTP start failed");
+        return;
+    }
+
+    running_ = true;
+    starting_ = false;
+    NotifyState(kApStarted, GetApIp());
+}
+
+// Called from the app task, the ap_web_control task and the destructor.
+// Serialized: two overlapping calls used to both pass the server_ check and
+// both call httpd_stop() on the same handle.
 void ApTransferServer::Stop() {
-    if (!running_ && !starting_ && server_ == nullptr && ap_netif_ == nullptr) return;
+    std::lock_guard<std::recursive_mutex> lock(lifecycle_mutex_);
+    if (!running_ && !starting_ && server_ == nullptr && ap_netif_ == nullptr &&
+        !ap_owns_radio_) {
+        return;
+    }
 
     ESP_LOGI(kTag, "Stopping AP Transfer Server");
     const TransferMode old_mode = mode_;
     starting_ = false;
     start_task_ = nullptr;
 
-    if (server_) {
-        httpd_stop(server_);
-        server_ = nullptr;
+    if (httpd_handle_t server = std::exchange(server_, nullptr)) {
+        httpd_stop(server);
     }
 
-    if (old_mode == TransferMode::kAp) {
-        ESP_LOGI(kTag, "Returning WiFi to STA mode");
-        esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
-        if (err != ESP_OK) {
-            ESP_LOGW(kTag, "esp_wifi_set_mode(STA) failed: %s", esp_err_to_name(err));
-        }
-        err = esp_wifi_connect();
-        if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
-            ESP_LOGW(kTag, "esp_wifi_connect failed after AP stop: %s", esp_err_to_name(err));
-        }
-
-        WifiManager::GetInstance().ResumeStationAfterExternalAp();
-    }
-
-    if (ap_netif_) {
-        esp_netif_destroy_default_wifi(ap_netif_);
-        ap_netif_ = nullptr;
+    if (old_mode == TransferMode::kAp || ap_owns_radio_) {
+        ReleaseAccessPoint();
     }
 
     running_ = false;
     mode_ = TransferMode::kNone;
     NotifyState(kStopped, "Server stopped");
+}
 
+// Undo StartAccessPoint(): give the driver back to the station that was
+// suspended for it, or switch it off if there is none. Reconnecting
+// unconditionally used to leave a radio running in station mode that
+// WifiManager did not know about (so nothing ever stopped it), with power
+// save still disabled from the AP configuration.
+void ApTransferServer::ReleaseAccessPoint() {
+    if (!ap_owns_radio_) {
+        return;
+    }
+    ap_owns_radio_ = false;
+    ESP_LOGI(kTag, "Returning WiFi to STA mode");
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err != ESP_OK) {
+        ESP_LOGW(kTag, "esp_wifi_set_mode(STA) failed: %s", esp_err_to_name(err));
+    }
+    if (WifiManager::GetInstance().ResumeStationAfterExternalAp()) {
+        err = esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+        if (err != ESP_OK) {
+            ESP_LOGW(kTag, "esp_wifi_set_ps(MIN_MODEM) failed: %s", esp_err_to_name(err));
+        }
+    } else {
+        ESP_LOGI(kTag, "No station to hand the radio back to; stopping it");
+        err = esp_wifi_stop();
+        if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_INIT &&
+            err != ESP_ERR_WIFI_NOT_STARTED) {
+            ESP_LOGW(kTag, "esp_wifi_stop after AP failed: %s", esp_err_to_name(err));
+        }
+    }
+    if (ap_netif_) {
+        esp_netif_destroy_default_wifi(ap_netif_);
+        ap_netif_ = nullptr;
+    }
 }
 
 bool ApTransferServer::StartAccessPoint() {
+    // Without the driver, esp-netif and the default event loop (the Wi-Fi
+    // switch has been off since boot), esp_netif_create_default_wifi_ap()
+    // below aborts the device instead of returning an error.
+    if (!WifiManager::GetInstance().IsInitialized()) {
+        ESP_LOGE(kTag, "AP transfer needs the Wi-Fi driver; not initialized");
+        return false;
+    }
     // The raw esp_wifi_* calls below are the sanctioned handoff, not a bypass:
     // Suspend/ResumeStationForExternalAp() unhook WifiManager's event handlers
     // and reconnect timers for the duration, so the driver has exactly one
     // owner at a time. Anything that touches esp_wifi_* outside such a pair
     // desynchronizes WifiManager's view of the radio.
     WifiManager::GetInstance().SuspendStationForExternalAp();
+    ap_owns_radio_ = true;
 
     // AP mode is entered from several states: normal STA, user-disabled WiFi,
     // and after long idle/sleep. Stop any stale WiFi activity first so the AP
@@ -454,16 +489,44 @@ bool ApTransferServer::StartHttpServer() {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 12;
     config.max_open_sockets = 4;
-    config.recv_wait_timeout = 30;  // Large images take time
+    // Per-recv wait. httpd_stop() on the app task waits for the handler in
+    // progress, so this (together with the upload's overall deadline) bounds
+    // how long a stalled client can hold the supervisor loop.
+    config.recv_wait_timeout = 10;
     config.send_wait_timeout = 10;
     config.lru_purge_enable = true;
-    
-    esp_err_t err = httpd_start(&server_, &config);
+    // Every request opens a session ("Connection: close"), which makes the
+    // open hook the one place that sees all HTTP activity for the idle
+    // timeout. httpd frees global_user_ctx with free() unless told otherwise.
+    config.global_user_ctx = this;
+    config.global_user_ctx_free_fn = [](void*) {};
+    config.open_fn = [](httpd_handle_t handle, int) -> esp_err_t {
+        if (auto* self = static_cast<ApTransferServer*>(httpd_get_global_user_ctx(handle))) {
+            self->MarkActivity();
+        }
+        return ESP_OK;
+    };
+
+    httpd_handle_t server = nullptr;
+    esp_err_t err = httpd_start(&server, &config);
     if (err != ESP_OK) {
         ESP_LOGE(kTag, "Failed to start HTTP server: %s", esp_err_to_name(err));
-        server_ = nullptr;
         return false;
     }
+    if (!RegisterHandlers(server)) {
+        // A half-registered server used to stay in server_ with mode_ reset:
+        // IsRunning() then blocked idle sleep for good while nothing could
+        // stop it, because neither the AP nor the LAN stop path matched.
+        ESP_LOGE(kTag, "HTTP handler registration failed; server stopped");
+        httpd_stop(server);
+        return false;
+    }
+    server_ = server;
+    ESP_LOGI(kTag, "HTTP server started at http://%s/", ap_ip_.c_str());
+    return true;
+}
+
+bool ApTransferServer::RegisterHandlers(httpd_handle_t server) {
 
     // Register handlers
     httpd_uri_t index_uri = {
@@ -472,7 +535,7 @@ bool ApTransferServer::StartHttpServer() {
         .handler = IndexHandler,
         .user_ctx = this
     };
-    if (httpd_register_uri_handler(server_, &index_uri) != ESP_OK) return false;
+    if (httpd_register_uri_handler(server, &index_uri) != ESP_OK) return false;
 
     httpd_uri_t upload_uri = {
         .uri = "/upload",
@@ -480,7 +543,7 @@ bool ApTransferServer::StartHttpServer() {
         .handler = UploadHandler,
         .user_ctx = this
     };
-    if (httpd_register_uri_handler(server_, &upload_uri) != ESP_OK) return false;
+    if (httpd_register_uri_handler(server, &upload_uri) != ESP_OK) return false;
 
     httpd_uri_t status_uri = {
         .uri = "/status",
@@ -488,7 +551,7 @@ bool ApTransferServer::StartHttpServer() {
         .handler = StatusHandler,
         .user_ctx = this
     };
-    if (httpd_register_uri_handler(server_, &status_uri) != ESP_OK) return false;
+    if (httpd_register_uri_handler(server, &status_uri) != ESP_OK) return false;
 
     httpd_uri_t settings_get_uri = {
         .uri = "/settings",
@@ -496,7 +559,7 @@ bool ApTransferServer::StartHttpServer() {
         .handler = SettingsHandler,
         .user_ctx = this
     };
-    if (httpd_register_uri_handler(server_, &settings_get_uri) != ESP_OK) return false;
+    if (httpd_register_uri_handler(server, &settings_get_uri) != ESP_OK) return false;
 
     httpd_uri_t settings_post_uri = {
         .uri = "/settings",
@@ -504,7 +567,7 @@ bool ApTransferServer::StartHttpServer() {
         .handler = SettingsHandler,
         .user_ctx = this
     };
-    if (httpd_register_uri_handler(server_, &settings_post_uri) != ESP_OK) return false;
+    if (httpd_register_uri_handler(server, &settings_post_uri) != ESP_OK) return false;
 
     httpd_uri_t photos_uri = {
         .uri = "/photos",
@@ -512,7 +575,7 @@ bool ApTransferServer::StartHttpServer() {
         .handler = PhotosHandler,
         .user_ctx = this
     };
-    if (httpd_register_uri_handler(server_, &photos_uri) != ESP_OK) return false;
+    if (httpd_register_uri_handler(server, &photos_uri) != ESP_OK) return false;
 
     httpd_uri_t photo_get_uri = {
         .uri = "/photo",
@@ -520,7 +583,7 @@ bool ApTransferServer::StartHttpServer() {
         .handler = PhotoHandler,
         .user_ctx = this
     };
-    if (httpd_register_uri_handler(server_, &photo_get_uri) != ESP_OK) return false;
+    if (httpd_register_uri_handler(server, &photo_get_uri) != ESP_OK) return false;
 
     httpd_uri_t photo_delete_uri = {
         .uri = "/photo",
@@ -528,7 +591,7 @@ bool ApTransferServer::StartHttpServer() {
         .handler = PhotoHandler,
         .user_ctx = this
     };
-    if (httpd_register_uri_handler(server_, &photo_delete_uri) != ESP_OK) return false;
+    if (httpd_register_uri_handler(server, &photo_delete_uri) != ESP_OK) return false;
 
     httpd_uri_t photo_meta_uri = {
         .uri = "/photo/meta",
@@ -536,7 +599,7 @@ bool ApTransferServer::StartHttpServer() {
         .handler = PhotoMetaHandler,
         .user_ctx = this
     };
-    if (httpd_register_uri_handler(server_, &photo_meta_uri) != ESP_OK) return false;
+    if (httpd_register_uri_handler(server, &photo_meta_uri) != ESP_OK) return false;
 
     httpd_uri_t photo_move_uri = {
         .uri = "/photos/move",
@@ -544,7 +607,7 @@ bool ApTransferServer::StartHttpServer() {
         .handler = PhotoMoveHandler,
         .user_ctx = this
     };
-    if (httpd_register_uri_handler(server_, &photo_move_uri) != ESP_OK) return false;
+    if (httpd_register_uri_handler(server, &photo_move_uri) != ESP_OK) return false;
 
     httpd_uri_t photo_show_uri = {
         .uri = "/photo/show",
@@ -552,9 +615,8 @@ bool ApTransferServer::StartHttpServer() {
         .handler = PhotoShowHandler,
         .user_ctx = this
     };
-    if (httpd_register_uri_handler(server_, &photo_show_uri) != ESP_OK) return false;
+    if (httpd_register_uri_handler(server, &photo_show_uri) != ESP_OK) return false;
 
-    ESP_LOGI(kTag, "HTTP server started at http://%s/", ap_ip_.c_str());
     return true;
 }
 
@@ -598,8 +660,19 @@ esp_err_t ApTransferServer::UploadHandler(httpd_req_t* req) {
         return ESP_FAIL;
     }
 
+    // 30 KB normally arrives in well under a second. A client trickling a
+    // few bytes per recv timeout would otherwise hold this handler -- and any
+    // httpd_stop() waiting for it on the app task -- indefinitely.
+    const int64_t receive_deadline_us = esp_timer_get_time() + kUploadDeadlineUs;
     size_t received = 0;
     while (received < expected_size) {
+        if (esp_timer_get_time() > receive_deadline_us) {
+            free(buf);
+            ESP_LOGW(kTag, "Upload timed out after %u/%u bytes",
+                     static_cast<unsigned>(received), static_cast<unsigned>(expected_size));
+            httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT, "Upload timed out");
+            return ESP_FAIL;
+        }
         int ret = httpd_req_recv(req, reinterpret_cast<char*>(buf + received),
                                  expected_size - received);
         if (ret <= 0) {
@@ -608,6 +681,7 @@ esp_err_t ApTransferServer::UploadHandler(httpd_req_t* req) {
             return ESP_FAIL;
         }
         received += static_cast<size_t>(ret);
+        self->MarkActivity();
     }
 
     ESP_LOGI(kTag, "Received %u bytes", static_cast<unsigned>(received));
