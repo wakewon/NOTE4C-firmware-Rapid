@@ -89,6 +89,12 @@ void DnsServer::Run() {
         if (!running_) {
             break;
         }
+        // The answer below appends 16 bytes to the query in place. Any client
+        // of the open setup hotspot could otherwise send a full-size datagram
+        // and have those bytes written past the end of this stack buffer.
+        if (len < 12 || len > static_cast<int>(sizeof(buffer)) - 16) {
+            continue;
+        }
 
         // Simple DNS response: point all queries to 192.168.4.1
         buffer[2] |= 0x80;  // Set response flag

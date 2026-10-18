@@ -46,7 +46,9 @@ public:
 
     void AddAuth(const std::string &&ssid, const std::string &&password);
     void Start();
-    void Stop();
+    // release_driver=false leaves the Wi-Fi driver running, for a station
+    // that is suspended while an external AP owns it.
+    void Stop(bool release_driver = true);
     void SuspendForExternalAp();
     void ResumeAfterExternalAp();
     bool IsConnected();

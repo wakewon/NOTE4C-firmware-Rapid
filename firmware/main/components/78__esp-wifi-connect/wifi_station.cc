@@ -654,7 +654,7 @@ void WifiStation::AddAuth(const std::string &&ssid, const std::string &&password
     ssid_manager.AddSsid(ssid, password);
 }
 
-void WifiStation::Stop() {
+void WifiStation::Stop(bool release_driver) {
     ESP_LOGI(TAG, "Stopping WiFi station");
     
     // Unregister event handlers FIRST to prevent scan done from triggering connect
@@ -678,9 +678,11 @@ void WifiStation::Stop() {
     }
 
     // Now safe to stop scan, disconnect and stop WiFi (no event callbacks will fire)
-    esp_wifi_scan_stop();
-    esp_wifi_disconnect();
-    esp_wifi_stop();
+    if (release_driver) {
+        esp_wifi_scan_stop();
+        esp_wifi_disconnect();
+        esp_wifi_stop();
+    }
 
     if (station_netif_ != nullptr) {
         esp_netif_destroy_default_wifi(station_netif_);
@@ -907,18 +909,35 @@ void WifiStation::StartConnect() {
 
     wifi_config_t wifi_config;
     bzero(&wifi_config, sizeof(wifi_config));
-    strcpy((char *)wifi_config.sta.ssid, ap_record.ssid.c_str());
-    strcpy((char *)wifi_config.sta.password, ap_record.password.c_str());
+    // The driver fields are fixed-size and need no terminator; a 32-byte SSID
+    // or 64-byte passphrase copied with strcpy() wrote one byte past them.
+    memcpy(wifi_config.sta.ssid, ap_record.ssid.data(),
+           std::min(ap_record.ssid.size(), sizeof(wifi_config.sta.ssid)));
+    memcpy(wifi_config.sta.password, ap_record.password.data(),
+           std::min(ap_record.password.size(), sizeof(wifi_config.sta.password)));
     if (remember_bssid_) {
         wifi_config.sta.channel = ap_record.channel;
         memcpy(wifi_config.sta.bssid, ap_record.bssid, 6);
         wifi_config.sta.bssid_set = true;
     }
     wifi_config.sta.listen_interval = 10;
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-
-    reconnect_count_ = 0;
-    ESP_ERROR_CHECK(esp_wifi_connect());
+    // Runs on the event task. An abort here (the driver can refuse a config
+    // while it is still connecting, or run out of memory) rebooted the whole
+    // device out of whatever it was showing; retry on the next scan instead.
+    esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    if (err == ESP_OK) {
+        reconnect_count_ = 0;
+        err = esp_wifi_connect();
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Connect to %s failed to start: %s; next scan in %d s",
+                 ssid_.c_str(), esp_err_to_name(err),
+                 scan_current_interval_microseconds_ / 1000 / 1000);
+        if (timer_handle_ != nullptr) {
+            esp_timer_start_once(timer_handle_, scan_current_interval_microseconds_);
+        }
+        UpdateScanInterval();
+    }
 }
 
 int8_t WifiStation::GetRssi() {

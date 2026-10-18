@@ -196,46 +196,56 @@ void WifiManager::StartStation() {
 void WifiManager::StopStation() {
     std::unique_lock<std::mutex> lifecycle_lock(lifecycle_mutex_);
     WifiStation* station = nullptr;
+    bool suspended = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!station_active_) return;
         station_active_ = false;
+        suspended = station_suspended_;
+        station_suspended_ = false;
         station = station_.get();
     }
 
-    ESP_LOGI(TAG, "Stopping station");
-    station->Stop();
+    ESP_LOGI(TAG, "Stopping station%s", suspended ? " (suspended for external AP)" : "");
+    // While suspended the driver belongs to the external AP: tear down the
+    // station's own state, but stopping the driver here would take the
+    // hotspot down underneath a running transfer server.
+    station->Stop(!suspended);
     ESP_LOGI(TAG, "Station stopped");
     lifecycle_lock.unlock();
     NotifyEvent(WifiEvent::Disconnected);
 }
 
-void WifiManager::SuspendStationForExternalAp() {
+bool WifiManager::SuspendStationForExternalAp() {
     std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
     WifiStation* station = nullptr;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!station_active_ || !station_) {
             ESP_LOGI(TAG, "Suspend station for external AP skipped: station inactive");
-            return;
+            return false;
         }
+        station_suspended_ = true;
         station = station_.get();
     }
     station->SuspendForExternalAp();
+    return true;
 }
 
-void WifiManager::ResumeStationAfterExternalAp() {
+bool WifiManager::ResumeStationAfterExternalAp() {
     std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
     WifiStation* station = nullptr;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        station_suspended_ = false;
         if (!station_active_ || !station_) {
             ESP_LOGI(TAG, "Resume station after external AP skipped: station inactive");
-            return;
+            return false;
         }
         station = station_.get();
     }
     station->ResumeAfterExternalAp();
+    return true;
 }
 
 bool WifiManager::IsConnected() const {

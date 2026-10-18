@@ -70,8 +70,12 @@ public:
     
     void StartStation();   // Non-blocking, auto-stops config AP if active
     void StopStation();    // Non-blocking
-    void SuspendStationForExternalAp();
-    void ResumeStationAfterExternalAp();
+    // An external AP (photo transfer) borrows the driver. Suspend returns
+    // whether an active station was suspended; Resume returns whether one was
+    // handed the driver back -- if not, the caller still owns the radio and
+    // has to switch it off.
+    bool SuspendStationForExternalAp();
+    bool ResumeStationAfterExternalAp();
     
     bool IsConnected() const;
     std::string GetSsid() const;
@@ -125,6 +129,7 @@ private:
     mutable std::mutex mutex_;
     bool initialized_ = false;
     bool station_active_ = false;
+    bool station_suspended_ = false;
     bool config_mode_active_ = false;
     NetworkProbeTarget probe_target_ = NetworkProbeTarget::Mqtt;
 

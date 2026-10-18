@@ -68,6 +68,8 @@ private:
     esp_timer_handle_t scan_timer_ = nullptr;
     bool is_connecting_ = false;
     esp_netif_t* ap_netif_ = nullptr;
+    // Created only for the portal's credential test; see StartAccessPoint().
+    esp_netif_t* sta_netif_ = nullptr;
     std::vector<wifi_ap_record_t> ap_records_;
 
     // 高级配置项

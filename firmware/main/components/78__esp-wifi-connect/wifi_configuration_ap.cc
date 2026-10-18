@@ -150,6 +150,15 @@ void WifiConfigurationAp::StartAccessPoint()
     
     // Create the default WiFi AP interface
     ap_netif_ = esp_netif_create_default_wifi_ap();
+    // The portal runs in APSTA mode and tests submitted credentials on the
+    // station side, which needs a station interface for DHCP. WifiStation
+    // destroys its own when it stops, so without this IP_EVENT_STA_GOT_IP
+    // never fired, every test connection timed out and /submit never saved.
+    // Never create a second one: the default key is unique and a duplicate
+    // aborts in esp_netif_new().
+    if (esp_netif_get_handle_from_ifkey("WIFI_STA_DEF") == nullptr) {
+        sta_netif_ = esp_netif_create_default_wifi_sta();
+    }
 
     // Set the router IP address to 192.168.4.1
     esp_netif_ip_info_t ip_info;
@@ -716,7 +725,15 @@ bool WifiConfigurationAp::ConnectToWifi(const std::string &ssid, const std::stri
     wifi_config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
     wifi_config.sta.failure_retry_cnt = 1;
     
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    // The page accepts any input; a passphrase the driver rejects (shorter
+    // than WPA2 allows, say) must fail this attempt, not abort the device.
+    esp_err_t config_ret = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    if (config_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Rejected WiFi config for %s: %s", ssid.c_str(),
+                 esp_err_to_name(config_ret));
+        is_connecting_ = false;
+        return false;
+    }
     auto ret = esp_wifi_connect();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to connect to WiFi: %d", ret);
@@ -867,6 +884,18 @@ void WifiConfigurationAp::Stop() {
     esp_smartconfig_stop();
 #endif
 
+    // 注销事件处理器 first: unregistering waits for a handler that is
+    // already running, and that handler may restart scan_timer_. Deleting the
+    // timer before this left a window for it to touch a freed timer.
+    if (instance_any_id_) {
+        esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, instance_any_id_);
+        instance_any_id_ = nullptr;
+    }
+    if (instance_got_ip_) {
+        esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, instance_got_ip_);
+        instance_got_ip_ = nullptr;
+    }
+
     // 停止定时器
     if (scan_timer_) {
         esp_timer_stop(scan_timer_);
@@ -886,16 +915,6 @@ void WifiConfigurationAp::Stop() {
         dns_server_.reset();
     }
 
-    // 注销事件处理器
-    if (instance_any_id_) {
-        esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, instance_any_id_);
-        instance_any_id_ = nullptr;
-    }
-    if (instance_got_ip_) {
-        esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, instance_got_ip_);
-        instance_got_ip_ = nullptr;
-    }
-
     // 停止WiFi（但不 deinit，WiFi 驱动由 WifiManager 管理）
     esp_wifi_stop();
     
@@ -903,6 +922,11 @@ void WifiConfigurationAp::Stop() {
     if (ap_netif_) {
         esp_netif_destroy_default_wifi(ap_netif_);
         ap_netif_ = nullptr;
+    }
+    // Before WifiStation::Start() creates its own default station interface.
+    if (sta_netif_) {
+        esp_netif_destroy_default_wifi(sta_netif_);
+        sta_netif_ = nullptr;
     }
 
     ESP_LOGI(TAG, "Wifi configuration AP stopped");
