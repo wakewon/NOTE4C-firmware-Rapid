@@ -1,4 +1,5 @@
 #include "wifi_station.h"
+#include "wifi_credentials.h"
 #include <cctype>
 #include <cstring>
 #include <algorithm>
@@ -869,7 +870,7 @@ void WifiStation::HandleScanResult() {
         auto it = std::find_if(ssid_list.begin(), ssid_list.end(), [ap_record](const SsidItem& item) {
             return strcmp((char *)ap_record.ssid, item.ssid.c_str()) == 0;
         });
-        if (it != ssid_list.end()) {
+        if (it != ssid_list.end() && wifi_credentials::Valid(it->ssid, it->password)) {
             ESP_LOGI(TAG, "Found AP: %s, BSSID: %02x:%02x:%02x:%02x:%02x:%02x, RSSI: %d, Channel: %d, Authmode: %d",
                 (char *)ap_record.ssid, 
                 ap_record.bssid[0], ap_record.bssid[1], ap_record.bssid[2],
@@ -909,12 +910,11 @@ void WifiStation::StartConnect() {
 
     wifi_config_t wifi_config;
     bzero(&wifi_config, sizeof(wifi_config));
-    // The driver fields are fixed-size and need no terminator; a 32-byte SSID
-    // or 64-byte passphrase copied with strcpy() wrote one byte past them.
-    memcpy(wifi_config.sta.ssid, ap_record.ssid.data(),
-           std::min(ap_record.ssid.size(), sizeof(wifi_config.sta.ssid)));
-    memcpy(wifi_config.sta.password, ap_record.password.data(),
-           std::min(ap_record.password.size(), sizeof(wifi_config.sta.password)));
+    // HandleScanResult() queues only valid credentials. Should one fail to
+    // assign anyway, it takes the retry path below like a refused config;
+    // returning here would leave the station with no scan scheduled at all.
+    const bool assigned =
+        wifi_credentials::Assign(wifi_config.sta, ap_record.ssid, ap_record.password);
     if (remember_bssid_) {
         wifi_config.sta.channel = ap_record.channel;
         memcpy(wifi_config.sta.bssid, ap_record.bssid, 6);
@@ -924,7 +924,8 @@ void WifiStation::StartConnect() {
     // Runs on the event task. An abort here (the driver can refuse a config
     // while it is still connecting, or run out of memory) rebooted the whole
     // device out of whatever it was showing; retry on the next scan instead.
-    esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    esp_err_t err = assigned ? esp_wifi_set_config(WIFI_IF_STA, &wifi_config)
+                             : ESP_ERR_INVALID_ARG;
     if (err == ESP_OK) {
         reconnect_count_ = 0;
         err = esp_wifi_connect();
@@ -1075,7 +1076,7 @@ void WifiStation::WifiEventHandler(void* arg, esp_event_base_t event_base, int32
                                        [&fast_ssid](const SsidItem& item) {
                                            return item.ssid == fast_ssid;
                                        });
-                if (it != ssid_list.end()) {
+                if (it != ssid_list.end() && wifi_credentials::Valid(it->ssid, it->password)) {
                     this_->ssid_ = it->ssid;
                     this_->password_ = it->password;
                     if (this_->on_connect_) {
@@ -1084,8 +1085,7 @@ void WifiStation::WifiEventHandler(void* arg, esp_event_base_t event_base, int32
 
                     wifi_config_t wifi_config;
                     bzero(&wifi_config, sizeof(wifi_config));
-                    strcpy((char *)wifi_config.sta.ssid, it->ssid.c_str());
-                    strcpy((char *)wifi_config.sta.password, it->password.c_str());
+                    wifi_credentials::Assign(wifi_config.sta, it->ssid, it->password);
                     wifi_config.sta.channel = fast_channel;
                     memcpy(wifi_config.sta.bssid, fast_bssid, 6);
                     wifi_config.sta.bssid_set = true;
