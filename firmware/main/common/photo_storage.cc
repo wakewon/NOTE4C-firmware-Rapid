@@ -241,22 +241,6 @@ static int rebuild_index_from_meta_files(void) {
     return s_photo_count;
 }
 
-// Ensure SPIFFS mount path is available.
-static bool ensure_photo_dir(void) {
-    struct stat st;
-    if (stat(kBasePath, &st) == 0) {
-        if (!S_ISDIR(st.st_mode)) {
-            ESP_LOGW(kTag, "Base path exists but is not a directory: %s", kBasePath);
-        }
-        return true;
-    }
-
-    // Some SPIFFS setups don't expose a stat-able mount root despite successful
-    // registration. Keep storage enabled and rely on direct file open operations.
-    ESP_LOGW(kTag, "Base path stat unavailable (%s), continue in flat-file mode", kBasePath);
-    return true;
-}
-
 // Write index file.
 //
 // The index used to be rewritten in place ("wb" truncates first). A reset in
@@ -357,10 +341,12 @@ static int load_index(void) {
             s_photo_count = 0;
             return rebuild_index_from_meta_files();
         }
-    } else {
-        // A leftover copy from a write that never completed.
-        remove(kIndexTmpFile);
     }
+    // A leftover copy from a write that never completed is left alone: the
+    // next save_index() overwrites it, and removing a file that is normally
+    // absent cost a full-partition SPIFFS name scan (~270 ms) on every boot.
+    // It is only ever renamed into place when the live index is missing,
+    // which save_index() allows only after the copy was written completely.
 
     uint32_t magic = 0;
     uint16_t version = 0;
@@ -403,12 +389,14 @@ static int load_index(void) {
         // an interrupted update. Never pass unterminated persisted fields to
         // strcmp/stat/logging routines.
         terminate_photo_info_strings(&info);
-        if (info.id[0] == '\0' || info.path[0] == '\0' ||
-            !photo_file_available(info)) {
-            // Skip it for this boot only. Deleting its metadata and rewriting
-            // the index from here turned any transient read failure during a
-            // wake into a photo that was gone for good.
-            ESP_LOGW(kTag, "Skipping unavailable photo in index: %s",
+        // No stat() of the image here. On SPIFFS every stat is a scan of the
+        // whole partition for the name -- about 30 ms each, for every photo,
+        // on every wake -- and the gallery loads photos transactionally and
+        // already skips one whose file turns out missing or short. Never
+        // delete or rewrite anything from here either: a transient failure
+        // during a wake must not cost a photo for good.
+        if (info.id[0] == '\0' || info.path[0] == '\0' || info.file_size == 0) {
+            ESP_LOGW(kTag, "Skipping invalid photo record in index: %s",
                      info.id[0] ? info.id : "<invalid>");
             continue;
         }
@@ -478,10 +466,9 @@ int photo_storage_init(void) {
         ESP_LOGI(kTag, "SPIFFS mounted: total=%d KB, used=%d KB", total / 1024, used / 1024);
     }
 
-    // Create photo directory
-    if (!ensure_photo_dir()) {
-        return -1;
-    }
+    // SPIFFS is flat: there is no photo directory to create. Checking the
+    // mount root with stat() failed every time and cost a full-partition name
+    // scan (~270 ms) on every boot.
 
     // Load index
     load_index();
