@@ -749,12 +749,29 @@ void CustomLcdDisplay::refresh_task_loop() {
             ESP_LOGI(TAG, "[REFRESH] Got dirty rect: x=%d, y=%d, w=%d, h=%d, area=%d",
                      r.x, r.y, r.w, r.h, rect_area(r));
         }
-        if (urgent || force_full || idle_full || fast_bw || rect_area(r) > 0) {
+        const bool has_work =
+            urgent || force_full || idle_full || fast_bw || rect_area(r) > 0;
+        if (has_work) {
             refresh_in_progress = true;
         }
         UpdateDisplayBusyLocked();
         (void)CheckRefreshIdleLocked();
         xSemaphoreGive(dirty_mutex);
+
+        // Only an explicit request may start a waveform. This loop used to fall
+        // through the throttle below with nothing requested, sit out the 3 s
+        // debounce, and refresh whatever the framebuffer differed by from
+        // prev_buffer. At boot that is the deferred default page, so every
+        // wake ran an unrequested "boot_baseline" full refresh ~3.5 s in --
+        // with refresh_in_progress never set, IsRefreshPending() reported
+        // idle throughout. A scheduled wake that only synced the clock then
+        // committed deep sleep mid-waveform and left the memory-card page
+        // half drawn over the photo until the next slideshow wake; a real
+        // request arriving during that debounce waited out the 3 s and then
+        // ran as a second full refresh.
+        if (!has_work) {
+            continue;
+        }
 
         // Sample work no faster than this interval. ``last_sample_tick`` is
         // also rebased after an actual waveform completes, so background work
