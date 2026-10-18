@@ -21,6 +21,12 @@ public:
     void OnDoubleClick(std::function<void()> callback);
     void OnMultipleClick(std::function<void()> callback, uint8_t click_count = 3);
 
+    // No press, release or click sequence in progress.
+    bool IsIdle() const {
+        return button_handle_ == nullptr ||
+               iot_button_get_event(button_handle_) == BUTTON_NONE_PRESS;
+    }
+
 protected:
     gpio_num_t gpio_num_;
     button_handle_t button_handle_ = nullptr;

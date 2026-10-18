@@ -11,6 +11,7 @@
 #include <cstring>
 #include <utility>
 
+#include "boards/common/gpio_isr_service.h"
 #include "boards/common/i2c_power_hook.h"
 
 namespace {
@@ -603,13 +604,7 @@ void ZectrixNfc::FieldIsrHandler(void* arg) {
 }
 
 esp_err_t ZectrixNfc::EnsureIsrServiceInstalled() {
-    static std::mutex isr_mutex;
-    std::lock_guard<std::mutex> lock(isr_mutex);
-    esp_err_t ret = gpio_install_isr_service(0);
-    if (ret == ESP_ERR_INVALID_STATE) {
-        return ESP_OK;
-    }
-    return ret;
+    return EnsureGpioIsrService();
 }
 
 esp_err_t ZectrixNfc::Probe() {

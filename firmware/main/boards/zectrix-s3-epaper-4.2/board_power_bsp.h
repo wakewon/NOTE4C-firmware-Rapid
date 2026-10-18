@@ -18,6 +18,7 @@ private:
     std::atomic<bool> led_override_blink_{false};
     std::atomic<bool> led_override_phase_{false};
     std::atomic<int> led_activity_pulses_{0};
+    std::atomic<bool> low_power_cadence_{false};
     TaskHandle_t led_task_ = nullptr;
 
     static void PowerLedTask(void *arg);
@@ -36,6 +37,10 @@ public:
     void VbatPowerOff();
     void SetFactoryLedOverride(bool enabled, bool blink);
     void FlashActivityLed();
+    // Slower idle polling of the LED task during the low-power wait.
+    void SetLowPowerCadence(bool enabled) {
+        low_power_cadence_.store(enabled, std::memory_order_relaxed);
+    }
     void PrepareForDeepSleep();
 };
 

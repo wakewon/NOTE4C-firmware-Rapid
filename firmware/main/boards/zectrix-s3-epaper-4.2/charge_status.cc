@@ -69,7 +69,9 @@ void ChargeStatus::SamplerTask(void* arg) {
     auto* self = static_cast<ChargeStatus*>(arg);
     while (!self->sampler_stop_requested_.load(std::memory_order_acquire)) {
         self->Sample(NowMs());
-        vTaskDelay(pdMS_TO_TICKS(kSamplePeriodMs));
+        vTaskDelay(pdMS_TO_TICKS(self->low_power_cadence_.load(std::memory_order_acquire)
+                                     ? kLowPowerSamplePeriodMs
+                                     : kSamplePeriodMs));
     }
     self->sampler_task_ = nullptr;
     vTaskDelete(nullptr);

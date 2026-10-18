@@ -63,7 +63,10 @@ void BoardPowerBsp::PowerLedTask(void *arg) {
         } else {
             gpio_set_level(GPIO_NUM_3, 1);
             gpio_hold_en((gpio_num_t)GPIO_NUM_3);
-            vTaskDelay(pdMS_TO_TICKS(500));
+            // Nothing to show. In the low-power wait (battery only, so no
+            // charge state to follow) poll rarely: each pass wakes the chip.
+            vTaskDelay(pdMS_TO_TICKS(
+                self->low_power_cadence_.load(std::memory_order_relaxed) ? 2000 : 500));
         }
     }
 }

@@ -52,3 +52,13 @@ CONFIG_BTDM_CTRL_MODE_BLE_ONLY=y
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 
+# Power management: frequency scaling everywhere, auto light sleep only inside
+# the application's low-power wait window (Application::UpdateLowPowerWait).
+CONFIG_PM_ENABLE=y
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+CONFIG_PM_LIGHT_SLEEP_CALLBACKS=y
+CONFIG_PM_SLP_IRAM_OPT=y
+CONFIG_PM_RTOS_IDLE_OPT=y
+# Sleep through idle gaps from 20 ms up. With several 0.5-1 s periodic
+# tasks still running in the window, gaps of 20-30 ms are common.
+CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP=2

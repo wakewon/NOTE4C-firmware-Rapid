@@ -110,7 +110,14 @@ public:
     // Notify when refresh transitions from busy to idle.
     void SetOnRefreshIdle(std::function<void()> cb);
     void SetNextKickMs(uint32_t kick_ms);
-    
+
+    // While set, BUSY waits poll every kLowPowerBusyPollMs instead of every
+    // tick, so the system can light-sleep between polls. Only the
+    // application's low-power wait window sets it.
+    void SetLowPowerBusyWait(bool enabled) {
+        low_power_busy_wait_.store(enabled, std::memory_order_release);
+    }
+
 private:
     const custom_lcd_spi_t lcd_spi_data;
     const int Width;
@@ -209,6 +216,7 @@ private:
     // Mirrors fast_bw_since_full_ for lock-free readers on the sleep path.
     std::atomic<bool> full_color_recovery_snapshot_{false};
     bool refresh_busy_seen_ = false;
+    std::atomic<bool> low_power_busy_wait_{false};
     uint32_t next_kick_ms_ = 0;
     std::function<void()> on_refresh_idle_;
 

@@ -4,6 +4,7 @@
 #include <esp_adc/adc_cali_scheme.h>
 #include <esp_adc/adc_oneshot.h>
 #include <esp_log.h>
+#include <esp_sleep.h>
 #include <esp_timer.h>
 
 #include <atomic>
@@ -14,6 +15,7 @@
 #include "application.h"
 #include "board.h"
 #include "board_power_bsp.h"
+#include "boards/common/gpio_isr_service.h"
 #include "boards/common/i2c_bus_lock.h"
 #include "boards/zectrix/zectrix_nfc.h"
 #include "button.h"
@@ -60,6 +62,29 @@ void EnterWifiConfigComboOnce() {
         Application::ButtonAction::WifiConfigCombo);
 }
 
+// Button standby: the low-power wait window lets the chip light-sleep, and
+// iot_button's 5 ms polling timer would wake it 200 times a second. While the
+// window is open that timer is stopped and each key instead gets a level
+// interrupt that is also a light-sleep wake source. The first press masks the
+// interrupts again and restarts the timer, which then sees the key still down
+// and reports the press as usual -- and, running every 5 ms, keeps the chip
+// out of light sleep until the application closes the window.
+constexpr gpio_num_t kStandbyButtonGpios[] = {
+    kBoardUpButtonGpio, kBoardDownButtonGpio, kBoardConfirmButtonGpio};
+std::atomic<bool> s_button_standby{false};
+bool s_button_standby_isr_ready = false;
+
+// Registered through EnsureGpioIsrService(), which installs the service
+// without ESP_INTR_FLAG_IRAM: the handler and what it calls may live in flash.
+void ButtonStandbyIsr(void*) {
+    for (gpio_num_t gpio : kStandbyButtonGpios) {
+        gpio_intr_disable(gpio);
+    }
+    if (s_button_standby.exchange(false, std::memory_order_acq_rel)) {
+        iot_button_resume();
+    }
+}
+
 class CustomBoard : public Board {
 public:
     CustomBoard()
@@ -74,6 +99,7 @@ public:
         InitializeLcdDisplay();
         InitializeButtons();
         BindFactoryTestCallbacks();
+        KeepRailsDrivenInLightSleep();
     }
 
     std::string GetBoardType() override {
@@ -282,7 +308,110 @@ public:
         }
     }
 
+    // Board side of the application's low-power wait window: buttons on
+    // interrupts instead of the 5 ms poll, the charger pins and the LED task
+    // polled slowly. Refuses, changing nothing, while a key is down or a click
+    // is still being decoded. Idempotent, so the application can re-arm it
+    // every tick.
+    bool EnterLowPowerWait() {
+        if (!EnterButtonStandby()) {
+            return false;
+        }
+        charge_status_.SetLowPowerCadence(true);
+        if (power_ != nullptr) {
+            power_->SetLowPowerCadence(true);
+        }
+        return true;
+    }
+
+    void LeaveLowPowerWait() {
+        if (power_ != nullptr) {
+            power_->SetLowPowerCadence(false);
+        }
+        charge_status_.SetLowPowerCadence(false);
+        LeaveButtonStandby();
+    }
+
 private:
+    // See ButtonStandbyIsr(). Refuses while any key is down or a click
+    // sequence is still being decoded: stopping the timer then would hold
+    // that click back until the window closes.
+    bool EnterButtonStandby() {
+        if (s_button_standby.load(std::memory_order_acquire)) {
+            return true;
+        }
+        if (!s_button_standby_isr_ready) {
+            const esp_err_t err = EnsureGpioIsrService();
+            if (err != ESP_OK) {
+                ESP_LOGW(kTag, "Button standby unavailable: %s", esp_err_to_name(err));
+                return false;
+            }
+            for (gpio_num_t gpio : kStandbyButtonGpios) {
+                gpio_set_intr_type(gpio, GPIO_INTR_DISABLE);
+                if (gpio_isr_handler_add(gpio, ButtonStandbyIsr, nullptr) != ESP_OK) {
+                    ESP_LOGW(kTag, "Button standby unavailable: GPIO %d", gpio);
+                    return false;
+                }
+                gpio_intr_disable(gpio);
+            }
+            s_button_standby_isr_ready = true;
+        }
+        if (!up_button_.IsIdle() || !down_button_.IsIdle() || !confirm_button_.IsIdle()) {
+            return false;
+        }
+        for (gpio_num_t gpio : kStandbyButtonGpios) {
+            if (gpio_get_level(gpio) == 0) {
+                return false;
+            }
+        }
+        iot_button_stop();
+        s_button_standby.store(true, std::memory_order_release);
+        // gpio_wakeup_enable() also arms the pin as a low-level interrupt and
+        // keeps its pull-up through light sleep. A key pressed in between
+        // fires at once and undoes the standby.
+        for (gpio_num_t gpio : kStandbyButtonGpios) {
+            gpio_wakeup_enable(gpio, GPIO_INTR_LOW_LEVEL);
+            gpio_intr_enable(gpio);
+        }
+        esp_sleep_enable_gpio_wakeup();
+        return true;
+    }
+
+    void LeaveButtonStandby() {
+        if (!s_button_standby_isr_ready) {
+            return;
+        }
+        for (gpio_num_t gpio : kStandbyButtonGpios) {
+            gpio_intr_disable(gpio);
+        }
+        if (s_button_standby.exchange(false, std::memory_order_acq_rel)) {
+            iot_button_resume();
+        }
+        for (gpio_num_t gpio : kStandbyButtonGpios) {
+            gpio_wakeup_disable(gpio);
+            gpio_set_intr_type(gpio, GPIO_INTR_DISABLE);
+        }
+        // Light-sleep only. Left armed, it would also keep the RTC peripheral
+        // domain powered through deep sleep.
+        esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
+    }
+
+    // ESP-IDF's light-sleep GPIO workaround isolates every pad during light
+    // sleep. The rails below are also pad-held, which keeps them, but the
+    // battery latch in particular switches the whole board off if it ever
+    // floats: pin all of them to their normal configuration as well, and
+    // keep the I2C pull-ups on so the idle bus does not float either.
+    void KeepRailsDrivenInLightSleep() {
+        constexpr gpio_num_t kPins[] = {
+            VBAT_PWR_PIN, EPD_PWR_PIN, Audio_PWR_PIN, Audio_AMP_PIN,
+            GPIO_NUM_3 /* power LED */, NFC_PWR_GPIO,
+            AUDIO_CODEC_I2C_SDA_PIN, AUDIO_CODEC_I2C_SCL_PIN,
+        };
+        for (gpio_num_t pin : kPins) {
+            gpio_sleep_sel_dis(pin);
+        }
+    }
+
     void InitializePower() {
         power_ = std::make_unique<BoardPowerBsp>(EPD_PWR_PIN,
                                                  Audio_PWR_PIN,
@@ -630,4 +759,14 @@ extern "C" void ZectrixPrepareForDeepSleep() {
 extern "C" void ZectrixPrepareForScheduledWake() {
     auto& board = static_cast<CustomBoard&>(Board::GetInstance());
     board.PrepareForScheduledWake();
+}
+
+extern "C" bool ZectrixEnterLowPowerWait() {
+    auto& board = static_cast<CustomBoard&>(Board::GetInstance());
+    return board.EnterLowPowerWait();
+}
+
+extern "C" void ZectrixLeaveLowPowerWait() {
+    auto& board = static_cast<CustomBoard&>(Board::GetInstance());
+    board.LeaveLowPowerWait();
 }

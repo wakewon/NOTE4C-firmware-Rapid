@@ -139,6 +139,7 @@ idf_component_register(
         esp_lcd
         esp_netif
         esp_event
+        esp_pm
         log
 )
 

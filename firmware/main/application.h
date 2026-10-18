@@ -18,6 +18,8 @@ class RawDrawUiManager;
 }
 
 enum class NetworkEvent;
+struct esp_pm_lock;  // esp_pm_lock_handle_t
+struct tskTaskControlBlock;  // TaskHandle_t
 
 class Application {
 public:
@@ -141,6 +143,16 @@ private:
     bool quiet_recovery_ = false;
     int battery_level_at_boot_ = -1;
 
+    // Power management. awake_lock_ forbids auto light sleep and is held at
+    // all times except inside the low-power wait window: a scheduled wake on
+    // battery, waiting out its waveform with nothing else to do.
+    esp_pm_lock* awake_lock_ = nullptr;
+    bool low_power_wait_active_ = false;
+    int64_t low_power_wait_started_us_ = 0;
+    void InitializePowerManagement();
+    void UpdateLowPowerWait(bool display_busy);
+    void EndLowPowerWait(const char* reason);
+
     enum class SleepPhase {
         Awake,
         WaitingForDisplay,
@@ -150,6 +162,9 @@ private:
     const char* pending_sleep_reason_ = nullptr;
     std::mutex scheduled_callbacks_mutex_;
     std::vector<std::function<void()>> scheduled_callbacks_;
+    // The task running Run(); Schedule() notifies it so a callback does not
+    // wait out the loop period.
+    std::atomic<tskTaskControlBlock*> main_task_{nullptr};
 
     // Slideshow / network-sync schedule. One owner (this class), one deadline
     // per job, expressed in the RTC microsecond counter so a single absolute

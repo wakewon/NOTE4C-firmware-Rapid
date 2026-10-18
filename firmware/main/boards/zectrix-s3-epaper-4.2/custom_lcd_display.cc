@@ -4,6 +4,7 @@
 
 #include <esp_log.h>
 #include <esp_heap_caps.h>
+#include <esp_timer.h>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -29,6 +30,10 @@ LV_FONT_DECLARE(weather_icons_48);   // Weather icons 48px (FontAwesome)
 
 #define TAG "CustomLcdDisplay"
 static constexpr uint32_t kDisplayKickMs = 1000;
+// BUSY poll periods inside the application's low-power wait window: fast for
+// the first second of a wait, slow after that (see read_busy()).
+static constexpr uint32_t kLowPowerBusyFastPollMs = 50;
+static constexpr uint32_t kLowPowerBusyPollMs = 500;
 static constexpr int kFourColorSampleIntervalMs = 12000;
 // The 12 s interval above was sized for the 23 s full-color waveform. A
 // truncated fast refresh takes about 550 ms, and throttling one by 12 s was
@@ -970,7 +975,13 @@ void CustomLcdDisplay::refresh_task_loop() {
             stat_urgent++;
         }
 
-        const TickType_t refresh_started = xTaskGetTickCount();
+        // esp_timer, not the tick count: tickless idle drops the fraction of
+        // a tick on every light-sleep period, and over a 23 s waveform in the
+        // low-power window that under-reported it by about two seconds.
+        const int64_t refresh_started_us = esp_timer_get_time();
+        auto refresh_elapsed_ms = [refresh_started_us]() {
+            return static_cast<unsigned>((esp_timer_get_time() - refresh_started_us) / 1000);
+        };
         if (should_full) {
             stat_full++;
             if (idle_full) {
@@ -999,8 +1010,7 @@ void CustomLcdDisplay::refresh_task_loop() {
             xSemaphoreTake(dirty_mutex, portMAX_DELAY);
             CompleteFullColorRefreshLocked();
             xSemaphoreGive(dirty_mutex);
-            ESP_LOGW(TAG, "[FULL_COLOR] complete in %u ms",
-                     (unsigned)((xTaskGetTickCount() - refresh_started) * portTICK_PERIOD_MS));
+            ESP_LOGW(TAG, "[FULL_COLOR] complete in %u ms", refresh_elapsed_ms());
         } else if (IsFourColorPanel() && fast_bw) {
             stat_fast_bw++;
             ESP_LOGD(TAG, "[ULTRA_BW] start timing=%s source=%s; colors mapped to black/white",
@@ -1019,7 +1029,7 @@ void CustomLcdDisplay::refresh_task_loop() {
             // blocks the logging task while a host is attached but not
             // draining, so volume here costs input responsiveness.
             ESP_LOGI(TAG, "[ULTRA_BW] complete in %u ms; recovery=%s",
-                     (unsigned)((xTaskGetTickCount() - refresh_started) * portTICK_PERIOD_MS),
+                     refresh_elapsed_ms(),
                      fast_bw_recovery_mode_ ==
                              ssd2683_fast_bw::RecoveryMode::DeferredInteraction
                          ? "deferred_30s" : "quality_10s");
@@ -1054,6 +1064,18 @@ void CustomLcdDisplay::refresh_task_loop() {
 // =======================================================
 // GPIO/SPI init
 // =======================================================
+// ESP-IDF's light-sleep GPIO workaround (ESP_SLEEP_GPIO_RESET_WORKAROUND)
+// isolates every pad while the chip light-sleeps: output off, pulls off. For
+// the panel lines that means RST and CS float for the length of the waveform
+// the controller is still running, and a reset or a stray chip select there
+// corrupts the refresh. Keep these pads on their normal configuration; the
+// supply pin is already held by the power BSP.
+static void KeepPinDrivenInLightSleep(int pin) {
+    if (pin >= 0) {
+        gpio_sleep_sel_dis(static_cast<gpio_num_t>(pin));
+    }
+}
+
 void CustomLcdDisplay::spi_gpio_init() {
     int rst  = lcd_spi_data.rst;
     int cs   = lcd_spi_data.cs;
@@ -1076,6 +1098,9 @@ void CustomLcdDisplay::spi_gpio_init() {
     ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_config(&gpio_conf));
 
     set_rst_1();
+    KeepPinDrivenInLightSleep(rst);
+    KeepPinDrivenInLightSleep(cs);
+    KeepPinDrivenInLightSleep(dc);
 }
 
 void CustomLcdDisplay::spi_port_init() {
@@ -1112,6 +1137,8 @@ void CustomLcdDisplay::spi_port_init() {
     ESP_ERROR_CHECK(spi_bus_initialize((spi_host_device_t)spi_host, &buscfg, SPI_DMA_CH_AUTO));
     ESP_ERROR_CHECK(spi_bus_add_device((spi_host_device_t)spi_host, &devcfg, &spi));
     spi_bus_inited = true;
+    KeepPinDrivenInLightSleep(mosi);
+    KeepPinDrivenInLightSleep(scl);
 }
 
 void CustomLcdDisplay::spi_port_rx_init() {
@@ -1175,7 +1202,20 @@ void CustomLcdDisplay::read_busy() {
         // FREERTOS_HZ is 100 here, so pdMS_TO_TICKS(5) rounds to 0 and
         // vTaskDelay(0) returns without yielding, turning this into a busy
         // spin that starved IDLE and tripped the task watchdog.
-        vTaskDelay(1);
+        //
+        // In the low-power window a 10 ms poll would keep the chip awake for
+        // the whole ~23 s waveform: auto light sleep needs every task blocked
+        // for at least FREERTOS_IDLE_TIME_BEFORE_SLEEP ticks. The short busy
+        // phases (reset, power on, power off) still get a fast poll so each is
+        // not stretched to half a second; noticing the end of the waveform up
+        // to one slow poll late costs nothing.
+        TickType_t poll = 1;
+        if (low_power_busy_wait_.load(std::memory_order_acquire)) {
+            poll = pdMS_TO_TICKS((now - start) < pdMS_TO_TICKS(1000)
+                                     ? kLowPowerBusyFastPollMs
+                                     : kLowPowerBusyPollMs);
+        }
+        vTaskDelay(poll);
     }
 }
 

@@ -14,6 +14,7 @@
 #include <driver/gpio.h>
 #include <esp_mac.h>
 #include <esp_log.h>
+#include <esp_pm.h>
 #include <esp_sleep.h>
 #include <esp_rtc_time.h>
 #include <esp_sntp.h>
@@ -211,6 +212,9 @@ struct BootRecord {
     uint8_t boot_kind;
     uint8_t battery;
     uint8_t flags;
+    // Part of awake_s spent in auto light sleep.
+    uint16_t light_sleep_s;
+    uint16_t reserved;
 };
 
 constexpr uint32_t kPowerDiagnosticsMagic = 0x4E345045;  // "N4PE"
@@ -234,6 +238,22 @@ static_assert(std::is_trivially_default_constructible_v<PowerLifecycleDiagnostic
 RTC_NOINIT_ATTR RetainedSchedule s_retained_schedule;
 RTC_NOINIT_ATTR PowerLifecycleDiagnostics s_power_diagnostics;
 bool s_sntp_started = false;
+
+// Auto light sleep this boot. Written only by the exit callback, which runs
+// on the IDLE task of the one core that slept (the other is stalled for the
+// duration), and read by the app task once the low-power window has closed.
+uint64_t s_light_sleep_us = 0;
+uint32_t s_light_sleep_periods = 0;
+
+#if CONFIG_PM_LIGHT_SLEEP_CALLBACKS
+IRAM_ATTR esp_err_t OnLightSleepExit(int64_t sleep_time_us, void*) {
+    if (sleep_time_us > 0) {
+        s_light_sleep_us += static_cast<uint64_t>(sleep_time_us);
+        ++s_light_sleep_periods;
+    }
+    return ESP_OK;
+}
+#endif
 
 uint32_t RetainedChecksum(const void* data, size_t length) {
     // FNV-1a. Only has to reject random power-on contents and torn writes.
@@ -317,12 +337,14 @@ void LogBootHistory(int max_entries) {
         const BootRecord& entry = s_power_diagnostics.history[slot];
         if (entry.rtc_s == 0 && entry.reset_reason == 0) continue;
         ESP_LOGI(kTag,
-                 "Boot history -%d: rtc=%lus reset=%s kind=%s battery=%d flags=0x%02x awake=%us%s",
+                 "Boot history -%d: rtc=%lus reset=%s kind=%s battery=%d flags=0x%02x "
+                 "awake=%us light_sleep=%us%s",
                  age, static_cast<unsigned long>(entry.rtc_s),
                  ResetReasonName(entry.reset_reason), BootKindName(entry.boot_kind),
                  entry.battery == 0xFF ? -1 : static_cast<int>(entry.battery),
                  static_cast<unsigned>(entry.flags),
                  static_cast<unsigned>(entry.awake_s),
+                 static_cast<unsigned>(entry.light_sleep_s),
                  (entry.flags & kBootFlagSleepCommitted)     ? ""
                  : (entry.flags & kBootFlagRestartRequested) ? " (restart requested)"
                                                              : " (no sleep commit)");
@@ -358,6 +380,8 @@ extern "C" RtcPcf8563* ZectrixGetRtc();
 extern "C" void ZectrixPrepareForDeepSleep();
 extern "C" void ZectrixPrepareForScheduledWake();
 extern "C" bool ZectrixIsExternalPowerPresent();
+extern "C" bool ZectrixEnterLowPowerWait();
+extern "C" void ZectrixLeaveLowPowerWait();
 
 int CurrentLocalDateKey() {
     time_t now = time(nullptr);
@@ -540,6 +564,7 @@ void Application::Initialize(bool display_stall_recovery_boot,
     RuntimeGuardNoteProgress(RuntimeGuardPhase::Initializing);
     input_ready_.store(false, std::memory_order_release);
     scheduled_wake_accepts_input_.store(false, std::memory_order_release);
+    InitializePowerManagement();
     Settings gallery_nvs(kGalleryNamespace, false);
     slideshow_interval_minutes_ = gallery_nvs.GetInt(kSlideshowIntervalKey, 5);
     if (!IsValidSlideshowInterval(slideshow_interval_minutes_)) {
@@ -1117,6 +1142,7 @@ void Application::HandleInputDuringScheduledWake(ButtonAction action) {
 void Application::PromoteScheduledWakeToInteractive(const char* reason) {
     if (!scheduler_timer_wake_ || sleep_phase_ != SleepPhase::Awake) return;
     ESP_LOGI(kTag, "Scheduled wake promoted to interactive: %s", reason ? reason : "unspecified");
+    EndLowPowerWait("interactive");
     scheduler_timer_wake_ = false;
     scheduled_wake_accepts_input_.store(false, std::memory_order_release);
     RuntimeGuardSetScheduledWake(false);
@@ -1779,8 +1805,108 @@ void Application::EnterLowPowerSleep(const char* reason) {
     }
 }
 
+// Dynamic frequency scaling runs everywhere: whenever both cores are idle the
+// CPU drops from 240 MHz to the 40 MHz crystal. Auto light sleep is enabled
+// too, but awake_lock_ forbids it outside the low-power wait window, so the
+// buttons, Wi-Fi, the HTTP servers and the USB console never see it.
+void Application::InitializePowerManagement() {
+#if CONFIG_PM_ENABLE
+    esp_pm_lock_handle_t lock = nullptr;
+    esp_err_t err = esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "app_awake", &lock);
+    if (err != ESP_OK) {
+        ESP_LOGW(kTag, "Power management lock unavailable: %s", esp_err_to_name(err));
+        return;
+    }
+    // Before esp_pm_configure(): light sleep must be forbidden the moment it
+    // becomes possible.
+    esp_pm_lock_acquire(lock);
+    awake_lock_ = lock;
+#if CONFIG_PM_LIGHT_SLEEP_CALLBACKS
+    esp_pm_sleep_cbs_register_config_t callbacks = {};
+    callbacks.exit_cb = OnLightSleepExit;
+    esp_pm_light_sleep_register_cbs(&callbacks);
+#endif
+    esp_pm_config_t config = {};
+    config.max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
+    config.min_freq_mhz = CONFIG_XTAL_FREQ;
+#if CONFIG_FREERTOS_USE_TICKLESS_IDLE
+    config.light_sleep_enable = true;
+#endif
+    err = esp_pm_configure(&config);
+    if (err != ESP_OK) {
+        ESP_LOGW(kTag, "Power management not configured: %s", esp_err_to_name(err));
+    }
+#endif
+}
+
+// A slideshow wake spends ~23 of its ~27 s waiting for the panel to finish
+// its waveform, and at 240 MHz that idle wait was most of the energy the
+// wake cost. Inside this window the chip light-sleeps between BUSY polls
+// instead. Only where nothing can need it awake: a scheduled wake that no key
+// has turned interactive, on battery, with no network session -- the radio
+// and the USB console do not survive light sleep, and on external power there
+// is nothing to save.
+void Application::UpdateLowPowerWait(bool display_busy) {
+#if CONFIG_PM_ENABLE && CONFIG_FREERTOS_USE_TICKLESS_IDLE
+    if (awake_lock_ == nullptr) {
+        return;
+    }
+    const bool wanted = scheduler_timer_wake_ && display_busy && !network_sync_pending_ &&
+                        !quiet_recovery_ && !ZectrixIsExternalPowerPresent();
+    if (!wanted) {
+        EndLowPowerWait(display_busy ? "conditions changed" : "panel idle");
+        return;
+    }
+    // Also re-arms button standby after a key bounce that woke it without
+    // producing a press (the window would otherwise stay open with the
+    // 5 ms button timer running, and never sleep).
+    if (!ZectrixEnterLowPowerWait()) {
+        return;
+    }
+    if (low_power_wait_active_) {
+        return;
+    }
+    if (auto* lcd = static_cast<CustomLcdDisplay*>(Board::GetInstance().GetDisplay())) {
+        lcd->SetLowPowerBusyWait(true);
+    }
+    low_power_wait_active_ = true;
+    low_power_wait_started_us_ = esp_timer_get_time();
+    ESP_LOGI(kTag, "Low-power wait: light sleep allowed until the waveform completes");
+    // Last: from here on the chip may sleep whenever every task is blocked.
+    esp_pm_lock_release(awake_lock_);
+#else
+    (void)display_busy;
+#endif
+}
+
+void Application::EndLowPowerWait(const char* reason) {
+#if CONFIG_PM_ENABLE && CONFIG_FREERTOS_USE_TICKLESS_IDLE
+    if (!low_power_wait_active_) {
+        return;
+    }
+    // First: everything below assumes the chip stays awake.
+    esp_pm_lock_acquire(awake_lock_);
+    low_power_wait_active_ = false;
+    ZectrixLeaveLowPowerWait();
+    if (auto* lcd = static_cast<CustomLcdDisplay*>(Board::GetInstance().GetDisplay())) {
+        lcd->SetLowPowerBusyWait(false);
+    }
+    ESP_LOGI(kTag,
+             "Low-power wait ended (%s) after %lld ms; light sleep so far %llu ms in %lu periods",
+             reason ? reason : "unspecified",
+             static_cast<long long>((esp_timer_get_time() - low_power_wait_started_us_) / 1000),
+             static_cast<unsigned long long>(s_light_sleep_us / 1000),
+             static_cast<unsigned long>(s_light_sleep_periods));
+#else
+    (void)reason;
+#endif
+}
+
 void Application::CommitLowPowerSleep() {
     RuntimeGuardNoteProgress(RuntimeGuardPhase::CommittingSleep);
+    // Auto light sleep re-arms the timer wakeup on every entry; it must not be
+    // possible between configuring the deep-sleep sources and the commit.
+    EndLowPowerWait("sleep commit");
     // A late station callback may race the asynchronous EPD waveform. Reassert
     // the final radio state immediately before power is committed; the glass
     // already contains the disconnected state selected by preflight.
@@ -1901,7 +2027,13 @@ void Application::CommitLowPowerSleep() {
     BootRecord& record = CurrentBootRecord();
     record.awake_s = static_cast<uint16_t>(
         std::min<int64_t>(esp_timer_get_time() / 1000000, UINT16_MAX));
+    record.light_sleep_s = static_cast<uint16_t>(
+        std::min<uint64_t>(s_light_sleep_us / 1000000, UINT16_MAX));
     record.flags |= kBootFlagSleepCommitted;
+    ESP_LOGI(kTag, "Awake %lld ms, of which %llu ms in light sleep (%lu periods)",
+             static_cast<long long>(esp_timer_get_time() / 1000),
+             static_cast<unsigned long long>(s_light_sleep_us / 1000),
+             static_cast<unsigned long>(s_light_sleep_periods));
     SealRetained(s_power_diagnostics);
     ESP_LOGI(kTag,
              "Power lifecycle commit: boots=%u timer_wakes=%u sleep_commits=%u photo=%ld",
@@ -1955,6 +2087,7 @@ void Application::HandleSntpSynchronized() {
 }
 
 void Application::Run() {
+    main_task_.store(xTaskGetCurrentTaskHandle(), std::memory_order_release);
     while (true) {
         RuntimeGuardNoteProgress(
             sleep_phase_ == SleepPhase::Awake
@@ -2093,6 +2226,8 @@ void Application::Run() {
             }
         }
 
+        UpdateLowPowerWait(display_busy);
+
         if (scheduler_timer_wake_) {
             if (!display_busy && !network_sync_pending_) {
                 // A slideshow deadline that came due while this wake was busy
@@ -2148,7 +2283,10 @@ void Application::Run() {
                                                           : "interactive idle timeout");
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(250));
+        // In the low-power wait this loop only has to notice the end of the
+        // waveform, and each of its wake-ups cuts a light sleep short; a key
+        // press still gets through at once, because Schedule() notifies.
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(low_power_wait_active_ ? 1000 : 250));
     }
 }
 
@@ -2187,8 +2325,13 @@ bool Application::SetDeviceState(DeviceState state) {
 
 void Application::Schedule(std::function<void()>&& callback) {
     if (!callback) return;
-    std::lock_guard<std::mutex> lock(scheduled_callbacks_mutex_);
-    scheduled_callbacks_.push_back(std::move(callback));
+    {
+        std::lock_guard<std::mutex> lock(scheduled_callbacks_mutex_);
+        scheduled_callbacks_.push_back(std::move(callback));
+    }
+    if (TaskHandle_t task = main_task_.load(std::memory_order_acquire)) {
+        xTaskNotifyGive(task);
+    }
 }
 
 void Application::DrainScheduledCallbacks() {
