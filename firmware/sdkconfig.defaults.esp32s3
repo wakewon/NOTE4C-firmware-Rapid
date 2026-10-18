@@ -44,3 +44,11 @@ CONFIG_LV_USE_SNAPSHOT=y
 # Bluetooth BLE
 CONFIG_BT_ENABLED=y
 CONFIG_BTDM_CTRL_MODE_BLE_ONLY=y
+
+# Console on the USB-Serial-JTAG port only. UART0 at 115200 baud was the
+# primary console with nothing attached to it, and every log line beyond its
+# 128-byte FIFO busy-waited the CPU at 240 MHz: about 0.6 s of each wake. USB
+# output is fast with a host and dropped after one 50 ms timeout without one.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
