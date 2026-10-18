@@ -412,9 +412,18 @@ void RawDrawUiManager::Init(CustomLcdDisplay* lcd, RefreshCallback refresh_cb,
         }
     }
 
-    // Clear and render initial frame
+    // A deferred boot draws nothing here. Every such boot either renders its
+    // own first frame (the slideshow photo, a restored gallery, the replayed
+    // wake key, the low-battery notice) or pushes nothing at all (a sync-only
+    // wake, a quiet recovery). Rendering the default memory-card page anyway
+    // loaded and scaled the selected photo -- about 0.7 s of every scheduled
+    // wake -- only for the slideshow frame to be drawn over it. TriggerRefresh()
+    // and RefreshRect() render the active page first should anything ever
+    // request a refresh before a frame exists.
     auto* fb = lcd_->GetFramebuffer();
-    if (fb) {
+    if (fb && defer_initial_refresh) {
+        ESP_LOGI(kTag, "Boot render deferred until a frame is requested");
+    } else if (fb) {
         // Lock for thread safety
         auto* mutex = lcd_->GetMutex();
         if (mutex) xSemaphoreTake(mutex, portMAX_DELAY);
@@ -427,13 +436,9 @@ void RawDrawUiManager::Init(CustomLcdDisplay* lcd, RefreshCallback refresh_cb,
         // Establish a known full-color baseline at boot. Later page changes,
         // cursor moves and button-driven updates go through the FAST_BW
         // callback and arm the idle recovery timer.
-        if (defer_initial_refresh) {
-            ESP_LOGI(kTag, "Boot baseline rendered but physical refresh deferred");
-        } else {
-            RecordCurrentFrameAsDisplayed();
-            ESP_LOGI(kTag, "[FULL_COLOR] request source=boot_baseline");
-            lcd_->RequestUrgentFullRefresh();
-        }
+        RecordCurrentFrameAsDisplayed();
+        ESP_LOGI(kTag, "[FULL_COLOR] request source=boot_baseline");
+        lcd_->RequestUrgentFullRefresh();
     }
 
     ESP_LOGI(kTag, "RawDraw UI Manager initialized: %dx%d, page=%s",
@@ -1218,6 +1223,19 @@ void RawDrawUiManager::RenderAll(uint8_t* fb, int width, int height) {
     if (quick_switch_open_) {
         DrawQuickSwitchOverlay(fb, width, height);
     }
+    framebuffer_holds_page_ = true;
+}
+
+// Every refresh path draws its frame before asking for a waveform; a deferred
+// Init() relies on that. Should a path ever ask first, render the active page
+// rather than push the blank boot framebuffer onto the glass.
+bool RawDrawUiManager::EnsureFramebufferHoldsPage() {
+    if (framebuffer_holds_page_) {
+        return true;
+    }
+    ESP_LOGW(kTag, "Refresh requested before any frame was rendered; rendering %s first",
+             GetPageTitle(current_page_));
+    return RenderActivePageToFramebuffer();
 }
 
 void RawDrawUiManager::DrawGlobalPageFrame(uint8_t* fb, int width, int height) {
@@ -1562,6 +1580,7 @@ void RawDrawUiManager::RedrawQuickSwitchOnly(uint8_t* fb) {
 
 void RawDrawUiManager::RefreshRect(const rawdraw::Rect& rect, RefreshIntent intent) {
     if (!lcd_ || !refresh_cb_) return;
+    if (!EnsureFramebufferHoldsPage()) return;
     rawdraw::Rect refresh_rect = rawdraw::align_x8(rawdraw::clamp_rect(
         {rect.x - 4, rect.y - 4, rect.w + 12, rect.h + 12}, width_, height_));
     auto* mutex = lcd_->GetMutex();
@@ -1581,6 +1600,7 @@ void RawDrawUiManager::RefreshRect(const rawdraw::Rect& rect, RefreshIntent inte
 
 void RawDrawUiManager::TriggerRefresh(RefreshIntent intent) {
     if (!lcd_) return;
+    if (!EnsureFramebufferHoldsPage()) return;
 
     // No framebuffer lock here. Nothing below touches the pixels, and an
     // unbounded wait on the render task's mutex is reachable from the sleep

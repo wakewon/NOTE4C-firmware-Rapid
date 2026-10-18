@@ -588,6 +588,9 @@ private:
     std::function<void(int)> slideshow_interval_changed_cb_;
     bool persistent_sleep_preparing_ = false;
     bool current_state_matches_display_ = true;
+    // Set by the first RenderAll() after boot. A deferred Init() renders
+    // nothing, so until then the framebuffer is still the blank allocation.
+    bool framebuffer_holds_page_ = false;
     PersistentDisplayMetadata displayed_metadata_{};
     std::mutex gallery_storage_sync_mutex_;
     std::string gallery_preferred_photo_id_;
@@ -634,6 +637,8 @@ private:
     // Sleep-critical callers must treat that as "frame not prepared" rather
     // than waiting.
     bool RenderActivePageToFramebuffer();
+    // False only if nothing was rendered yet and rendering now failed.
+    bool EnsureFramebufferHoldsPage();
     bool HasGlobalChrome() const;
 };
 
