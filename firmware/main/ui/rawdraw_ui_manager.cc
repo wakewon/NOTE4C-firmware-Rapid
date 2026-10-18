@@ -1678,19 +1678,33 @@ bool RawDrawUiManager::PrepareGallerySlideshowFrame(int retained_index, bool adv
     if (!photo_gallery_renderer_ || photo_gallery_renderer_->GetPhotoCount() <= 0) {
         return false;
     }
-    current_page_ = RawDrawPageId::Gallery;
-    current_state_matches_display_ = true;
-    photo_gallery_renderer_->SetSelectedIndex(retained_index);
-    if (!photo_gallery_renderer_->EnterFullscreenMode()) {
-        return false;
-    }
-    const bool advanced = advance && photo_gallery_renderer_->SelectNext(true);
-    if (advance && !advanced && retained_fullscreen &&
-        photo_gallery_renderer_->GetSelectedIndex() == retained_index) {
+    const int count = photo_gallery_renderer_->GetPhotoCount();
+    if (advance && retained_fullscreen && count == 1) {
         // A one-photo album: the glass already shows exactly this frame, and
         // repainting it every interval only spent a 20 s waveform per wake.
         ESP_LOGI(kTag, "Slideshow has nothing to advance to; frame left as is");
         return false;
+    }
+    current_page_ = RawDrawPageId::Gallery;
+    current_state_matches_display_ = true;
+    // Select the photo to show before entering fullscreen. Entering on the
+    // retained photo loaded it from SPIFFS -- a name scan plus a 30 KB read,
+    // about 0.4 s -- only for the advance to load the next one over it.
+    const int retained = std::max(0, std::min(retained_index, count - 1));
+    photo_gallery_renderer_->SetSelectedIndex(advance ? (retained + 1) % count : retained);
+    if (!photo_gallery_renderer_->EnterFullscreenMode()) {
+        return false;
+    }
+    if (advance && retained_fullscreen &&
+        photo_gallery_renderer_->GetSelectedIndex() == retained) {
+        // Every other photo turned out unreadable; the frame on glass stands.
+        ESP_LOGI(kTag, "Slideshow has nothing to advance to; frame left as is");
+        return false;
+    }
+    if (advance) {
+        photo_gallery_renderer_->MarkFullRefresh();
+        ESP_LOGI(kTag, "Slideshow next photo: %d/%d",
+                 photo_gallery_renderer_->GetSelectedIndex() + 1, count);
     }
     {
         std::lock_guard<std::mutex> lock(ui_state_mutex_);
