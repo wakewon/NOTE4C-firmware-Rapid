@@ -15,8 +15,10 @@
 
 #define TAG "main"
 
-// Persists across soft resets and deep sleep, cleared only on power-on.
-// Used to avoid bouncing more than once per software reset.
+// Survives the deep-sleep bounce below. RTC_DATA is reloaded from flash on
+// every other reset (esp_restart() included), which is what re-arms it.
+// Used to avoid bouncing more than once per software reset, and to recognise
+// the boot that follows the bounce.
 static RTC_DATA_ATTR bool s_sw_reset_bounced = false;
 
 static void LogNvsStats() {
@@ -49,8 +51,15 @@ extern "C" void app_main(void)
     // Some soft/external reset paths leave the Wi-Fi RF state dirty until the
     // next hardware-equivalent reset. For those reset reasons only, perform a
     // brief deep-sleep round-trip once to come back with clean radio state.
+    //
+    // The boot that follows the bounce reports a deep-sleep timer wake. Now
+    // that the application's retained schedule survives esp_restart(), that
+    // boot would pass for a scheduled one, so it is identified here and
+    // handed over explicitly.
+    bool user_restart_bounce = false;
     {
         const auto reason = esp_reset_reason();
+        user_restart_bounce = s_sw_reset_bounced && reason == ESP_RST_DEEPSLEEP;
         ESP_LOGI(TAG, "Boot reset reason=%d bounced=%d display_stall_recovery=%d",
                  reason, s_sw_reset_bounced ? 1 : 0,
                  display_stall_recovery_boot ? 1 : 0);
@@ -87,6 +96,6 @@ extern "C" void app_main(void)
     // initialization deadlock instead of starting too late to observe it.
     RuntimeGuardNoteProgress(RuntimeGuardPhase::Initializing);
     StartDisplayStallGuard();
-    app.Initialize(display_stall_recovery_boot);
+    app.Initialize(display_stall_recovery_boot, user_restart_bounce);
     app.Run();  // This function runs the main event loop and never returns
 }

@@ -29,7 +29,12 @@ public:
     Application(const Application&) = delete;
     Application& operator=(const Application&) = delete;
 
-    void Initialize(bool display_stall_recovery_boot = false);
+    // display_stall_recovery_boot: the runtime guard restarted the device.
+    // user_restart_bounce: this is the deep-sleep bounce main.cc inserts after
+    // a requested esp_restart(); it reports a timer wake but is not a
+    // scheduled one.
+    void Initialize(bool display_stall_recovery_boot = false,
+                    bool user_restart_bounce = false);
     void Run();
 
     DeviceState GetDeviceState() const { return state_.load(std::memory_order_acquire); }
@@ -57,25 +62,47 @@ public:
     // outside the app task may drive the radio or the schedule directly.
     void RequestSlideshowIntervalChange(int minutes);
     void RequestWifiDisabled(const char* reason);
-    void OnUpClick();
-    void OnDownClick();
-    void OnUpLongPress();
-    void OnDownLongPress();
-    void OnWifiConfigComboLongPress();
-    void OnBootClick();
-    void OnBootLongPress();
     void RequestManualSleep(bool disable_wifi = false);
+
+    enum class ButtonAction : uint8_t {
+        UpClick,
+        DownClick,
+        BootClick,
+        UpLongPress,
+        DownLongPress,
+        BootLongPress,
+        WifiConfigCombo,
+    };
+    // The only entry point for physical buttons. Called on the button task at
+    // the moment of the event, which is where input readiness has to be
+    // sampled (see the definition).
+    void PostButtonAction(ButtonAction action);
 
 private:
     Application();
     ~Application();
 
+    // Why this boot happened, which decides what the first frame is and
+    // whether the session is interactive. See Initialize().
+    enum class BootKind : uint8_t {
+        ColdBoot,       // power-on, USB/EN reset, or no usable retained state
+        UserRestart,    // the settings restart, after main.cc's deep-sleep bounce
+        ScheduledWake,  // RTC timer wake with a valid retained schedule
+        ButtonWake,     // BOOT/DOWN EXT1 wake; the press is replayed
+        ChargerWake,    // charger CHRG/FULL pin woke the device
+        Recovery,       // panic, watchdog, brownout or stall-guard restart
+    };
+
     std::atomic<DeviceState> state_{kDeviceStateUnknown};
     std::atomic<bool> wifi_connected_{false};
     std::atomic<bool> wifi_enabled_{false};
     std::atomic<bool> input_ready_{false};
+    // True while a scheduled (timer) wake is still able to turn interactive:
+    // a press during it promotes the session instead of being dropped.
+    std::atomic<bool> scheduled_wake_accepts_input_{false};
     AudioService audio_service_;
     std::unique_ptr<ui::RawDrawUiManager> rawdraw_ui_manager_;
+    BootKind boot_kind_ = BootKind::ColdBoot;
     bool audio_started_ = false;
     bool network_initialized_ = false;
     bool scheduler_timer_wake_ = false;
@@ -99,7 +126,20 @@ private:
     int64_t interactive_sleep_deadline_us_ = 0;
     int64_t external_power_probe_deadline_us_ = 0;
     int64_t display_freshness_probe_deadline_us_ = 0;
+    // esp_timer time of the last physical button action (or of the start of
+    // the interactive session). Drives the awake slideshow's return from idle
+    // pages and the local-service idle timeout.
+    int64_t last_input_us_ = 0;
+    // Settings "重启" needs a second press inside this window.
+    int64_t restart_confirm_deadline_us_ = 0;
+    bool restart_requested_ = false;
+    int64_t restart_requested_at_us_ = 0;
     bool external_power_present_ = false;
+    // Battery protection (see kCriticalBatteryPercent).
+    bool battery_critical_ = false;
+    // Too many consecutive unexpected resets: paint nothing, start no radio.
+    bool quiet_recovery_ = false;
+    int battery_level_at_boot_ = -1;
 
     enum class SleepPhase {
         Awake,
@@ -137,6 +177,22 @@ private:
     void EnterManualSleep();
     void NoteButtonActivity();
     void EnterWifiConfigMode();
+    void OnUpClick();
+    void OnDownClick();
+    void OnUpLongPress();
+    void OnDownLongPress();
+    void OnWifiConfigComboLongPress();
+    void OnBootClick();
+    void OnBootLongPress();
+    void DispatchButtonAction(ButtonAction action);
+    void HandleInputDuringScheduledWake(ButtonAction action);
+    void PromoteScheduledWakeToInteractive(const char* reason);
+    void StopIdleLocalServices(int64_t idle_us);
+    void StopConfigApIfRunning();
+    void OnRestartItemActivated();
+    void ReturnToSlideshowBeforeSleep();
+    void UpdateBatteryProtection(int level, bool external_power);
+    void ShowLowBatteryNoticeBeforeSleep();
     void DrainScheduledCallbacks();
     void HandleNetworkEvent(NetworkEvent event, const std::string& data);
     void HandleSntpSynchronized();

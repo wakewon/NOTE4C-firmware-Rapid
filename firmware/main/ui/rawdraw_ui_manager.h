@@ -275,6 +275,19 @@ public:
     void AdoptRetainedPersistentMetadata(const PersistentDisplayMetadata& metadata);
     bool PrepareRetainedGalleryFrame(int retained_index,
                                      bool retained_fullscreen);
+    // Rebuilds the retained gallery state (selection + fullscreen) as the
+    // current page. With refresh=false only the framebuffer is redrawn, for
+    // wakes where the glass is known to still show that frame.
+    bool RestoreRetainedGalleryState(int retained_index, bool retained_fullscreen,
+                                     bool refresh);
+    // Renders the current page and requests the boot full-colour baseline.
+    void PresentBootBaseline();
+    // True once this boot has rebuilt (or drawn) the state that the glass
+    // shows. False after AdoptRetainedPersistentMetadata() until a Prepare*/
+    // Restore* call reconstructs it.
+    bool DisplayedStateReconstructed() const { return current_state_matches_display_; }
+    // esp_timer time of the last HTTP connection to the local server, or 0.
+    int64_t GetHttpLastActivityUs() const;
     bool PrepareRetainedDisplayInvalidation(int retained_index,
                                             bool retained_fullscreen);
     PersistentFramePreparation PreparePersistentFrame();
@@ -438,9 +451,22 @@ public:
         slideshow_interval_changed_cb_ = std::move(callback);
     }
     // Advances to the next fullscreen photo. Returns false when the gallery is
-    // not in a state that can advance (wrong page, dialog open, no photos).
-    bool AdvanceGallerySlideshow();
-    bool PrepareGallerySlideshowFrame(int retained_index, bool advance);
+    // not in a state that can advance (dialog open, no photos). With
+    // return_to_slideshow, a memory-card gallery or an idle page such as
+    // Settings is first switched back to the fullscreen slideshow; pages that
+    // own a running service (AP transfer, Wi-Fi config) are never taken.
+    bool AdvanceGallerySlideshow(bool return_to_slideshow = false);
+    // retained_fullscreen: the glass shows retained_index fullscreen, so a
+    // slideshow with nothing to advance to leaves it alone.
+    bool PrepareGallerySlideshowFrame(int retained_index, bool advance,
+                                      bool retained_fullscreen = false);
+    // Before deep sleep: leave a non-gallery page (Settings, a stopped
+    // service page) for the gallery and queue its full-colour frame.
+    bool ReturnToGalleryForSleep();
+    // Replaces the frame with a "battery low, please charge" notice and
+    // queues its full-colour refresh. The page state is left untouched, so a
+    // later wake can rebuild the gallery from the retained selection.
+    bool ShowLowBatteryNotice(int battery_level);
     bool PrepareGalleryInteractiveWakeFrame(
         int retained_index, bool retained_fullscreen,
         const rawdraw::ButtonEvent& wake_event);

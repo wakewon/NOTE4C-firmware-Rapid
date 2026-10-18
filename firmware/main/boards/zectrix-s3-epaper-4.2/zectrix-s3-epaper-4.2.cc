@@ -56,9 +56,8 @@ void EnterWifiConfigComboOnce() {
         return;
     }
     ESP_LOGI(kTag, "UP+DOWN combo detected, entering WiFi config");
-    Application::GetInstance().Schedule([]() {
-        Application::GetInstance().OnWifiConfigComboLongPress();
-    });
+    Application::GetInstance().PostButtonAction(
+        Application::ButtonAction::WifiConfigCombo);
 }
 
 class CustomBoard : public Board {
@@ -385,8 +384,8 @@ private:
                 ESP_LOGI(kTag, "UP click suppressed after long press");
                 return;
             }
-            auto& app = Application::GetInstance();
-            app.Schedule([]() { Application::GetInstance().OnUpClick(); });
+            Application::GetInstance().PostButtonAction(
+                Application::ButtonAction::UpClick);
         });
 
         up_button_.OnPressUp([]() {
@@ -398,9 +397,8 @@ private:
                 if (s_down_held.load()) {
                     EnterWifiConfigComboOnce();
                 } else {
-                    Application::GetInstance().Schedule([]() {
-                        Application::GetInstance().OnUpLongPress();
-                    });
+                    Application::GetInstance().PostButtonAction(
+                        Application::ButtonAction::UpLongPress);
                 }
             }
             s_up_held.store(false);
@@ -421,8 +419,8 @@ private:
                 ESP_LOGI(kTag, "DOWN click suppressed after long press");
                 return;
             }
-            auto& app = Application::GetInstance();
-            app.Schedule([]() { Application::GetInstance().OnDownClick(); });
+            Application::GetInstance().PostButtonAction(
+                Application::ButtonAction::DownClick);
         });
 
         down_button_.OnPressUp([]() {
@@ -434,9 +432,8 @@ private:
                 if (s_up_held.load()) {
                     EnterWifiConfigComboOnce();
                 } else {
-                    Application::GetInstance().Schedule([]() {
-                        Application::GetInstance().OnDownLongPress();
-                    });
+                    Application::GetInstance().PostButtonAction(
+                        Application::ButtonAction::DownLongPress);
                 }
             }
             s_down_held.store(false);
@@ -450,9 +447,8 @@ private:
             if (s_down_held.load()) {
                 EnterWifiConfigComboOnce();
             } else {
-                Application::GetInstance().Schedule([]() {
-                    Application::GetInstance().OnUpLongPress();
-                });
+                Application::GetInstance().PostButtonAction(
+                    Application::ButtonAction::UpLongPress);
             }
         });
 
@@ -462,45 +458,22 @@ private:
             if (s_up_held.load()) {
                 EnterWifiConfigComboOnce();
             } else {
-                Application::GetInstance().Schedule([]() {
-                    Application::GetInstance().OnDownLongPress();
-                });
+                Application::GetInstance().PostButtonAction(
+                    Application::ButtonAction::DownLongPress);
             }
         });
 
-        // CONFIRM (BOOT) short press → forward to factory test (or PTT)
+        // CONFIRM (BOOT). Readiness is sampled inside PostButtonAction() at
+        // the moment of the event: the release of a BOOT press that woke the
+        // device must not act a second time.
         confirm_button_.OnClick([]() {
-            auto& app = Application::GetInstance();
-            if (!app.IsInputReady()) {
-                ESP_LOGI(kTag, "BOOT release ignored while wake action is being restored");
-                return;
-            }
-            app.Schedule([]() {
-                auto& scheduled_app = Application::GetInstance();
-                if (scheduled_app.GetRawDrawUiManager()) {
-                    scheduled_app.OnBootClick();
-                } else {
-                    FactoryTestService::Instance().HandleButton(
-                        FactoryTestButton::kConfirmClick);
-                }
-            });
+            Application::GetInstance().PostButtonAction(
+                Application::ButtonAction::BootClick);
         });
 
-        // CONFIRM (BOOT) long press → voice PTT or factory test
         confirm_button_.OnLongPress([]() {
-            auto& app = Application::GetInstance();
-            if (!app.IsInputReady()) {
-                return;
-            }
-            app.Schedule([]() {
-                auto& scheduled_app = Application::GetInstance();
-                if (scheduled_app.GetRawDrawUiManager()) {
-                    scheduled_app.OnBootLongPress();
-                } else {
-                    FactoryTestService::Instance().HandleButton(
-                        FactoryTestButton::kConfirmLongPress);
-                }
-            });
+            Application::GetInstance().PostButtonAction(
+                Application::ButtonAction::BootLongPress);
         });
     }
 

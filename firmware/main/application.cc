@@ -19,9 +19,14 @@
 #include <esp_sntp.h>
 #include <esp_system.h>
 #include <esp_wifi.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #include <ctime>
 #include <algorithm>
+#include <cstddef>
+#include <cstring>
+#include <type_traits>
 #include <sys/time.h>
 
 namespace {
@@ -37,9 +42,28 @@ constexpr int kSettingsNetworkSyncIndex = 5;
 constexpr int kSettingsWifiIndex = 6;
 constexpr int kSettingsHttpServerIndex = 7;
 constexpr int kSettingsLanIpIndex = 8;
-constexpr uint32_t kRetainedMagic = 0x4E344353;  // "N4CS" (layout v4)
+constexpr int kSettingsRestartIndex = 1;
+constexpr uint32_t kRetainedMagic = 0x4E344354;  // "N4CT" (layout v5, RTC_NOINIT)
 constexpr int64_t kInteractiveAwakeUs = 120LL * 1000 * 1000;
 constexpr int64_t kNetworkSyncTimeoutUs = 35LL * 1000 * 1000;
+// On battery, a local service (AP transfer, LAN server, Wi-Fi config hotspot)
+// with no HTTP request and no key press for this long is stopped so the
+// device can sleep again. Each of them blocks idle sleep, and an accidental
+// one-second BOOT press on the gallery (which opens AP transfer) used to keep
+// the radio and CPU running until the battery was empty.
+constexpr int64_t kLocalServiceIdleTimeoutUs = 10LL * 60 * 1000 * 1000;
+constexpr int64_t kRestartConfirmWindowUs = 8LL * 1000 * 1000;
+// A requested restart waits for the panel to settle, but never longer than
+// this: the boot that follows repaints everything anyway.
+constexpr int64_t kRestartDisplayWaitUs = 30LL * 1000 * 1000;
+// Battery protection. ReadBatteryStatus() maps about 3.47 V to 3 %. Below
+// that every further slideshow waveform risks a brownout halfway through, and
+// a fullscreen photo has no status bar to say why the frame stopped changing.
+// Two consecutive readings, so one noisy sample cannot stop the slideshow;
+// 10 % (or a charger) to resume.
+constexpr int kCriticalBatteryPercent = 3;
+constexpr int kBatteryResumePercent = 10;
+constexpr uint8_t kCriticalBatteryStrikes = 2;
 
 constexpr int SchedulePeriodSeconds(int interval_minutes) {
     return interval_minutes > 0 ? interval_minutes * 60 : 0;
@@ -128,30 +152,207 @@ static_assert(TODO_UP_BUTTON_GPIO > GPIO_NUM_21,
 // and a long awake session no longer credits nothing at all.
 //
 // 0 means "not scheduled" (interval disabled).
+//
+// Both records below are RTC_NOINIT, so they survive every reset that keeps
+// the RTC domain powered: deep sleep, but also esp_restart(), panics,
+// watchdogs and brownouts. They used to be RTC_DATA_ATTR, which the
+// bootloader reloads from flash on every reset except a deep-sleep wake. The
+// stall guard's esp_restart() therefore wiped exactly the state its recovery
+// path was written to restore, any crash sent the frame back to photo 1 in
+// memory-card mode, and the diagnostics that should have explained a field
+// failure were zeroed by it.
+//
+// RTC_NOINIT storage must not have a C++ initializer: GCC emits a startup
+// constructor for any type with default member initializers, and it would
+// overwrite the retained copy on every boot. Hence the trivially
+// constructible layouts, the display metadata carried as bytes, and a
+// checksum that tells a valid record from power-on garbage or a torn update.
 struct RetainedSchedule {
     uint32_t magic;
-    int slideshow_config_minutes;
-    int sync_config_minutes;
+    uint32_t size;
+    int32_t slideshow_config_minutes;
+    int32_t sync_config_minutes;
     uint64_t slideshow_due_rtc_us;
     uint64_t sync_due_rtc_us;
-    int selected_photo_index;
-    int gallery_fullscreen;
-    ui::PersistentDisplayMetadata display_metadata;
+    int32_t selected_photo_index;
+    int32_t gallery_fullscreen;
+    uint8_t display_metadata[sizeof(ui::PersistentDisplayMetadata)];
+    // Consecutive wakes that measured a critical battery on battery power,
+    // and whether the "please charge" notice is the frame on glass.
+    uint8_t low_battery_strikes;
+    uint8_t low_battery_notice_shown;
+    uint8_t reserved[2];
+    uint32_t checksum;
+};
+static_assert(std::is_trivially_default_constructible_v<RetainedSchedule>,
+              "RTC_NOINIT storage must not get a startup constructor");
+static_assert(std::is_trivially_copyable_v<ui::PersistentDisplayMetadata>,
+              "display metadata is retained with memcpy");
+
+constexpr int kBootHistoryLength = 12;
+enum BootRecordFlag : uint8_t {
+    kBootFlagFrameRefreshed = 1u << 0,
+    kBootFlagNetworkSession = 1u << 1,
+    kBootFlagSleepCommitted = 1u << 2,
+    kBootFlagPromoted = 1u << 3,
+    kBootFlagQuietRecovery = 1u << 4,
+    kBootFlagServicesTimedOut = 1u << 5,
+    kBootFlagRestartRequested = 1u << 6,
 };
 
-constexpr uint32_t kPowerDiagnosticsMagic = 0x4E345044;  // "N4PD"
+// One entry per boot, completed when that boot commits deep sleep. A wake
+// that never reaches the commit (crash, watchdog, brownout, stall restart)
+// keeps awake_s == 0, which is what a field failure looks like afterwards.
+struct BootRecord {
+    uint32_t rtc_s;
+    uint16_t awake_s;
+    uint16_t wake_causes;
+    uint8_t reset_reason;
+    uint8_t boot_kind;
+    uint8_t battery;
+    uint8_t flags;
+};
+
+constexpr uint32_t kPowerDiagnosticsMagic = 0x4E345045;  // "N4PE"
 struct PowerLifecycleDiagnostics {
     uint32_t magic;
+    uint32_t size;
     uint32_t boot_count;
     uint32_t timer_wake_count;
     uint32_t sleep_commit_count;
+    uint32_t unexpected_reset_count;
+    uint32_t consecutive_unexpected_resets;
     uint32_t last_wakeup_causes;
     int32_t last_photo_index;
+    uint32_t history_next;
+    BootRecord history[kBootHistoryLength];
+    uint32_t checksum;
+};
+static_assert(std::is_trivially_default_constructible_v<PowerLifecycleDiagnostics>,
+              "RTC_NOINIT storage must not get a startup constructor");
+
+RTC_NOINIT_ATTR RetainedSchedule s_retained_schedule;
+RTC_NOINIT_ATTR PowerLifecycleDiagnostics s_power_diagnostics;
+bool s_sntp_started = false;
+
+uint32_t RetainedChecksum(const void* data, size_t length) {
+    // FNV-1a. Only has to reject random power-on contents and torn writes.
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    uint32_t hash = 2166136261u;
+    for (size_t i = 0; i < length; ++i) {
+        hash ^= bytes[i];
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+template <typename Record>
+void SealRetained(Record& record) {
+    record.checksum = RetainedChecksum(&record, offsetof(Record, checksum));
+}
+
+template <typename Record>
+bool RetainedRecordValid(const Record& record, uint32_t magic) {
+    return record.magic == magic && record.size == sizeof(Record) &&
+           record.checksum == RetainedChecksum(&record, offsetof(Record, checksum));
+}
+
+void SealRetainedSchedule() { SealRetained(s_retained_schedule); }
+
+ui::PersistentDisplayMetadata RetainedDisplayMetadata() {
+    ui::PersistentDisplayMetadata metadata;
+    memcpy(&metadata, s_retained_schedule.display_metadata, sizeof(metadata));
+    return metadata;
+}
+
+void StoreRetainedDisplayMetadata(const ui::PersistentDisplayMetadata& metadata) {
+    memcpy(s_retained_schedule.display_metadata, &metadata, sizeof(metadata));
+}
+
+BootRecord& CurrentBootRecord() {
+    const uint32_t newest = (s_power_diagnostics.history_next + kBootHistoryLength - 1) %
+                            kBootHistoryLength;
+    return s_power_diagnostics.history[newest];
+}
+
+void MarkBootRecord(uint8_t flags) {
+    CurrentBootRecord().flags |= flags;
+    SealRetained(s_power_diagnostics);
+}
+
+// Indexed by Application::BootKind.
+constexpr const char* kBootKindNames[] = {
+    "cold", "restart", "scheduled", "button", "charger", "recovery",
 };
 
-RTC_DATA_ATTR RetainedSchedule s_retained_schedule{};
-RTC_DATA_ATTR PowerLifecycleDiagnostics s_power_diagnostics{};
-bool s_sntp_started = false;
+const char* BootKindName(uint8_t kind) {
+    return kind < sizeof(kBootKindNames) / sizeof(kBootKindNames[0])
+               ? kBootKindNames[kind]
+               : "?";
+}
+
+const char* ResetReasonName(int reason) {
+    switch (reason) {
+        case ESP_RST_POWERON: return "poweron";
+        case ESP_RST_EXT: return "ext";
+        case ESP_RST_SW: return "sw";
+        case ESP_RST_PANIC: return "panic";
+        case ESP_RST_INT_WDT: return "int_wdt";
+        case ESP_RST_TASK_WDT: return "task_wdt";
+        case ESP_RST_WDT: return "wdt";
+        case ESP_RST_DEEPSLEEP: return "deepsleep";
+        case ESP_RST_BROWNOUT: return "brownout";
+        case ESP_RST_USB: return "usb";
+        case ESP_RST_PWR_GLITCH: return "pwr_glitch";
+        case ESP_RST_CPU_LOCKUP: return "cpu_lockup";
+        default: return "other";
+    }
+}
+
+void LogBootHistory(int max_entries) {
+    int logged = 0;
+    for (int age = std::min(max_entries, kBootHistoryLength); age >= 1; --age) {
+        const uint32_t slot = (s_power_diagnostics.history_next + kBootHistoryLength - age) %
+                              kBootHistoryLength;
+        const BootRecord& entry = s_power_diagnostics.history[slot];
+        if (entry.rtc_s == 0 && entry.reset_reason == 0) continue;
+        ESP_LOGI(kTag,
+                 "Boot history -%d: rtc=%lus reset=%s kind=%s battery=%d flags=0x%02x awake=%us%s",
+                 age, static_cast<unsigned long>(entry.rtc_s),
+                 ResetReasonName(entry.reset_reason), BootKindName(entry.boot_kind),
+                 entry.battery == 0xFF ? -1 : static_cast<int>(entry.battery),
+                 static_cast<unsigned>(entry.flags),
+                 static_cast<unsigned>(entry.awake_s),
+                 (entry.flags & kBootFlagSleepCommitted)     ? ""
+                 : (entry.flags & kBootFlagRestartRequested) ? " (restart requested)"
+                                                             : " (no sleep commit)");
+        ++logged;
+    }
+    if (logged == 0) {
+        ESP_LOGI(kTag, "Boot history: empty");
+    }
+}
+
+// Resets that interrupt whatever the device was doing. A recovery boot must
+// rebuild the frame the glass was showing (the interrupted waveform may have
+// left it half drawn) instead of falling back to the cold-boot page.
+constexpr bool IsUnexpectedReset(esp_reset_reason_t reason) {
+    return reason == ESP_RST_PANIC || reason == ESP_RST_INT_WDT ||
+           reason == ESP_RST_TASK_WDT || reason == ESP_RST_WDT ||
+           reason == ESP_RST_BROWNOUT || reason == ESP_RST_CPU_LOCKUP ||
+           reason == ESP_RST_PWR_GLITCH;
+}
+
+static_assert(IsUnexpectedReset(ESP_RST_PANIC));
+static_assert(IsUnexpectedReset(ESP_RST_BROWNOUT));
+static_assert(!IsUnexpectedReset(ESP_RST_DEEPSLEEP));
+static_assert(!IsUnexpectedReset(ESP_RST_POWERON));
+static_assert(!IsUnexpectedReset(ESP_RST_SW), "the stall guard is reported separately");
+
+// After this many unexpected resets without a single clean sleep commit in
+// between, stop repeating whatever the crashing boot did (a full waveform, a
+// radio start): keep the glass as it is and go straight back to sleep.
+constexpr uint32_t kQuietRecoveryThreshold = 3;
 
 extern "C" RtcPcf8563* ZectrixGetRtc();
 extern "C" void ZectrixPrepareForDeepSleep();
@@ -332,9 +533,13 @@ Application::Application() = default;
 
 Application::~Application() = default;
 
-void Application::Initialize(bool display_stall_recovery_boot) {
+void Application::Initialize(bool display_stall_recovery_boot,
+                             bool user_restart_bounce) {
+    static_assert(static_cast<int>(BootKind::Recovery) == 5,
+                  "kBootKindNames must follow BootKind");
     RuntimeGuardNoteProgress(RuntimeGuardPhase::Initializing);
     input_ready_.store(false, std::memory_order_release);
+    scheduled_wake_accepts_input_.store(false, std::memory_order_release);
     Settings gallery_nvs(kGalleryNamespace, false);
     slideshow_interval_minutes_ = gallery_nvs.GetInt(kSlideshowIntervalKey, 5);
     if (!IsValidSlideshowInterval(slideshow_interval_minutes_)) {
@@ -351,70 +556,143 @@ void Application::Initialize(bool display_stall_recovery_boot) {
     RuntimeGuardNoteProgress(RuntimeGuardPhase::Initializing);
     InitializeLocalClockFromRtc();
 
+    const esp_reset_reason_t reset_reason = esp_reset_reason();
     const uint32_t wakeup_causes = esp_sleep_get_wakeup_causes();
+    const bool deep_sleep_wake = reset_reason == ESP_RST_DEEPSLEEP;
     const bool timer_wakeup =
-        (wakeup_causes & (1UL << ESP_SLEEP_WAKEUP_TIMER)) != 0;
-    if (s_power_diagnostics.magic != kPowerDiagnosticsMagic) {
-        s_power_diagnostics = {};
+        deep_sleep_wake && (wakeup_causes & (1UL << ESP_SLEEP_WAKEUP_TIMER)) != 0;
+    uint64_t ext1_wakeup_mask = 0;
+    if ((wakeup_causes & (1UL << ESP_SLEEP_WAKEUP_EXT1)) != 0) {
+        ext1_wakeup_mask = esp_sleep_get_ext1_wakeup_status();
+    }
+    const uint64_t button_wakeup_mask =
+        ext1_wakeup_mask & ((1ULL << BOOT_BUTTON_GPIO) | (1ULL << TODO_DOWN_BUTTON_GPIO));
+    const bool charger_wakeup =
+        (wakeup_causes & (1UL << ESP_SLEEP_WAKEUP_EXT0)) != 0 ||
+        (ext1_wakeup_mask & (1ULL << CHARGE_DETECT_GPIO)) != 0;
+    const bool unexpected_reset =
+        display_stall_recovery_boot || IsUnexpectedReset(reset_reason);
+    const bool retained_valid = RetainedRecordValid(s_retained_schedule, kRetainedMagic);
+
+    if (user_restart_bounce) {
+        boot_kind_ = BootKind::UserRestart;
+    } else if (unexpected_reset) {
+        boot_kind_ = BootKind::Recovery;
+    } else if (timer_wakeup && retained_valid) {
+        boot_kind_ = BootKind::ScheduledWake;
+    } else if (deep_sleep_wake && !timer_wakeup && button_wakeup_mask != 0) {
+        boot_kind_ = BootKind::ButtonWake;
+    } else if (deep_sleep_wake && !timer_wakeup && charger_wakeup) {
+        boot_kind_ = BootKind::ChargerWake;
+    } else {
+        boot_kind_ = BootKind::ColdBoot;
+    }
+
+    if (!RetainedRecordValid(s_power_diagnostics, kPowerDiagnosticsMagic)) {
+        memset(&s_power_diagnostics, 0, sizeof(s_power_diagnostics));
         s_power_diagnostics.magic = kPowerDiagnosticsMagic;
+        s_power_diagnostics.size = sizeof(s_power_diagnostics);
         s_power_diagnostics.last_photo_index = -1;
     }
+    // The previous boots first: when the frame is found frozen, this is the
+    // record of how the last wakes ended, and a boot whose entry has no
+    // awake time never reached its sleep commit.
+    LogBootHistory(boot_kind_ == BootKind::ScheduledWake ? 3 : kBootHistoryLength);
     ++s_power_diagnostics.boot_count;
     if (timer_wakeup) {
         ++s_power_diagnostics.timer_wake_count;
     }
+    if (unexpected_reset) {
+        ++s_power_diagnostics.unexpected_reset_count;
+        ++s_power_diagnostics.consecutive_unexpected_resets;
+    } else if (!deep_sleep_wake) {
+        s_power_diagnostics.consecutive_unexpected_resets = 0;
+    }
     s_power_diagnostics.last_wakeup_causes = wakeup_causes;
+    BootRecord& record =
+        s_power_diagnostics.history[s_power_diagnostics.history_next % kBootHistoryLength];
+    record = {};
+    record.rtc_s = static_cast<uint32_t>(NowRtcUs() / 1000000);
+    record.wake_causes = static_cast<uint16_t>(wakeup_causes & 0xFFFF);
+    record.reset_reason = static_cast<uint8_t>(reset_reason);
+    record.boot_kind = static_cast<uint8_t>(boot_kind_);
+    record.battery = 0xFF;
+    s_power_diagnostics.history_next =
+        (s_power_diagnostics.history_next + 1) % kBootHistoryLength;
+    SealRetained(s_power_diagnostics);
     ESP_LOGI(kTag,
-             "Power lifecycle: boots=%u timer_wakes=%u sleep_commits=%u last_wake=0x%08lx last_photo=%ld",
+             "Power lifecycle: boots=%u timer_wakes=%u sleep_commits=%u "
+             "unexpected_resets=%u consecutive=%u reset=%s kind=%s last_photo=%ld",
              static_cast<unsigned>(s_power_diagnostics.boot_count),
              static_cast<unsigned>(s_power_diagnostics.timer_wake_count),
              static_cast<unsigned>(s_power_diagnostics.sleep_commit_count),
-             static_cast<unsigned long>(s_power_diagnostics.last_wakeup_causes),
+             static_cast<unsigned>(s_power_diagnostics.unexpected_reset_count),
+             static_cast<unsigned>(s_power_diagnostics.consecutive_unexpected_resets),
+             ResetReasonName(reset_reason), BootKindName(record.boot_kind),
              static_cast<long>(s_power_diagnostics.last_photo_index));
-    uint64_t button_wakeup_mask = 0;
-    if ((wakeup_causes & (1UL << ESP_SLEEP_WAKEUP_EXT1)) != 0) {
-        button_wakeup_mask = esp_sleep_get_ext1_wakeup_status();
-    }
-    const bool interactive_button_wake = !timer_wakeup &&
-        (button_wakeup_mask & ((1ULL << BOOT_BUTTON_GPIO) |
-                               (1ULL << TODO_DOWN_BUTTON_GPIO))) != 0;
-    ESP_LOGI(kTag, "Wake sources=0x%08lx ext1_gpio_mask=0x%llx",
+    ESP_LOGI(kTag, "Wake sources=0x%08lx ext1_gpio_mask=0x%llx retained=%d",
              static_cast<unsigned long>(wakeup_causes),
-             static_cast<unsigned long long>(button_wakeup_mask));
-    scheduler_timer_wake_ = timer_wakeup &&
-                            s_retained_schedule.magic == kRetainedMagic;
-    if (s_retained_schedule.magic != kRetainedMagic ||
-        s_retained_schedule.slideshow_config_minutes != slideshow_interval_minutes_ ||
-        s_retained_schedule.sync_config_minutes != network_sync_interval_minutes_) {
-        s_retained_schedule = {
-            .magic = kRetainedMagic,
-            .slideshow_config_minutes = slideshow_interval_minutes_,
-            .sync_config_minutes = network_sync_interval_minutes_,
-            .slideshow_due_rtc_us = 0,
-            .sync_due_rtc_us = 0,
-            .selected_photo_index = 0,
-            .gallery_fullscreen = 0,
-        };
+             static_cast<unsigned long long>(ext1_wakeup_mask),
+             retained_valid ? 1 : 0);
+
+    if (!retained_valid) {
+        memset(&s_retained_schedule, 0, sizeof(s_retained_schedule));
+        s_retained_schedule.magic = kRetainedMagic;
+        s_retained_schedule.size = sizeof(s_retained_schedule);
+        StoreRetainedDisplayMetadata(ui::PersistentDisplayMetadata{});
         ResetSlideshowDeadline();
         ResetNetworkSyncDeadline();
-        scheduler_timer_wake_ = false;
+    } else if (s_retained_schedule.slideshow_config_minutes != slideshow_interval_minutes_ ||
+               s_retained_schedule.sync_config_minutes != network_sync_interval_minutes_) {
+        // The stored intervals changed underneath the retained schedule (NVS
+        // reset, firmware defaults). Re-arm both, keep the photo position, and
+        // start this boot interactively rather than trust stale deadlines.
+        ResetSlideshowDeadline();
+        ResetNetworkSyncDeadline();
+        if (boot_kind_ == BootKind::ScheduledWake) {
+            boot_kind_ = BootKind::ColdBoot;
+        }
     }
+    scheduler_timer_wake_ = boot_kind_ == BootKind::ScheduledWake;
+    const bool interactive_button_wake = boot_kind_ == BootKind::ButtonWake;
     NormalizeScheduleDeadlines();
-    const bool restore_after_display_stall =
-        display_stall_recovery_boot &&
-        s_retained_schedule.display_metadata.contract.restorable &&
-        s_retained_schedule.display_metadata.contract.restore_kind ==
-            ui::PersistentRestoreKind::Gallery;
+
+    const ui::PersistentDisplayMetadata retained_metadata = RetainedDisplayMetadata();
+    const int retained_photo_index = s_retained_schedule.selected_photo_index;
+    const bool retained_fullscreen = s_retained_schedule.gallery_fullscreen != 0;
+    const bool retained_gallery_restorable =
+        retained_valid && retained_metadata.contract.restorable &&
+        retained_metadata.contract.restore_kind == ui::PersistentRestoreKind::Gallery;
+    const bool quiet_recovery =
+        boot_kind_ == BootKind::Recovery &&
+        s_power_diagnostics.consecutive_unexpected_resets >= kQuietRecoveryThreshold;
+    quiet_recovery_ = quiet_recovery;
+    // A recovery boot rebuilds the frame the glass was showing: the reset may
+    // have cut a waveform short, and falling back to the cold-boot memory-card
+    // page is what used to leave a menu-like screen up until the next
+    // slideshow wake. A charger insertion wakes the device too; it is not a
+    // reason to forget which photo was on display.
+    // The low-battery notice is not a restorable page, but the selection
+    // behind it is still valid: charging resumes the gallery it replaced.
+    const bool notice_on_glass =
+        retained_valid && s_retained_schedule.low_battery_notice_shown != 0;
+    const bool restore_retained_frame =
+        (boot_kind_ == BootKind::Recovery || boot_kind_ == BootKind::ChargerWake) &&
+        (retained_gallery_restorable || notice_on_glass);
+    const bool adopt_retained_display =
+        retained_valid && (scheduler_timer_wake_ || interactive_button_wake ||
+                           restore_retained_frame || quiet_recovery);
     // One line per boot describing the single schedule, the way
     // "Power lifecycle:" describes the single power record. Both deadlines are
     // absolute, so consecutive boots must show them counting down in real
     // time; a value that jumps back to a full period, or that does not move
     // across a cycle, is the desynchronization this replaced.
     ESP_LOGI(kTag,
-             "Schedule: rtc_now=%llds slideshow=%dmin/%ds sync=%dmin/%ds",
+             "Schedule: rtc_now=%llds slideshow=%dmin/%ds sync=%dmin/%ds photo=%d fullscreen=%d",
              static_cast<long long>(NowRtcUs() / 1000000),
              slideshow_interval_minutes_, SecondsUntilSlideshow(),
-             network_sync_interval_minutes_, SecondsUntilNetworkSync());
+             network_sync_interval_minutes_, SecondsUntilNetworkSync(),
+             retained_photo_index, retained_fullscreen ? 1 : 0);
     RuntimeGuardSetScheduledWake(scheduler_timer_wake_);
     if (scheduler_timer_wake_) {
         slideshow_due_ = IsSlideshowDue();
@@ -432,14 +710,12 @@ void Application::Initialize(bool display_stall_recovery_boot) {
             ResetNetworkSyncDeadline();
         }
         display_invalidation_due_ =
-            HasDateWakeDependency(s_retained_schedule.display_metadata.contract) &&
-            s_retained_schedule.display_metadata.snapshot.date_key !=
-                CurrentLocalDateKey();
+            HasDateWakeDependency(retained_metadata.contract) &&
+            retained_metadata.snapshot.date_key != CurrentLocalDateKey();
         ESP_LOGI(kTag,
                  "Timer wake reason: slideshow=%d network=%d display_invalidation=%d photo=%d",
                  slideshow_due_ ? 1 : 0, network_sync_pending_ ? 1 : 0,
-                 display_invalidation_due_ ? 1 : 0,
-                 s_retained_schedule.selected_photo_index);
+                 display_invalidation_due_ ? 1 : 0, retained_photo_index);
     }
     ESP_LOGI(kTag, "Network policy: wifi_enabled=%d sync_interval=%d scheduled_sync=%d",
              wifi_enabled_.load(std::memory_order_acquire) ? 1 : 0,
@@ -498,10 +774,25 @@ void Application::Initialize(bool display_stall_recovery_boot) {
         esp_timer_get_time() + 1000LL * 1000;
     display_freshness_probe_deadline_us_ =
         esp_timer_get_time() + 30LL * 1000 * 1000;
+    if (initial_battery_level >= 0 && initial_battery_level <= 100) {
+        CurrentBootRecord().battery = static_cast<uint8_t>(initial_battery_level);
+        SealRetained(s_power_diagnostics);
+    }
+    battery_level_at_boot_ = initial_battery_level;
+    UpdateBatteryProtection(initial_battery_level, external_power_present_);
+    if (battery_critical_ && scheduler_timer_wake_) {
+        // No slideshow waveform and no radio on a battery this low; the sleep
+        // path puts up the charge notice instead.
+        slideshow_due_ = false;
+        display_invalidation_due_ = false;
+        network_sync_pending_ = false;
+    }
     ESP_LOGI(kTag,
              "Initial battery sample: level=%d charging=%d external_power=%d",
              initial_battery_level, initial_charging ? 1 : 0,
              external_power_present_ ? 1 : 0);
+    const bool defer_initial_refresh = scheduler_timer_wake_ || interactive_button_wake ||
+                                       restore_retained_frame || quiet_recovery;
     rawdraw_ui_manager_->Init(lcd, [lcd](const rawdraw::Rect&, ui::RefreshIntent intent) {
         if (intent != ui::RefreshIntent::FullColor) {
             // Buttons, menus and cursor movement keep the low-latency path.
@@ -517,13 +808,9 @@ void Application::Initialize(bool display_stall_recovery_boot) {
             // Render them correctly once instead of FAST_BW plus a recovery.
             lcd->RequestUrgentFullRefresh();
         }
-    }, scheduler_timer_wake_ || interactive_button_wake ||
-           restore_after_display_stall);
-    if ((scheduler_timer_wake_ || interactive_button_wake ||
-         restore_after_display_stall) &&
-        s_retained_schedule.magic == kRetainedMagic) {
-        rawdraw_ui_manager_->AdoptRetainedPersistentMetadata(
-            s_retained_schedule.display_metadata);
+    }, defer_initial_refresh);
+    if (adopt_retained_display) {
+        rawdraw_ui_manager_->AdoptRetainedPersistentMetadata(retained_metadata);
     }
     // The UI manager performs the advance; the dwell clock lives here so the
     // awake path and the deep-sleep wake share one deadline.
@@ -531,28 +818,51 @@ void Application::Initialize(bool display_stall_recovery_boot) {
         [this]() { ResetSlideshowDeadline(); });
     rawdraw_ui_manager_->SetSlideshowIntervalChangedCallback(
         [this](int minutes) { RequestSlideshowIntervalChange(minutes); });
-    if (restore_after_display_stall) {
-        // The guard may have interrupted an SSD2683 waveform while the glass
-        // was black or otherwise transitional. Rebuild the last committed
-        // gallery frame in one pass: never expose Init()'s default memory-card
-        // framebuffer and never count recovery as another slideshow advance.
-        const bool restored = rawdraw_ui_manager_->PrepareRetainedGalleryFrame(
-            s_retained_schedule.selected_photo_index,
-            s_retained_schedule.gallery_fullscreen != 0);
+    if (quiet_recovery) {
+        // Whatever the last few boots did, it reset the device each time.
+        // Leave the glass and the radio alone, keep the retained photo
+        // position, and go straight back to the deep-sleep schedule.
+        if (restore_retained_frame) {
+            rawdraw_ui_manager_->RestoreRetainedGalleryState(
+                retained_photo_index, retained_fullscreen, false);
+        }
+        MarkBootRecord(kBootFlagQuietRecovery);
         ESP_LOGW(kTag,
-                 "Display-stall recovery restored retained gallery frame=%d photo=%d fullscreen=%d",
-                 restored ? 1 : 0, s_retained_schedule.selected_photo_index,
-                 s_retained_schedule.gallery_fullscreen != 0 ? 1 : 0);
+                 "Quiet recovery after %u consecutive unexpected resets: no refresh, no radio",
+                 static_cast<unsigned>(s_power_diagnostics.consecutive_unexpected_resets));
+    } else if (restore_retained_frame) {
+        // A recovery repaints the retained frame: the reset may have stopped
+        // the panel mid-waveform. A charger wake only repaints a page that
+        // shows the battery state; a fullscreen photo is already on glass.
+        const bool refresh =
+            boot_kind_ == BootKind::Recovery || !retained_fullscreen || notice_on_glass;
+        const bool restored = rawdraw_ui_manager_->RestoreRetainedGalleryState(
+            retained_photo_index, retained_fullscreen, refresh);
+        if (!restored) {
+            rawdraw_ui_manager_->PresentBootBaseline();
+        }
+        if (!restored || refresh) {
+            MarkBootRecord(kBootFlagFrameRefreshed);
+        }
+        ESP_LOGW(kTag,
+                 "%s restored retained gallery frame=%d photo=%d fullscreen=%d refresh=%d",
+                 BootKindName(static_cast<uint8_t>(boot_kind_)), restored ? 1 : 0,
+                 retained_photo_index, retained_fullscreen ? 1 : 0, refresh ? 1 : 0);
     } else if (scheduler_timer_wake_ && slideshow_due_) {
         slideshow_refresh_requested_ = rawdraw_ui_manager_->PrepareGallerySlideshowFrame(
-            s_retained_schedule.selected_photo_index, true);
+            retained_photo_index, true, retained_fullscreen);
+        if (slideshow_refresh_requested_) {
+            MarkBootRecord(kBootFlagFrameRefreshed);
+        }
         ESP_LOGI(kTag, "Scheduled slideshow frame requested=%d",
                  slideshow_refresh_requested_ ? 1 : 0);
     } else if (scheduler_timer_wake_ && display_invalidation_due_) {
         display_invalidation_refresh_requested_ =
             rawdraw_ui_manager_->PrepareRetainedDisplayInvalidation(
-                s_retained_schedule.selected_photo_index,
-                s_retained_schedule.gallery_fullscreen != 0);
+                retained_photo_index, retained_fullscreen);
+        if (display_invalidation_refresh_requested_) {
+            MarkBootRecord(kBootFlagFrameRefreshed);
+        }
         ESP_LOGI(kTag,
                  "Scheduled display invalidation caused refresh=%d",
                  display_invalidation_refresh_requested_ ? 1 : 0);
@@ -564,8 +874,8 @@ void Application::Initialize(bool display_stall_recovery_boot) {
                       : rawdraw::ButtonEvent::kBootClick};
         slideshow_refresh_requested_ =
             rawdraw_ui_manager_->PrepareGalleryInteractiveWakeFrame(
-                s_retained_schedule.selected_photo_index,
-                s_retained_schedule.gallery_fullscreen != 0, wake_event);
+                retained_photo_index, retained_fullscreen, wake_event);
+        MarkBootRecord(kBootFlagFrameRefreshed);
         ESP_LOGI(kTag,
                  "Interactive button wake replayed: gpio=%d requested=%d",
                  down_wake ? static_cast<int>(TODO_DOWN_BUTTON_GPIO)
@@ -582,7 +892,7 @@ void Application::Initialize(bool display_stall_recovery_boot) {
         std::vector<rawdraw::SettingsItemDef> items;
         items.push_back({"系统", "", nullptr, rawdraw::SettingsItemType::Section, false});
         items.push_back({"重启", "执行", nullptr, rawdraw::SettingsItemType::Action, false,
-                         []() { esp_restart(); }});
+                         [this]() { OnRestartItemActivated(); }});
         items.push_back({"相册", "", nullptr, rawdraw::SettingsItemType::Section, false});
         items.push_back({"轮播间隔", FormatMinutesLabel(slideshow_interval), nullptr,
                          rawdraw::SettingsItemType::Action, false,
@@ -603,7 +913,6 @@ void Application::Initialize(bool display_stall_recovery_boot) {
                                  NextNetworkSyncInterval(network_sync_interval_minutes_);
                              nvs.SetInt(kSyncIntervalKey, next);
                              network_sync_interval_minutes_ = next;
-                             s_retained_schedule.sync_config_minutes = next;
                              ResetNetworkSyncDeadline();
                              sr->UpdateItem(kSettingsNetworkSyncIndex,
                                             FormatNetworkSyncLabel(
@@ -707,13 +1016,21 @@ void Application::Initialize(bool display_stall_recovery_boot) {
 
     if (network_sync_pending_) {
         StartScheduledNetworkSync();
-    } else if (!scheduler_timer_wake_ &&
-               wifi_enabled_.load(std::memory_order_acquire)) {
+        MarkBootRecord(kBootFlagNetworkSession);
+    } else if (!scheduler_timer_wake_ && boot_kind_ != BootKind::Recovery &&
+               !battery_critical_ && wifi_enabled_.load(std::memory_order_acquire)) {
+        // A recovery boot stays radio-idle: if the radio was involved in the
+        // reset, starting it again on every boot is how a single fault turns
+        // into a reset loop. The periodic sync still runs on schedule. A
+        // critical battery gets no radio either.
         StartInteractiveWifiAttempt();
     }
 
     if (!scheduler_timer_wake_) {
-        interactive_sleep_deadline_us_ = esp_timer_get_time() + kInteractiveAwakeUs;
+        const int64_t now_us = esp_timer_get_time();
+        interactive_sleep_deadline_us_ =
+            quiet_recovery ? now_us : now_us + kInteractiveAwakeUs;
+        last_input_us_ = now_us;
         if (interactive_button_wake) {
             const gpio_num_t wake_gpio =
                 (button_wakeup_mask & (1ULL << TODO_DOWN_BUTTON_GPIO)) != 0
@@ -722,6 +1039,9 @@ void Application::Initialize(bool display_stall_recovery_boot) {
             // The wake action above is deterministic. Keep normal callbacks
             // gated until release so the same physical press is not delivered
             // a second time by the button component during startup.
+            // PostButtonAction() samples readiness when the event happens,
+            // so a release or long-press that the button component reports
+            // while this loop is still waiting is dropped, not queued.
             const int64_t release_deadline_us =
                 esp_timer_get_time() + 5LL * 1000 * 1000;
             while (gpio_get_level(wake_gpio) == 0 &&
@@ -733,12 +1053,98 @@ void Application::Initialize(bool display_stall_recovery_boot) {
                          "Wake key GPIO%d still held after 5 s; enabling input anyway",
                          static_cast<int>(wake_gpio));
             }
+            // iot_button reports SINGLE_CLICK only after the 180 ms
+            // multi-click window that follows the release. Keep input closed
+            // past it so that click is still dropped at the source.
+            vTaskDelay(pdMS_TO_TICKS(250));
         }
         input_ready_.store(true, std::memory_order_release);
+    } else {
+        scheduled_wake_accepts_input_.store(true, std::memory_order_release);
     }
 
     SetDeviceState(kDeviceStateIdle);
     RuntimeGuardNoteProgress(RuntimeGuardPhase::Running);
+}
+
+void Application::PostButtonAction(ButtonAction action) {
+    // Runs on the button task at the moment of the event, and that is where
+    // readiness has to be sampled. The press that wakes the device from deep
+    // sleep is replayed inside Initialize(); its release -- or a hold past the
+    // one-second long-press time -- reaches the button component while
+    // Initialize() is still waiting for that release. Checked later on the
+    // app task, the queued event already saw input_ready_ == true and acted a
+    // second time: a DOWN wake held for a second advanced the photo and then
+    // opened Settings. Only BOOT used to be gated here.
+    if (input_ready_.load(std::memory_order_acquire)) {
+        Schedule([this, action]() { DispatchButtonAction(action); });
+        return;
+    }
+    if (scheduled_wake_accepts_input_.load(std::memory_order_acquire)) {
+        Schedule([this, action]() { HandleInputDuringScheduledWake(action); });
+        return;
+    }
+    ESP_LOGI(kTag, "Button action %d ignored: input not ready",
+             static_cast<int>(action));
+}
+
+void Application::DispatchButtonAction(ButtonAction action) {
+    switch (action) {
+        case ButtonAction::UpClick: OnUpClick(); break;
+        case ButtonAction::DownClick: OnDownClick(); break;
+        case ButtonAction::BootClick: OnBootClick(); break;
+        case ButtonAction::UpLongPress: OnUpLongPress(); break;
+        case ButtonAction::DownLongPress: OnDownLongPress(); break;
+        case ButtonAction::BootLongPress: OnBootLongPress(); break;
+        case ButtonAction::WifiConfigCombo: OnWifiConfigComboLongPress(); break;
+    }
+}
+
+// A press during a timer wake used to be dropped: input stays closed for the
+// whole scheduled session (about 25 s for a slideshow refresh), the device
+// then went back to sleep, and the frame simply did not respond. Turn the
+// session interactive instead and act on the press.
+void Application::HandleInputDuringScheduledWake(ButtonAction action) {
+    if (!scheduler_timer_wake_ || sleep_phase_ != SleepPhase::Awake) {
+        ESP_LOGI(kTag, "Button action %d dropped: scheduled wake is already preparing sleep",
+                 static_cast<int>(action));
+        return;
+    }
+    PromoteScheduledWakeToInteractive("button press");
+    DispatchButtonAction(action);
+}
+
+void Application::PromoteScheduledWakeToInteractive(const char* reason) {
+    if (!scheduler_timer_wake_ || sleep_phase_ != SleepPhase::Awake) return;
+    ESP_LOGI(kTag, "Scheduled wake promoted to interactive: %s", reason ? reason : "unspecified");
+    scheduler_timer_wake_ = false;
+    scheduled_wake_accepts_input_.store(false, std::memory_order_release);
+    RuntimeGuardSetScheduledWake(false);
+    MarkBootRecord(kBootFlagPromoted);
+    if (rawdraw_ui_manager_ && !rawdraw_ui_manager_->DisplayedStateReconstructed()) {
+        // A wake that only ran the network job never rebuilt the frame on
+        // glass; the framebuffer still holds Init()'s default page. Rebuild
+        // the retained gallery state so the press acts on what is visible --
+        // and repaint it when the glass shows something else (a page that
+        // cannot be restored, or the low-battery notice).
+        const auto retained = RetainedDisplayMetadata();
+        const bool glass_shows_gallery =
+            retained.contract.restorable &&
+            retained.contract.restore_kind == ui::PersistentRestoreKind::Gallery &&
+            s_retained_schedule.low_battery_notice_shown == 0;
+        const bool restored = rawdraw_ui_manager_->RestoreRetainedGalleryState(
+            s_retained_schedule.selected_photo_index,
+            s_retained_schedule.gallery_fullscreen != 0, !glass_shows_gallery);
+        if (!restored) {
+            rawdraw_ui_manager_->PresentBootBaseline();
+        }
+    }
+    const int64_t now_us = esp_timer_get_time();
+    interactive_sleep_deadline_us_ = now_us + kInteractiveAwakeUs;
+    last_input_us_ = now_us;
+    external_power_probe_deadline_us_ = now_us;
+    display_freshness_probe_deadline_us_ = now_us + 30LL * 1000 * 1000;
+    input_ready_.store(true, std::memory_order_release);
 }
 
 void Application::OnUpClick() {
@@ -807,25 +1213,65 @@ void Application::OnBootLongPress() {
     InputScope scope(*this);
     ESP_LOGI(kTag, "BOOT long press");
     NoteButtonActivity();
-    if (WifiManager::GetInstance().IsConfigMode()) {
+    if (network_initialized_ && WifiManager::GetInstance().IsConfigMode()) {
         ESP_LOGI(kTag, "BOOT long press - exiting WiFi config AP");
         if (rawdraw_ui_manager_) {
             rawdraw_ui_manager_->SwitchPage(ui::RawDrawPageId::Gallery);
         }
+        // StopStation() alone used to be the "Wi-Fi off" branch here, but
+        // StartConfigAp() had already marked the station inactive, so it
+        // returned at once and left the hotspot, its web/DNS servers and a
+        // 10 s scan running. IsConfigMode() then stayed true and blocked idle
+        // sleep until the battery was empty.
+        StopConfigApIfRunning();
         if (wifi_enabled_.load(std::memory_order_acquire)) {
             StartInteractiveWifiAttempt();
-        } else {
-            WifiManager::GetInstance().StopStation();
         }
         return;
     }
     if (rawdraw_ui_manager_) {
+        if (rawdraw_ui_manager_->GetCurrentPage() == ui::RawDrawPageId::Gallery &&
+            !rawdraw_ui_manager_->IsApTransferRunning()) {
+            // BOOT long press on the gallery opens AP transfer, which drives
+            // the Wi-Fi driver directly. With the Wi-Fi switch off since boot
+            // that driver, esp-netif and the default event loop did not exist,
+            // and esp_netif_create_default_wifi_ap() aborted the device.
+            // Initialization alone leaves the radio off.
+            EnsureNetworkInitialized();
+            // An interactive station attempt still waiting to connect must not
+            // time out underneath the hotspot: its StopStation() would stop
+            // the driver the AP is running on.
+            wifi_connect_deadline_us_ = 0;
+        }
         rawdraw_ui_manager_->HandleInput(rawdraw::ButtonEvent{rawdraw::ButtonEvent::kBootLongPress});
     }
 }
 
+void Application::OnRestartItemActivated() {
+    const int64_t now_us = esp_timer_get_time();
+    auto* sr = rawdraw_ui_manager_ ? rawdraw_ui_manager_->GetSettingsRenderer() : nullptr;
+    // The settings cursor starts on this item, so a single BOOT press right
+    // after opening Settings used to restart the device. Ask for a second one.
+    if (restart_confirm_deadline_us_ == 0 || now_us > restart_confirm_deadline_us_) {
+        restart_confirm_deadline_us_ = now_us + kRestartConfirmWindowUs;
+        if (sr) sr->UpdateItem(kSettingsRestartIndex, "再按一次确认");
+        ESP_LOGI(kTag, "Restart armed; press BOOT again within %lld s",
+                 static_cast<long long>(kRestartConfirmWindowUs / 1000000));
+        return;
+    }
+    restart_confirm_deadline_us_ = 0;
+    if (sr) sr->UpdateItem(kSettingsRestartIndex, "重启中");
+    // Restart from the supervisor loop once the panel is idle, so the reset
+    // does not cut the waveform that is drawing this very confirmation.
+    restart_requested_ = true;
+    restart_requested_at_us_ = now_us;
+    ESP_LOGI(kTag, "Restart confirmed; waiting for the panel to settle");
+}
+
 void Application::NoteButtonActivity() {
-    interactive_sleep_deadline_us_ = esp_timer_get_time() + kInteractiveAwakeUs;
+    const int64_t now_us = esp_timer_get_time();
+    interactive_sleep_deadline_us_ = now_us + kInteractiveAwakeUs;
+    last_input_us_ = now_us;
     manual_sleep_requested_.store(false, std::memory_order_release);
     // Fold a fresh battery/network sample into the button handler's one
     // already-planned render. This is opportunistic and never queues another
@@ -842,6 +1288,13 @@ void Application::EnterWifiConfigMode() {
     if (rawdraw_ui_manager_ && rawdraw_ui_manager_->IsLanHttpServerRunning()) {
         rawdraw_ui_manager_->StopLanHttpServer();
     }
+    if (rawdraw_ui_manager_ && rawdraw_ui_manager_->IsApTransferRunning()) {
+        // Both modes create the default AP netif. Starting the config portal
+        // while AP transfer still owns it made esp_netif_new() refuse the
+        // duplicate key, and the assert behind it aborted the device.
+        ESP_LOGI(kTag, "Stopping AP transfer before entering Wi-Fi config");
+        rawdraw_ui_manager_->StopApTransferMode();
+    }
     wifi_connected_.store(false, std::memory_order_release);
     wifi_connect_deadline_us_ = 0;
     ESP_LOGI(kTag, "Entering WiFi config mode by long press");
@@ -856,6 +1309,13 @@ void Application::EnterWifiConfigMode() {
     UpdateStatusBarForUi();
 }
 
+void Application::StopConfigApIfRunning() {
+    if (network_initialized_ && WifiManager::GetInstance().IsConfigMode()) {
+        ESP_LOGI(kTag, "Stopping Wi-Fi config hotspot");
+        WifiManager::GetInstance().StopConfigAp();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Slideshow / network-sync schedule (single owner)
 // ---------------------------------------------------------------------------
@@ -867,12 +1327,13 @@ void Application::ResetSlideshowDeadline() {
         period > 0 ? static_cast<uint64_t>(NowRtcUs()) +
                          static_cast<uint64_t>(period) * 1000000ULL
                    : 0;
+    SealRetainedSchedule();
 }
 
 // Self-heals a retained schedule whose deadline cannot be true any more.
 // The RTC timebase and the retained schedule normally live and die together --
 // a power cycle clears both -- but they can come apart: an OTA that relocates
-// esp_clk's retain structure restarts the clock while RTC_DATA survives. A
+// esp_clk's retain structure restarts the clock while RTC_NOINIT survives. A
 // deadline further out than one whole period is the observable symptom, and
 // silently parking the slideshow for hours is the cost of ignoring it.
 void Application::NormalizeScheduleDeadlines() {
@@ -901,6 +1362,7 @@ void Application::NormalizeScheduleDeadlines() {
             ResetNetworkSyncDeadline();
         }
     }
+    SealRetainedSchedule();
 }
 
 void Application::ResetNetworkSyncDeadline() {
@@ -910,6 +1372,7 @@ void Application::ResetNetworkSyncDeadline() {
         period > 0 ? static_cast<uint64_t>(NowRtcUs()) +
                          static_cast<uint64_t>(period) * 1000000ULL
                    : 0;
+    SealRetainedSchedule();
 }
 
 int Application::SecondsUntilSlideshow() const {
@@ -949,10 +1412,18 @@ void Application::ApplySlideshowInterval(int minutes) {
 // drifted from the retained one.
 void Application::PumpSlideshowSchedule() {
     if (!IsSlideshowDue() || !rawdraw_ui_manager_) return;
-    // Re-arm first: a gallery state that cannot advance right now (settings
-    // page open, delete dialog up) must not re-evaluate as due every tick.
+    // Re-arm first: a gallery state that cannot advance right now (delete
+    // dialog up, a service page) must not re-evaluate as due every tick.
     ResetSlideshowDeadline();
-    if (rawdraw_ui_manager_->AdvanceGallerySlideshow()) {
+    // A deep-sleep wake always returns to the fullscreen slideshow; an awake
+    // session only did so if fullscreen was already showing, so on USB power
+    // the frame stayed on the memory-card page after every cold boot, or on
+    // Settings after a visit, for as long as it stayed plugged in. Take the
+    // page back too, but only once nobody has touched a key for a full
+    // interactive window.
+    const bool user_idle =
+        esp_timer_get_time() - last_input_us_ >= kInteractiveAwakeUs;
+    if (rawdraw_ui_manager_->AdvanceGallerySlideshow(user_idle)) {
         ESP_LOGI(kTag, "Awake slideshow advance");
     }
 }
@@ -974,6 +1445,9 @@ void Application::DisableWifiAndPersist(const char* reason) {
     if (rawdraw_ui_manager_ && rawdraw_ui_manager_->IsLanHttpServerRunning()) {
         rawdraw_ui_manager_->StopLanHttpServer();
     }
+    // "Wi-Fi off" has to include the config hotspot: StopStation() does not
+    // touch it, and a running hotspot keeps the device from sleeping.
+    StopConfigApIfRunning();
     if (network_initialized_) {
         WifiManager::GetInstance().StopStation();
     }
@@ -1037,6 +1511,20 @@ void Application::HandleNetworkEvent(NetworkEvent event, const std::string& data
     switch (event) {
         case NetworkEvent::Connected:
             ESP_LOGI(kTag, "WiFi connected: %s", data.c_str());
+            // Events are drained a tick after they were raised. A Connected
+            // queued in the same tick as a session timeout or teardown would
+            // otherwise mark the radio up and restart SNTP on an interface
+            // that no longer exists.
+            if (!network_initialized_ || !WifiManager::GetInstance().IsConnected()) {
+                ESP_LOGI(kTag, "Ignoring stale Wi-Fi connection event");
+                break;
+            }
+            // The Wi-Fi/IP handlers run on this task; an overflow there is a
+            // panic in the middle of a network session.
+            if (TaskHandle_t event_task = xTaskGetHandle("sys_evt")) {
+                ESP_LOGI(kTag, "sys_evt stack headroom after connect: %u bytes",
+                         static_cast<unsigned>(uxTaskGetStackHighWaterMark(event_task)));
+            }
             if (!wifi_enabled_.load(std::memory_order_acquire)) {
                 ESP_LOGW(kTag, "Ignoring late Wi-Fi connection because switch is OFF");
                 WifiManager::GetInstance().StopStation();
@@ -1160,10 +1648,56 @@ void Application::RequestManualSleep(bool disable_wifi) {
     EnterManualSleep();
 }
 
+// A photo frame should never go to sleep showing a menu. Leaving Settings
+// (or a stopped service page) open and walking away used to commit deep sleep
+// on that page; it then stayed on glass until the next slideshow wake, or for
+// good with the slideshow off -- the "menu frozen mid-refresh" frame.
+void Application::ReturnToSlideshowBeforeSleep() {
+    if (!rawdraw_ui_manager_) return;
+    const auto page = rawdraw_ui_manager_->GetCurrentPage();
+    if (page == ui::RawDrawPageId::Gallery) return;
+    if (rawdraw_ui_manager_->ReturnToGalleryForSleep()) {
+        ESP_LOGI(kTag, "[FULL_COLOR] returning from %s to the gallery before sleep",
+                 ui::RawDrawUiManager::GetPageTitle(page));
+    }
+}
+
+void Application::UpdateBatteryProtection(int level, bool external_power) {
+    uint8_t& strikes = s_retained_schedule.low_battery_strikes;
+    if (external_power || level > kBatteryResumePercent) {
+        strikes = 0;
+    } else if (level >= 0 && level <= kCriticalBatteryPercent) {
+        if (strikes < UINT8_MAX) ++strikes;
+    }
+    // Between the two thresholds the previous verdict stands (hysteresis).
+    battery_critical_ = strikes >= kCriticalBatteryStrikes;
+    SealRetainedSchedule();
+    if (battery_critical_ || strikes > 0) {
+        ESP_LOGW(kTag, "Battery protection: level=%d%% external_power=%d strikes=%u critical=%d",
+                 level, external_power ? 1 : 0, static_cast<unsigned>(strikes),
+                 battery_critical_ ? 1 : 0);
+    }
+}
+
+void Application::ShowLowBatteryNoticeBeforeSleep() {
+    if (!rawdraw_ui_manager_) return;
+    // Already the frame on glass, and nothing has been drawn over it in this
+    // wake: repainting it would only spend charge.
+    if (s_retained_schedule.low_battery_notice_shown != 0 &&
+        !rawdraw_ui_manager_->DisplayedStateReconstructed()) {
+        return;
+    }
+    if (rawdraw_ui_manager_->ShowLowBatteryNotice(battery_level_at_boot_)) {
+        s_retained_schedule.low_battery_notice_shown = 1;
+        SealRetainedSchedule();
+    }
+}
+
 void Application::EnterLowPowerSleep(const char* reason) {
     if (sleep_phase_ != SleepPhase::Awake) return;
     pending_sleep_reason_ = reason ? reason : "unspecified";
     input_ready_.store(false, std::memory_order_release);
+    scheduled_wake_accepts_input_.store(false, std::memory_order_release);
     RuntimeGuardNoteProgress(RuntimeGuardPhase::PreparingSleep);
     ESP_LOGI(kTag, "Sleep preparation beginning: %s", pending_sleep_reason_);
 
@@ -1189,6 +1723,15 @@ void Application::EnterLowPowerSleep(const char* reason) {
     network_sync_deadline_us_ = 0;
     wifi_connect_deadline_us_ = 0;
     UpdateStatusBarForUi(false, false);
+    // After the radio and the services are down, so the one frame drawn here
+    // already carries the final status bar.
+    if (quiet_recovery_) {
+        // Paint nothing: a waveform may be what keeps resetting the device.
+    } else if (battery_critical_) {
+        ShowLowBatteryNoticeBeforeSleep();
+    } else {
+        ReturnToSlideshowBeforeSleep();
+    }
 
     auto* sleep_lcd = static_cast<CustomLcdDisplay*>(Board::GetInstance().GetDisplay());
     // Lock-free snapshot. This runs while the render task may still be
@@ -1223,6 +1766,12 @@ void Application::EnterLowPowerSleep(const char* reason) {
                  "[FULL_COLOR] pre-sleep FAST_BW recovery debt detected; forcing final waveform");
         sleep_lcd->RequestUrgentFullRefresh();
         sleep_phase_ = SleepPhase::WaitingForDisplay;
+    } else if (sleep_lcd != nullptr && sleep_lcd->IsRefreshPending()) {
+        // Something above (returning to the gallery) already queued the final
+        // waveform. Committing now would cut the panel supply in the middle of
+        // it.
+        ESP_LOGI(kTag, "Pre-sleep refresh already queued; waiting for EPD idle");
+        sleep_phase_ = SleepPhase::WaitingForDisplay;
     } else {
         ESP_LOGI(kTag,
                  "Pre-sleep full-color refresh skipped: pixels unchanged and panel already stable");
@@ -1244,6 +1793,7 @@ void Application::CommitLowPowerSleep() {
     }
 
     s_retained_schedule.magic = kRetainedMagic;
+    s_retained_schedule.size = sizeof(s_retained_schedule);
     s_retained_schedule.slideshow_config_minutes = slideshow_interval_minutes_;
     s_retained_schedule.sync_config_minutes = network_sync_interval_minutes_;
     if (!scheduler_timer_wake_ || slideshow_refresh_requested_ ||
@@ -1254,8 +1804,11 @@ void Application::CommitLowPowerSleep() {
             rawdraw_ui_manager_ && rawdraw_ui_manager_->IsGalleryFullscreen() ? 1 : 0;
     }
     if (rawdraw_ui_manager_) {
-        s_retained_schedule.display_metadata =
-            rawdraw_ui_manager_->GetDisplayedPersistentMetadata();
+        StoreRetainedDisplayMetadata(
+            rawdraw_ui_manager_->GetDisplayedPersistentMetadata());
+    }
+    if (!battery_critical_) {
+        s_retained_schedule.low_battery_notice_shown = 0;
     }
     // A deadline that has already elapsed while awake is consumed here rather
     // than turned into a zero-second timer wake.
@@ -1269,12 +1822,15 @@ void Application::CommitLowPowerSleep() {
     } else if (SecondsUntilNetworkSync() == 0) {
         ResetNetworkSyncDeadline();
     }
+    // Last write before the commit. Every field above must be covered: a
+    // stale checksum makes the next wake discard the whole schedule.
+    SealRetainedSchedule();
 
     int display_invalidation_seconds = 0;
-    if (HasDateWakeDependency(s_retained_schedule.display_metadata.contract)) {
+    const ui::PersistentDisplayMetadata committed_metadata = RetainedDisplayMetadata();
+    if (HasDateWakeDependency(committed_metadata.contract)) {
         display_invalidation_seconds =
-            s_retained_schedule.display_metadata.snapshot.date_key !=
-                    CurrentLocalDateKey()
+            committed_metadata.snapshot.date_key != CurrentLocalDateKey()
                 ? 1
                 : SecondsUntilNextLocalMidnight();
     }
@@ -1293,9 +1849,16 @@ void Application::CommitLowPowerSleep() {
             next_wake_seconds = remaining;
         }
     };
-    consider_deadline(slideshow_remaining);
-    consider_deadline(sync_remaining);
-    consider_deadline(display_invalidation_seconds);
+    if (battery_critical_) {
+        // Only a charger or a key press wakes the device now; each timer wake
+        // would draw current for nothing and bring the brownout closer.
+        ESP_LOGW(kTag, "Battery critical (%d%%): timer wakes suspended until charged",
+                 battery_level_at_boot_);
+    } else {
+        consider_deadline(slideshow_remaining);
+        consider_deadline(sync_remaining);
+        consider_deadline(display_invalidation_seconds);
+    }
 
     esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
     if (next_wake_seconds > 0) {
@@ -1327,8 +1890,19 @@ void Application::CommitLowPowerSleep() {
     ESP_LOGI(kTag, "Final deep-sleep commit: %s",
              pending_sleep_reason_ ? pending_sleep_reason_ : "unspecified");
     ++s_power_diagnostics.sleep_commit_count;
+    // Only a boot that did its normal work proves the fault has cleared. A
+    // quiet recovery's commit must not restart the count, or a wake that
+    // crashes every time would be retried with a full waveform forever.
+    if (!quiet_recovery_) {
+        s_power_diagnostics.consecutive_unexpected_resets = 0;
+    }
     s_power_diagnostics.last_photo_index =
         s_retained_schedule.selected_photo_index;
+    BootRecord& record = CurrentBootRecord();
+    record.awake_s = static_cast<uint16_t>(
+        std::min<int64_t>(esp_timer_get_time() / 1000000, UINT16_MAX));
+    record.flags |= kBootFlagSleepCommitted;
+    SealRetained(s_power_diagnostics);
     ESP_LOGI(kTag,
              "Power lifecycle commit: boots=%u timer_wakes=%u sleep_commits=%u photo=%ld",
              static_cast<unsigned>(s_power_diagnostics.boot_count),
@@ -1369,7 +1943,9 @@ void Application::HandleSntpSynchronized() {
         // while the display waveform and Wi-Fi teardown finish.
         ZectrixPrepareForScheduledWake();
     }
-    if (scheduler_timer_wake_ && network_sync_pending_) {
+    if (network_sync_pending_) {
+        // Also after a press turned the scheduled wake interactive: the
+        // session it started still has to end with the radio off.
         CompleteScheduledNetworkJob(kScheduledNetworkJobTimeSync);
     } else if (!scheduler_timer_wake_ && sleep_phase_ == SleepPhase::Awake) {
         // Clock and status-bar text are monochrome. A successful sync must not
@@ -1413,6 +1989,24 @@ void Application::Run() {
         bool display_busy = lcd != nullptr && lcd->IsRefreshPending();
         const int64_t now_us = esp_timer_get_time();
 
+        if (restart_requested_ &&
+            (!display_busy || now_us - restart_requested_at_us_ >= kRestartDisplayWaitUs)) {
+            ESP_LOGI(kTag, "Restarting as requested from Settings");
+            MarkBootRecord(kBootFlagRestartRequested);
+            vTaskDelay(pdMS_TO_TICKS(50));
+            esp_restart();
+        }
+        if (restart_confirm_deadline_us_ != 0 && now_us > restart_confirm_deadline_us_) {
+            restart_confirm_deadline_us_ = 0;
+            auto* sr = rawdraw_ui_manager_ ? rawdraw_ui_manager_->GetSettingsRenderer() : nullptr;
+            if (sr && sr->UpdateItem(kSettingsRestartIndex, "执行") &&
+                sleep_phase_ == SleepPhase::Awake &&
+                rawdraw_ui_manager_->GetCurrentPage() == ui::RawDrawPageId::Settings) {
+                rawdraw_ui_manager_->RequestActivePageRefresh(
+                    ui::RefreshIntent::FastBwDeferredInteraction);
+            }
+        }
+
         if (!scheduler_timer_wake_ && sleep_phase_ == SleepPhase::Awake &&
             now_us >= display_freshness_probe_deadline_us_) {
             display_freshness_probe_deadline_us_ = now_us + 30LL * 1000 * 1000;
@@ -1440,7 +2034,15 @@ void Application::Run() {
             }
         }
         if (sleep_phase_ == SleepPhase::ReadyToCommit) {
-            CommitLowPowerSleep();
+            // Committing cuts the panel supply. Re-check here rather than
+            // trust the decision taken when preparation started: anything that
+            // queued a waveform since then has to finish first.
+            if (lcd != nullptr && lcd->IsRefreshPending()) {
+                ESP_LOGW(kTag, "Sleep commit deferred: a refresh started after preparation");
+                sleep_phase_ = SleepPhase::WaitingForDisplay;
+            } else {
+                CommitLowPowerSleep();
+            }
         }
 
         if (!scheduler_timer_wake_ &&
@@ -1462,7 +2064,10 @@ void Application::Run() {
             }
         }
 
-        if (scheduler_timer_wake_ && network_sync_pending_ &&
+        // Not gated on scheduler_timer_wake_: a press can turn a scheduled
+        // wake interactive while its network session is still running, and
+        // that session must still end on time.
+        if (network_sync_pending_ &&
             network_sync_deadline_us_ > 0 && now_us >= network_sync_deadline_us_) {
             ESP_LOGW(kTag, "Scheduled network session timed out; stopping until next interval");
             FinishScheduledNetworkSession("timeout");
@@ -1490,20 +2095,54 @@ void Application::Run() {
 
         if (scheduler_timer_wake_) {
             if (!display_busy && !network_sync_pending_) {
+                // A slideshow deadline that came due while this wake was busy
+                // with something else (a network session started a few
+                // seconds before it) is served now. The commit would otherwise
+                // consume the overdue deadline and the frame skipped a whole
+                // interval.
+                if (!slideshow_refresh_requested_ && !battery_critical_ &&
+                    rawdraw_ui_manager_ && IsSlideshowDue()) {
+                    ResetSlideshowDeadline();
+                    slideshow_refresh_requested_ =
+                        rawdraw_ui_manager_->PrepareGallerySlideshowFrame(
+                            s_retained_schedule.selected_photo_index, true,
+                            s_retained_schedule.gallery_fullscreen != 0);
+                    ESP_LOGI(kTag, "Slideshow came due during the wake; frame requested=%d",
+                             slideshow_refresh_requested_ ? 1 : 0);
+                    if (slideshow_refresh_requested_) {
+                        MarkBootRecord(kBootFlagFrameRefreshed);
+                        vTaskDelay(pdMS_TO_TICKS(250));
+                        continue;
+                    }
+                }
                 EnterScheduledSleep();
             }
         } else {
             const bool manual_sleep_requested =
                 manual_sleep_requested_.load(std::memory_order_acquire);
+            const bool config_ap_running =
+                network_initialized_ && WifiManager::GetInstance().IsConfigMode();
+            bool local_service_running =
+                IsLocalHttpServiceRunning(rawdraw_ui_manager_.get()) || config_ap_running;
+            if (local_service_running && !external_power_present_ &&
+                sleep_phase_ == SleepPhase::Awake && rawdraw_ui_manager_) {
+                const int64_t last_activity_us =
+                    std::max(last_input_us_, rawdraw_ui_manager_->GetHttpLastActivityUs());
+                const int64_t idle_us = now_us - last_activity_us;
+                if (idle_us >= kLocalServiceIdleTimeoutUs) {
+                    StopIdleLocalServices(idle_us);
+                    local_service_running =
+                        IsLocalHttpServiceRunning(rawdraw_ui_manager_.get()) ||
+                        (network_initialized_ && WifiManager::GetInstance().IsConfigMode());
+                }
+            }
             const bool idle_deadline_reached = interactive_sleep_deadline_us_ > 0 &&
                                                now_us >= interactive_sleep_deadline_us_;
-            const bool local_service_running =
-                IsLocalHttpServiceRunning(rawdraw_ui_manager_.get()) ||
-                (network_initialized_ && WifiManager::GetInstance().IsConfigMode());
             const bool idle_sleep_allowed =
                 ShouldEnterIdleSleep(idle_deadline_reached,
                                      external_power_present_) &&
                 !local_service_running;
+            display_busy = lcd != nullptr && lcd->IsRefreshPending();
             if ((manual_sleep_requested || idle_sleep_allowed) && !display_busy) {
                 EnterLowPowerSleep(manual_sleep_requested ? "manual request"
                                                           : "interactive idle timeout");
@@ -1511,6 +2150,33 @@ void Application::Run() {
         }
         vTaskDelay(pdMS_TO_TICKS(250));
     }
+}
+
+// Every local service blocks idle sleep, and none of them had a timeout: an
+// AP-transfer page opened by a one-second BOOT press, a LAN server switched on
+// in Settings, or a config hotspot from the UP+DOWN combo kept the radio and
+// CPU running until the battery was empty, with the slideshow stopped. On
+// battery, stop whatever has seen neither a key press nor an HTTP request for
+// kLocalServiceIdleTimeoutUs; the next tick's ordinary idle check then sleeps.
+void Application::StopIdleLocalServices(int64_t idle_us) {
+    ESP_LOGW(kTag, "Local services idle for %lld s on battery; stopping them",
+             static_cast<long long>(idle_us / 1000000));
+    MarkBootRecord(kBootFlagServicesTimedOut);
+    if (rawdraw_ui_manager_) {
+        if (rawdraw_ui_manager_->IsApTransferRunning() &&
+            rawdraw_ui_manager_->IsApTransferModeRunning()) {
+            rawdraw_ui_manager_->StopApTransferMode();
+        } else if (rawdraw_ui_manager_->IsLanHttpServerRunning()) {
+            rawdraw_ui_manager_->StopLanHttpServer();
+            if (auto* sr = rawdraw_ui_manager_->GetSettingsRenderer()) {
+                UpdateHttpServerSettingsItem(sr, false);
+            }
+        } else if (rawdraw_ui_manager_->IsHttpServerRunning()) {
+            // A server in neither mode (half-started) still blocks sleep.
+            rawdraw_ui_manager_->StopHttpServicesForSleep();
+        }
+    }
+    StopConfigApIfRunning();
 }
 
 bool Application::SetDeviceState(DeviceState state) {

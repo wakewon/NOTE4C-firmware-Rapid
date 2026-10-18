@@ -294,8 +294,11 @@ RawDrawUiManager::RawDrawUiManager()
                     break;
                 case rawdraw::ApTransferServer::kStopped:
                 default:
+                    // Whoever stopped the server either switches page next
+                    // (StopApTransferMode) or is preparing sleep. A refresh
+                    // queued here still saw the AP page as current and turned
+                    // the fast exit into a ~20 s full-colour waveform.
                     ap_transfer_renderer_->SetState(rawdraw::ApTransferRenderer::kWaitingForConnection, message);
-                    should_refresh = true;
                     break;
             }
             if (should_refresh && current_page_ == RawDrawPageId::APTransfer) {
@@ -437,6 +440,15 @@ void RawDrawUiManager::Init(CustomLcdDisplay* lcd, RefreshCallback refresh_cb,
              width_, height_, GetPageTitle(current_page_));
 }
 
+void RawDrawUiManager::PresentBootBaseline() {
+    if (!lcd_) return;
+    RenderActivePageToFramebuffer();
+    RecordCurrentFrameAsDisplayed();
+    ESP_LOGI(kTag, "[FULL_COLOR] request source=boot_baseline page=%s",
+             GetPageTitle(current_page_));
+    lcd_->RequestUrgentFullRefresh();
+}
+
 void RawDrawUiManager::MarkAllRenderersFullRefresh() {
     for (int i = 0; i < static_cast<int>(RawDrawPageId::Count); ++i) {
         auto* renderer = GetRendererForPage(static_cast<RawDrawPageId>(i));
@@ -471,6 +483,10 @@ void RawDrawUiManager::SwitchPage(RawDrawPageId page) {
 
     ESP_LOGI(kTag, "Switching page: %s -> %s",
              GetPageTitle(current_page_), GetPageTitle(page));
+
+    // The overlay belongs to the page it was opened over.
+    quick_switch_open_ = false;
+    quick_switch_backing_.clear();
 
     // Initialize the new page renderer
     InitRenderer(page);
@@ -527,6 +543,8 @@ void RawDrawUiManager::SetCurrentPageWithoutRender(RawDrawPageId page) {
     if (page == current_page_) {
         return;
     }
+    quick_switch_open_ = false;
+    quick_switch_backing_.clear();
     // Initialize the new page renderer
     InitRenderer(page);
     // Switch current page
@@ -767,24 +785,45 @@ bool RawDrawUiManager::PrepareRetainedDisplayInvalidation(
 bool RawDrawUiManager::PrepareRetainedGalleryFrame(
     int retained_index, bool retained_fullscreen) {
     if (!displayed_metadata_.contract.restorable ||
-        displayed_metadata_.contract.restore_kind != PersistentRestoreKind::Gallery ||
-        !photo_gallery_renderer_) {
+        displayed_metadata_.contract.restore_kind != PersistentRestoreKind::Gallery) {
         ESP_LOGW(kTag, "Retained gallery display cannot be reconstructed");
         displayed_metadata_.contract.restorable = false;
         displayed_metadata_.contract.wake_dependencies = 0;
         return false;
     }
+    return RestoreRetainedGalleryState(retained_index, retained_fullscreen, true);
+}
+
+// The caller decides whether the retained selection describes what should be
+// shown; this only rebuilds it.
+bool RawDrawUiManager::RestoreRetainedGalleryState(int retained_index,
+                                                   bool retained_fullscreen,
+                                                   bool refresh) {
+    if (!photo_gallery_renderer_) {
+        return false;
+    }
     current_page_ = RawDrawPageId::Gallery;
     photo_gallery_renderer_->SetSelectedIndex(retained_index);
     if (retained_fullscreen && !photo_gallery_renderer_->EnterFullscreenMode()) {
-        ESP_LOGW(kTag, "Could not restore retained fullscreen photo for invalidation");
+        ESP_LOGW(kTag, "Could not restore retained fullscreen photo");
         displayed_metadata_.contract.restorable = false;
         displayed_metadata_.contract.wake_dependencies = 0;
         return false;
     }
     current_state_matches_display_ = true;
-    status_bar_data_.page_title = GetPageTitle(current_page_);
-    RefreshActivePage(RefreshIntent::FullColor);
+    {
+        std::lock_guard<std::mutex> lock(ui_state_mutex_);
+        status_bar_data_.page_title = GetPageTitle(current_page_);
+    }
+    if (refresh) {
+        RefreshActivePage(RefreshIntent::FullColor);
+    } else {
+        // The glass already shows this frame (a charger wake, or a scheduled
+        // wake that turned interactive). Rebuild the framebuffer so the next
+        // input acts on what is visible, without spending a 20 s waveform on
+        // identical pixels.
+        RenderActivePageToFramebuffer();
+    }
     return true;
 }
 
@@ -793,7 +832,12 @@ bool RawDrawUiManager::IsDisplayRefreshPending() const {
 }
 
 void RawDrawUiManager::RefreshActivePage(RefreshIntent intent) {
-    RenderActivePageToFramebuffer();
+    if (!RenderActivePageToFramebuffer()) {
+        // The old framebuffer would be pushed and recorded as displayed. On a
+        // timer wake that is Init()'s default page, not the requested frame.
+        ESP_LOGW(kTag, "Refresh skipped: active page could not be rendered");
+        return;
+    }
 
     if (!TryDisplayCurrentPhotoRaw4Color()) {
         TriggerRefresh(intent);
@@ -1538,26 +1582,20 @@ void RawDrawUiManager::RefreshRect(const rawdraw::Rect& rect, RefreshIntent inte
 void RawDrawUiManager::TriggerRefresh(RefreshIntent intent) {
     if (!lcd_) return;
 
-    // Use the framebuffer's dirty tracking
-    // Mark the entire screen as dirty since we did a full clear + render
-    auto* mutex = lcd_->GetMutex();
-    if (mutex) xSemaphoreTake(mutex, portMAX_DELAY);
-
+    // No framebuffer lock here. Nothing below touches the pixels, and an
+    // unbounded wait on the render task's mutex is reachable from the sleep
+    // path, where a wedged render task must not also stall the main task.
     rawdraw::Rect full_rect = {0, 0, width_, height_};
-
-    // Align for EPD hardware
     full_rect = rawdraw::align_x8(full_rect);
 
     if (refresh_cb_) {
         RecordCurrentFrameAsDisplayed();
-        // Release mutex before calling callback (callback may re-acquire)
-        if (mutex) xSemaphoreGive(mutex);
-        mutex = nullptr;
-
+        if (intent == RefreshIntent::FullColor) {
+            ESP_LOGI(kTag, "[FULL_COLOR] request page=%s caller=%p",
+                     GetPageTitle(current_page_), __builtin_return_address(0));
+        }
         refresh_cb_(full_rect, intent);
     }
-
-    if (mutex) xSemaphoreGive(mutex);
 
     if (full_refresh_pending_) {
         full_refresh_pending_ = false;
@@ -1577,6 +1615,8 @@ void RawDrawUiManager::RequestActivePageRefresh(RefreshIntent intent) {
         return;
     }
     if (intent == RefreshIntent::FullColor) {
+        ESP_LOGI(kTag, "[FULL_COLOR] queued page=%s caller=%p",
+                 GetPageTitle(current_page_), __builtin_return_address(0));
         active_page_full_refresh_pending_.store(true, std::memory_order_release);
     } else {
         active_page_fast_refresh_intent_.store(static_cast<int>(intent),
@@ -1613,7 +1653,8 @@ void RawDrawUiManager::NotifySlideshowDwellReset() {
     }
 }
 
-bool RawDrawUiManager::PrepareGallerySlideshowFrame(int retained_index, bool advance) {
+bool RawDrawUiManager::PrepareGallerySlideshowFrame(int retained_index, bool advance,
+                                                    bool retained_fullscreen) {
     if (!photo_gallery_renderer_ || photo_gallery_renderer_->GetPhotoCount() <= 0) {
         return false;
     }
@@ -1623,10 +1664,18 @@ bool RawDrawUiManager::PrepareGallerySlideshowFrame(int retained_index, bool adv
     if (!photo_gallery_renderer_->EnterFullscreenMode()) {
         return false;
     }
-    if (advance) {
-        photo_gallery_renderer_->SelectNext(true);
+    const bool advanced = advance && photo_gallery_renderer_->SelectNext(true);
+    if (advance && !advanced && retained_fullscreen &&
+        photo_gallery_renderer_->GetSelectedIndex() == retained_index) {
+        // A one-photo album: the glass already shows exactly this frame, and
+        // repainting it every interval only spent a 20 s waveform per wake.
+        ESP_LOGI(kTag, "Slideshow has nothing to advance to; frame left as is");
+        return false;
     }
-    status_bar_data_.page_title = GetPageTitle(current_page_);
+    {
+        std::lock_guard<std::mutex> lock(ui_state_mutex_);
+        status_bar_data_.page_title = GetPageTitle(current_page_);
+    }
     RefreshActivePage(RefreshIntent::FullColor);
     return true;
 }
@@ -1650,7 +1699,10 @@ bool RawDrawUiManager::PrepareGalleryInteractiveWakeFrame(
     // result. This avoids first drawing the default gallery and then making
     // the wake key appear to merely repaint the same photo.
     const bool handled = photo_gallery_renderer_->HandleInput(wake_event);
-    status_bar_data_.page_title = GetPageTitle(current_page_);
+    {
+        std::lock_guard<std::mutex> lock(ui_state_mutex_);
+        status_bar_data_.page_title = GetPageTitle(current_page_);
+    }
     RefreshActivePage(RefreshIntent::FullColor);
     NotifySlideshowDwellReset();
     ESP_LOGI(kTag,
@@ -1681,20 +1733,126 @@ void RawDrawUiManager::QueueGalleryStorageSync(const char* preferred_photo_id) {
     gallery_storage_sync_pending_.store(true, std::memory_order_release);
 }
 
-bool RawDrawUiManager::AdvanceGallerySlideshow() {
-    if (current_page_ != RawDrawPageId::Gallery || !photo_gallery_renderer_) {
+bool RawDrawUiManager::AdvanceGallerySlideshow(bool return_to_slideshow) {
+    if (!photo_gallery_renderer_ || photo_gallery_renderer_->GetPhotoCount() <= 0) {
         return false;
     }
-    if (!photo_gallery_renderer_->IsFullscreenMode() ||
-        photo_gallery_renderer_->IsDeleteDialogOpen()) {
+    const bool on_fullscreen_gallery =
+        current_page_ == RawDrawPageId::Gallery &&
+        photo_gallery_renderer_->IsFullscreenMode();
+    if (!on_fullscreen_gallery) {
+        // A deep-sleep wake always lands in the fullscreen slideshow, but an
+        // awake session (USB power keeps the device awake) used to advance
+        // only if fullscreen was already showing. After a cold boot, which
+        // starts in memory-card mode, or after a visit to Settings, the
+        // frame then stayed on that page indefinitely. The caller decides
+        // that the user has been idle long enough to take the page back.
+        //
+        // Never take it from a page that owns a running mode: AP transfer
+        // and the Wi-Fi config page describe a live service, and a dialog or
+        // overlay is waiting for an answer.
+        if (!return_to_slideshow || current_page_ == RawDrawPageId::APTransfer ||
+            quick_switch_open_ || photo_gallery_renderer_->IsDeleteDialogOpen() ||
+            rawdraw::VoiceWakeupIsVisible(&voice_wakeup_state_)) {
+            return false;
+        }
+        if (current_page_ != RawDrawPageId::Gallery) {
+            SetCurrentPageWithoutRender(RawDrawPageId::Gallery);
+            if (page_switch_cb_) {
+                page_switch_cb_(RawDrawPageId::Gallery);
+            }
+        }
+        if (!photo_gallery_renderer_->EnterFullscreenMode()) {
+            return false;
+        }
+    }
+    if (photo_gallery_renderer_->IsDeleteDialogOpen()) {
         return false;
     }
-    if (!photo_gallery_renderer_->SelectNext(true)) {
+    if (!photo_gallery_renderer_->SelectNext(true) && on_fullscreen_gallery) {
         return false;
     }
-    ESP_LOGI(kTag, "Gallery fullscreen slideshow advanced");
+    ESP_LOGI(kTag, "Gallery fullscreen slideshow advanced: photo=%d returned=%d",
+             photo_gallery_renderer_->GetSelectedIndex(),
+             on_fullscreen_gallery ? 0 : 1);
     RefreshActivePage(RefreshIntent::FullColor);
     return true;
+}
+
+bool RawDrawUiManager::ReturnToGalleryForSleep() {
+    if (!photo_gallery_renderer_ || current_page_ == RawDrawPageId::Gallery) {
+        return false;
+    }
+    if (current_page_ == RawDrawPageId::APTransfer && IsHttpServerRunning()) {
+        return false;
+    }
+    SetCurrentPageWithoutRender(RawDrawPageId::Gallery);
+    if (page_switch_cb_) {
+        page_switch_cb_(RawDrawPageId::Gallery);
+    }
+    RefreshActivePage(RefreshIntent::FullColor);
+    return true;
+}
+
+bool RawDrawUiManager::ShowLowBatteryNotice(int battery_level) {
+    auto* fb = lcd_ ? lcd_->GetFramebuffer() : nullptr;
+    if (!fb || !refresh_cb_) return false;
+    if (!lcd_->LockFramebuffer(kFramebufferLockTimeoutMs)) {
+        ESP_LOGW(kTag, "Framebuffer busy; low-battery notice not drawn");
+        return false;
+    }
+    const auto& theme = rawdraw::ThemeManager::Get();
+    const rawdraw::Color ink = theme.ColorFor(rawdraw::ThemeToken::TextPrimary);
+    const rawdraw::Color secondary = theme.ColorFor(rawdraw::ThemeToken::TextSecondary);
+    const rawdraw::Color danger = theme.Style(rawdraw::ThemeToken::Danger).border;
+    rawdraw::Clear(fb, width_, height_);
+
+    // A battery outline with an almost empty red cell, then two lines of text.
+    const int body_w = 120;
+    const int body_h = 56;
+    const int body_x = (width_ - body_w) / 2 - 4;
+    const int body_y = 62;
+    rawdraw::DrawRectBorder(fb, width_, {body_x, body_y, body_w, body_h}, 3, ink);
+    rawdraw::DrawRect(fb, width_, {body_x + body_w, body_y + 16, 8, body_h - 32}, ink);
+    rawdraw::DrawRect(fb, width_, {body_x + 7, body_y + 7, 14, body_h - 14}, danger);
+
+    const lv_font_t* title_font = &SourceHanSansSC_Medium_slim;
+    const lv_font_t* body_font = &SourceHanSansSC_Regular_slim;
+    char title[32];
+    if (battery_level >= 0) {
+        snprintf(title, sizeof(title), "电量不足 %d%%", battery_level);
+    } else {
+        snprintf(title, sizeof(title), "电量不足");
+    }
+    const char* line1 = "请连接充电器";
+    const char* line2 = "充电后自动恢复相册轮播";
+    const int title_w = rawdraw::MeasureTextWidth(title, title_font);
+    rawdraw::DrawText(fb, width_, (width_ - title_w) / 2,
+                      rawdraw::InkCenteredTextTopYInBox(title_font, title, 146, 28, 0),
+                      title, title_font, danger, height_);
+    const int line1_w = rawdraw::MeasureTextWidth(line1, body_font);
+    rawdraw::DrawText(fb, width_, (width_ - line1_w) / 2,
+                      rawdraw::InkCenteredTextTopYInBox(body_font, line1, 186, 24, 0),
+                      line1, body_font, ink, height_);
+    const int line2_w = rawdraw::MeasureTextWidth(line2, body_font);
+    rawdraw::DrawText(fb, width_, (width_ - line2_w) / 2,
+                      rawdraw::InkCenteredTextTopYInBox(body_font, line2, 214, 24, 0),
+                      line2, body_font, secondary, height_);
+    lcd_->UnlockFramebuffer();
+
+    // The glass no longer shows the page state, and nothing on it depends on
+    // the date: no midnight wake, and no restore on the next wake.
+    displayed_metadata_.contract = PersistentDisplayContract{};
+    displayed_metadata_.snapshot = CapturePersistentSnapshot();
+    current_state_matches_display_ = false;
+    ESP_LOGW(kTag, "[FULL_COLOR] low-battery notice level=%d", battery_level);
+    rawdraw::Rect full_rect = {0, 0, width_, height_};
+    refresh_cb_(rawdraw::align_x8(full_rect), RefreshIntent::FullColor);
+    return true;
+}
+
+int64_t RawDrawUiManager::GetHttpLastActivityUs() const {
+    return ap_transfer_server_ ? ap_transfer_server_->LastActivityUs() : 0;
 }
 
 // ============================================================
@@ -1808,6 +1966,9 @@ void RawDrawUiManager::PumpClockRefresh() {
                 if (page_switch_cb_) {
                     page_switch_cb_(RawDrawPageId::Gallery);
                 }
+                // Even if the photo below turns out to be unreadable, the
+                // page changed and the glass must follow it.
+                gallery_page_changed = true;
             }
             if (photo_gallery_renderer_->SetSelectedById(show_id.c_str()) &&
                 photo_gallery_renderer_->EnterFullscreenMode()) {
