@@ -1082,7 +1082,10 @@ bool SettingsRenderer::UpdateItem(int index, const std::string& value) {
         const bool changed = items_[index].value != value;
         items_[index].value = value;
         needs_full_refresh_ = true;
-        return changed;
+        // RenderItem() draws the ON/OFF switch for a checkbox row, never its
+        // value text. Reporting such a change as dirty ordered a FAST_BW
+        // refresh plus its 30 s colour recovery for pixels that did not move.
+        return changed && items_[index].type != SettingsItemType::Checkbox;
     }
     return false;
 }

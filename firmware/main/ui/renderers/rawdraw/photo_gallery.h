@@ -88,6 +88,7 @@ private:
     void ClampSelection();
 
     // State
+    bool initialized_ = false;
     DisplayMode mode_ = kMemoryCardMode;
     int selected_index_ = 0;
     bool showing_delete_dialog_ = false;

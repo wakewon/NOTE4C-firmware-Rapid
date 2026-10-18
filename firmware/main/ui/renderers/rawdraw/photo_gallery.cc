@@ -158,10 +158,18 @@ void PhotoGalleryRenderer::Init(int width, int height) {
     width_ = width;
     height_ = height;
     needs_full_refresh_ = true;
-    mode_ = kMemoryCardMode;
-    selected_index_ = 0;
     showing_delete_dialog_ = false;
     delete_dialog_selected_ = 1;
+    // RawDrawUiManager re-runs Init() on every switch to this page. Only the
+    // first one may pick the default view: resetting here sent every return
+    // from Settings or AP transfer back to photo 1 in memory-card mode, and
+    // the next deep-sleep commit then retained index 0, restarting the whole
+    // slideshow from the beginning.
+    if (!initialized_) {
+        mode_ = kMemoryCardMode;
+        selected_index_ = 0;
+        initialized_ = true;
+    }
     RefreshPhotoList();
 }
 
