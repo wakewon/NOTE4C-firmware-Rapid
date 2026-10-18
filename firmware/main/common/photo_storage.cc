@@ -9,6 +9,7 @@
 #include "photo_storage.h"
 
 #include <esp_log.h>
+#include <esp_partition.h>
 #include <esp_spiffs.h>
 #include <cJSON.h>
 #include <nvs.h>
@@ -22,6 +23,7 @@
 #include <time.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <algorithm>
 #include <mutex>
 
 static const char* kTag = "PhotoStorage";
@@ -32,6 +34,9 @@ static const char* kPartitionLabel = "assets";
 // SPIFFS is flat (no real directories). Keep photo files directly under mount path.
 static const char* kPhotoDir = "/spiffs";
 static const char* kIndexFile = "/spiffs/photos.idx";
+// save_index() writes here first and renames over kIndexFile, so a reset in
+// the middle of a write can never leave a truncated live index behind.
+static const char* kIndexTmpFile = "/spiffs/photos.idx.tmp";
 
 // Index file format:
 // Bytes 0-3: magic "PHOT"
@@ -117,13 +122,6 @@ static bool photo_file_available(const PhotoInfo& info) {
     struct stat st = {};
     return stat(info.path, &st) == 0 &&
            static_cast<uint64_t>(st.st_size) == static_cast<uint64_t>(info.file_size);
-}
-
-static void remove_meta_for_id(const char* id) {
-    if (!id || id[0] == '\0') return;
-    char meta_path[PHOTO_MAX_PATH];
-    snprintf(meta_path, sizeof(meta_path), "%s/%s.meta", kPhotoDir, id);
-    remove(meta_path);
 }
 
 static bool load_meta_file(const char* meta_path, PhotoInfo* out_info) {
@@ -228,8 +226,10 @@ static int rebuild_index_from_meta_files(void) {
             snprintf(info.path, sizeof(info.path), "%s/%s.bin", kPhotoDir, info.id);
         }
         if (!photo_file_available(info)) {
-            ESP_LOGW(kTag, "Dropping stale photo metadata without image: %s", info.id);
-            remove(meta_path);
+            // Skip, but keep the file: this runs during boot, and a stat that
+            // fails for any transient reason must not destroy the only other
+            // record of a photo.
+            ESP_LOGW(kTag, "Skipping photo metadata without a readable image: %s", info.id);
             continue;
         }
         s_photos[s_photo_count++] = info;
@@ -257,28 +257,47 @@ static bool ensure_photo_dir(void) {
     return true;
 }
 
-// Write index file
+// Write index file.
+//
+// The index used to be rewritten in place ("wb" truncates first). A reset in
+// that window -- a brownout during a Wi-Fi burst, a stall-guard restart, the
+// settings restart -- left a short or empty index, load_index() then dropped
+// every photo past the cut, and the next save made the loss permanent: every
+// later slideshow wake found nothing to show and the frame never changed
+// again. Write a complete copy first and swap it in; SPIFFS rename() refuses
+// an existing target, hence the remove() in between, which load_index()
+// recovers from.
 static int save_index(void) {
-    FILE *f = fopen(kIndexFile, "wb");
+    FILE *f = fopen(kIndexTmpFile, "wb");
     if (!f) {
         ESP_LOGE(kTag, "Failed to open index for writing");
         return -1;
     }
 
-    // Write header
     uint32_t magic = INDEX_MAGIC;
     uint16_t version = INDEX_VERSION;
     uint16_t count = (uint16_t)s_photo_count;
-    fwrite(&magic, sizeof(magic), 1, f);
-    fwrite(&version, sizeof(version), 1, f);
-    fwrite(&count, sizeof(count), 1, f);
-
-    // Write records
-    if (s_photo_count > 0) {
-        fwrite(s_photos, sizeof(PhotoInfo), s_photo_count, f);
+    bool ok = fwrite(&magic, sizeof(magic), 1, f) == 1 &&
+              fwrite(&version, sizeof(version), 1, f) == 1 &&
+              fwrite(&count, sizeof(count), 1, f) == 1;
+    if (ok && s_photo_count > 0) {
+        ok = fwrite(s_photos, sizeof(PhotoInfo), s_photo_count, f) ==
+             static_cast<size_t>(s_photo_count);
+    }
+    if (fclose(f) != 0) {
+        ok = false;
+    }
+    if (!ok) {
+        ESP_LOGE(kTag, "Failed to write photo index; previous index kept");
+        remove(kIndexTmpFile);
+        return -1;
     }
 
-    fclose(f);
+    remove(kIndexFile);
+    if (rename(kIndexTmpFile, kIndexFile) != 0) {
+        ESP_LOGE(kTag, "Failed to install new photo index");
+        return -1;
+    }
     return 0;
 }
 
@@ -320,13 +339,27 @@ static int write_meta_file(const PhotoInfo* info) {
     return json_str ? 0 : -1;
 }
 
-// Read index file
+// Read index file.
+//
+// This runs on every boot, scheduled wakes included, so it must not write.
+// Problems are resolved in memory; the .meta file kept next to every photo
+// is the authority whenever the index itself cannot be trusted.
 static int load_index(void) {
     FILE *f = fopen(kIndexFile, "rb");
     if (!f) {
-        // No index yet, start fresh
-        s_photo_count = 0;
-        return 0;
+        // Either a fresh partition, or save_index() was interrupted between
+        // removing the old index and renaming the complete new one.
+        if (rename(kIndexTmpFile, kIndexFile) == 0) {
+            ESP_LOGW(kTag, "Recovered photo index from an interrupted update");
+            f = fopen(kIndexFile, "rb");
+        }
+        if (!f) {
+            s_photo_count = 0;
+            return rebuild_index_from_meta_files();
+        }
+    } else {
+        // A leftover copy from a write that never completed.
+        remove(kIndexTmpFile);
     }
 
     uint32_t magic = 0;
@@ -337,9 +370,9 @@ static int load_index(void) {
         fread(&version, sizeof(version), 1, f) != 1 ||
         fread(&count, sizeof(count), 1, f) != 1) {
         fclose(f);
-        ESP_LOGE(kTag, "Failed to read index header");
+        ESP_LOGE(kTag, "Failed to read index header; rebuilding from meta files");
         s_photo_count = 0;
-        return -1;
+        return rebuild_index_from_meta_files();
     }
 
     if (magic != INDEX_MAGIC || version != INDEX_VERSION) {
@@ -354,12 +387,17 @@ static int load_index(void) {
     }
 
     s_photo_count = 0;
-    bool index_changed = false;
     for (int i = 0; i < count; i++) {
         PhotoInfo info = {};
         if (fread(&info, sizeof(PhotoInfo), 1, f) != 1) {
-            index_changed = true;
-            continue;
+            // A short index lost every record past the cut. Dropping them and
+            // saving the remainder -- the previous behaviour -- made that loss
+            // permanent; the .meta files still describe every photo.
+            fclose(f);
+            ESP_LOGE(kTag, "Photo index truncated at record %d/%d; rebuilding from meta files",
+                     i, count);
+            s_photo_count = 0;
+            return rebuild_index_from_meta_files();
         }
         // The index lives in writable flash and can be truncated/corrupted by
         // an interrupted update. Never pass unterminated persisted fields to
@@ -367,10 +405,11 @@ static int load_index(void) {
         terminate_photo_info_strings(&info);
         if (info.id[0] == '\0' || info.path[0] == '\0' ||
             !photo_file_available(info)) {
-            ESP_LOGW(kTag, "Pruning unavailable photo from index: %s",
+            // Skip it for this boot only. Deleting its metadata and rewriting
+            // the index from here turned any transient read failure during a
+            // wake into a photo that was gone for good.
+            ESP_LOGW(kTag, "Skipping unavailable photo in index: %s",
                      info.id[0] ? info.id : "<invalid>");
-            remove_meta_for_id(info.id);
-            index_changed = true;
             continue;
         }
         apply_default_metadata(&info);
@@ -378,11 +417,28 @@ static int load_index(void) {
     }
 
     fclose(f);
-    if (index_changed) {
-        save_index();
-    }
     ESP_LOGI(kTag, "Loaded %d photos from index", s_photo_count);
     return 0;
+}
+
+// True when the photo partition has never been written (all 0xFF). Reads
+// until the first programmed byte, so a partition with data answers quickly.
+static bool partition_is_blank(void) {
+    const esp_partition_t* partition = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, kPartitionLabel);
+    if (!partition) return false;
+    uint32_t chunk[256];
+    for (size_t offset = 0; offset < partition->size; offset += sizeof(chunk)) {
+        const size_t length =
+            std::min<size_t>(sizeof(chunk), partition->size - offset);
+        if (esp_partition_read(partition, offset, chunk, length) != ESP_OK) {
+            return false;
+        }
+        for (size_t i = 0; i < length / sizeof(chunk[0]); ++i) {
+            if (chunk[i] != 0xFFFFFFFFu) return false;
+        }
+    }
+    return true;
 }
 
 int photo_storage_init(void) {
@@ -392,17 +448,27 @@ int photo_storage_init(void) {
         return 0;
     }
 
-    // Mount SPIFFS
+    // Mount SPIFFS. Never format automatically when the partition holds
+    // data: format_if_mount_failed turned any failed mount -- a read error at
+    // low battery voltage, say -- into the silent loss of every photo, after
+    // which no slideshow wake had anything left to show. Only a blank
+    // partition (first use) is formatted.
     esp_vfs_spiffs_conf_t conf = {
         .base_path = kBasePath,
         .partition_label = kPartitionLabel,
         .max_files = 10,
-        .format_if_mount_failed = true,
+        .format_if_mount_failed = false,
     };
 
     esp_err_t ret = esp_vfs_spiffs_register(&conf);
+    if (ret == ESP_FAIL && partition_is_blank()) {
+        ESP_LOGW(kTag, "Photo partition is blank; formatting it for first use");
+        conf.format_if_mount_failed = true;
+        ret = esp_vfs_spiffs_register(&conf);
+    }
     if (ret != ESP_OK) {
-        ESP_LOGE(kTag, "Failed to mount SPIFFS: %s", esp_err_to_name(ret));
+        ESP_LOGE(kTag, "Failed to mount SPIFFS: %s (photos left untouched)",
+                 esp_err_to_name(ret));
         return -1;
     }
 
