@@ -469,21 +469,37 @@ void SettingsRenderer::Render(uint8_t* fb, int width, int height) {
             {"序列号", serial},
             {"官方网站", "blog.lazyyoun.xyz"},
         };
-        bool first = true;
+        // The section's one selectable item (固件) is shown as the cursor on
+        // its info row; without it the page had no visible focus at all, and
+        // the next DOWN seemed to jump straight from 网络 back to 系统.
+        const bool firmware_selected = selected_index_ >= 0 &&
+                                       selected_index_ < static_cast<int>(items_.size()) &&
+                                       items_[selected_index_].label == "固件";
+        bool previous_selected = true;
         for (const auto& row : rows) {
             if (y + kInfoRowH > list_bottom) break;
-            if (!first) {
+            const bool selected = firmware_selected && std::string(row.label) == "固件版本";
+            if (!previous_selected && !selected) {
                 DrawDottedHLine(fb, width, y, kPageMarginX + 4, width - kPageMarginX - 4, ink);
             }
-            first = false;
+            previous_selected = selected;
+            const Color fg = ink;
+            if (selected) {
+                DrawRoundRectBorder(fb, width, height, {kPageMarginX, y + 1,
+                                    width - kPageMarginX * 2, kInfoRowH - 2}, kRowRadius, 2, ink);
+                DrawRect(fb, width, {kPageMarginX + 6, y + kInfoRowH / 2 - 6, 3, 12},
+                         selected_style.border);
+            }
+            const int text_x = kPageMarginX + (selected ? 16 : 4);
+            const int value_right = width - kPageMarginX - (selected ? 14 : 4);
             const int center_y = y + kInfoRowH / 2;
-            DrawText(fb, width, kPageMarginX + 4,
-                     InkCenteredTextTopY(font_, row.label, center_y, 0), row.label, font_, ink);
+            DrawText(fb, width, text_x,
+                     InkCenteredTextTopY(font_, row.label, center_y, 0), row.label, font_, fg);
             const std::string value = FitTextToWidth(row.value, value_font_, width / 2);
             const int value_w = MeasureTextWidth(value.c_str(), value_font_);
-            DrawText(fb, width, width - kPageMarginX - 4 - value_w,
+            DrawText(fb, width, value_right - value_w,
                      InkCenteredTextTopY(value_font_, value.c_str(), center_y, 0),
-                     value.c_str(), value_font_, ink);
+                     value.c_str(), value_font_, fg);
             y += kInfoRowH;
         }
     } else {
@@ -584,18 +600,20 @@ void SettingsRenderer::RenderItem(uint8_t* fb, int width, int y,
     const PaintStyle selected_style = theme.Component(ComponentRole::SettingsSelected);
     const Color paper = PaperColor();
     const Color accent = TokenInkOnPaper(ThemeToken::Accent);
-    // The cursor is the page's one solid element: an ink pill with paper-
-    // coloured content and a short accent stripe. The fast refresh shows the
-    // stripe black on black, which loses nothing.
-    const Color row_bg = selected ? selected_style.bg : paper;
-    const Color fg = selected ? selected_style.fg : theme.Style(ThemeToken::TextPrimary).fg;
+    // The cursor is an ink outline with a short accent stripe; the row keeps
+    // its paper background. A solid ink pill was tried first: every cursor
+    // move then turned a whole row from black back to yellow, and the fast
+    // waveform's paler yellow left a clearly visible block behind. An outline
+    // only toggles a few hundred pixels per move.
+    const Color row_bg = paper;
+    const Color fg = theme.Style(ThemeToken::TextPrimary).fg;
     const int left = content_left;
     const int right = width - content_left;
     const int center_y = y + row_h / 2;
 
     if (selected) {
-        DrawRoundRect(fb, width, height_, {left, y + 2, right - left, row_h - 4}, kRowRadius,
-                      row_bg, row_bg, 1);
+        DrawRoundRectBorder(fb, width, height_, {left, y + 2, right - left, row_h - 4},
+                            kRowRadius, 2, fg);
         DrawRect(fb, width, {left + 6, center_y - 8, 3, 16}, selected_style.border);
     }
 
@@ -610,7 +628,7 @@ void SettingsRenderer::RenderItem(uint8_t* fb, int width, int y,
         value_right = toggle_x - 10;
     } else if (item.type == SettingsItemType::Action && !IsDangerAction(item.label)) {
         // Something BOOT changes: a chevron after the current value.
-        DrawChevronMark(fb, width, value_right - 5, center_y, selected ? fg : accent);
+        DrawChevronMark(fb, width, value_right - 5, center_y, accent);
         value_right -= 14;
     }
 
@@ -625,11 +643,10 @@ void SettingsRenderer::RenderItem(uint8_t* fb, int width, int y,
             // Destructive actions read as a button: an accent chip.
             const int chip_h = 24;
             const Rect chip{value_right - value_w - 20, center_y - chip_h / 2, value_w + 20, chip_h};
-            DrawRoundRect(fb, width, height_, chip, chip_h / 2, accent,
-                          selected ? fg : accent, 1);
+            DrawRoundRect(fb, width, height_, chip, chip_h / 2, accent, accent, 1);
             DrawText(fb, width, chip.x + 10,
                      InkCenteredTextTopY(value_font_, value.c_str(), center_y, 0),
-                     value.c_str(), value_font_, selected ? fg : paper);
+                     value.c_str(), value_font_, paper);
         } else {
             DrawText(fb, width, value_right - value_w,
                      InkCenteredTextTopY(value_font_, value.c_str(), center_y, 0),
@@ -890,23 +907,20 @@ bool SettingsRenderer::HandleInput(const ButtonEvent& event) {
 
 
     switch (event.type) {
-        case ButtonEvent::kUpClick:
-            if (selected_index_ > 0) {
-                selected_index_ = FindPrevSelectable(selected_index_);
-            } else {
-                selected_index_ = GetLastSelectableIndex();
-            }
+        // Wrap when there is no selectable item further on. Testing the raw
+        // index instead never wrapped UP: index 0 is always a section header,
+        // so the first option (index 1) found nothing above it and stayed put.
+        case ButtonEvent::kUpClick: {
+            const int prev = FindPrevSelectable(selected_index_);
+            selected_index_ = prev != selected_index_ ? prev : GetLastSelectableIndex();
             EnsureSelectionVisible();
             needs_full_refresh_ = true;
             return true;
+        }
 
         case ButtonEvent::kDownClick: {
-            const int n = static_cast<int>(items_.size());
-            if (selected_index_ < n - 1) {
-                selected_index_ = FindNextSelectable(selected_index_);
-            } else {
-                selected_index_ = GetFirstSelectableIndex();  // Wrap to first
-            }
+            const int next = FindNextSelectable(selected_index_);
+            selected_index_ = next != selected_index_ ? next : GetFirstSelectableIndex();
             EnsureSelectionVisible();
             needs_full_refresh_ = true;
             return true;

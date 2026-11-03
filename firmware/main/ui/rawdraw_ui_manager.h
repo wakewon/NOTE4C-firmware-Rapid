@@ -526,6 +526,7 @@ public:
     void PumpClockRefresh();
 
 private:
+    static bool IsInteractivePage(RawDrawPageId page);
     void SetCurrentPageId(RawDrawPageId page);
     struct QuickSwitchItem {
         RawDrawPageId page;

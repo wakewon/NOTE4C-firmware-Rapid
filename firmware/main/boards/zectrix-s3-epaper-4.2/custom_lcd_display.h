@@ -182,6 +182,9 @@ private:
                                const char *step);
     void EPD_AbortFastBy();
     bool RunFastByRefresh(const char **plan_name, uint32_t *changed_pixels);
+    // After a full-colour waveform: make the frame the fast refresh's
+    // starting state when it holds no white. Returns whether it did.
+    bool AdoptFullColorFrameAsFastState();
     void BuildFastByMask(const uint8_t *semantic, uint8_t *mask) const;
     void EPD_TurnOnDisplayPart();
     void EPD_SetFullWindowAndCounter(); // ***关键：恢复全屏窗口+计数器***

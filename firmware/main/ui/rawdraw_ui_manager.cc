@@ -498,6 +498,15 @@ void RawDrawUiManager::SwitchPage(RawDrawPageId page) {
     // Initialize the new page renderer
     InitRenderer(page);
 
+    // Entering a menu from a photo page is drawn with the full-colour
+    // waveform. The fast refresh can only take over a frame with white in it
+    // by driving every pixel, which leaves the whole menu in its paler fast
+    // yellow with a ghost of the photo; the vendor driver likewise starts its
+    // fast updates from a natively drawn yellow image. Once this frame is on
+    // glass (it holds no white), the driver keeps using it as the fast
+    // refresh's starting state, so navigation only redraws what changed.
+    const bool entering_menu = !IsInteractivePage(current_page_) && IsInteractivePage(page);
+
     // Switch current page
     SetCurrentPageId(page);
     if (page == RawDrawPageId::Gallery) {
@@ -530,7 +539,8 @@ void RawDrawUiManager::SwitchPage(RawDrawPageId page) {
         if (mutex) xSemaphoreGive(mutex);
 
         if (!TryDisplayCurrentPhotoRaw4Color()) {
-            TriggerRefresh(RefreshIntent::FastBwDeferredInteraction);
+            TriggerRefresh(entering_menu ? RefreshIntent::FullColor
+                                         : RefreshIntent::FastBwDeferredInteraction);
         }
     }
 
@@ -590,16 +600,18 @@ rawdraw::PageRenderer* RawDrawUiManager::GetActiveRenderer() const {
     return GetRendererForPage(current_page_);
 }
 
+bool RawDrawUiManager::IsInteractivePage(RawDrawPageId page) {
+    return page == RawDrawPageId::Settings || page == RawDrawPageId::APTransfer ||
+           page == RawDrawPageId::Wifi;
+}
+
 void RawDrawUiManager::SetCurrentPageId(RawDrawPageId page) {
     current_page_ = page;
     // Menus and service pages are what the black/yellow fast refresh redraws,
     // so they are drawn on yellow paper; photos keep the runtime theme. Every
     // assignment of current_page_ goes through here so a page can never be
     // drawn on the other page's palette.
-    const bool interactive = page == RawDrawPageId::Settings ||
-                             page == RawDrawPageId::APTransfer ||
-                             page == RawDrawPageId::Wifi;
-    rawdraw::ThemeManager::Get().SetSurface(interactive
+    rawdraw::ThemeManager::Get().SetSurface(IsInteractivePage(page)
                                                 ? rawdraw::ThemeSurface::Interactive
                                                 : rawdraw::ThemeSurface::Display);
 }
@@ -1502,10 +1514,11 @@ void RawDrawUiManager::DrawQuickSwitchOverlay(uint8_t* fb, int width, int height
         if (i >= total) break;
         const bool selected = i == quick_switch_index_;
         const rawdraw::Rect row{overlay.x + 10, y, overlay.w - 20, item_h};
-        const rawdraw::Color fg = selected ? selected_style.fg : ink;
+        // Same cursor as Settings: an outline plus accent stripe, so moving
+        // it toggles only a few pixels in the fast refresh.
+        const rawdraw::Color fg = ink;
         if (selected) {
-            rawdraw::DrawRoundRect(fb, width, height, row, 10, selected_style.bg,
-                                   selected_style.bg, 1);
+            rawdraw::DrawRoundRectBorder(fb, width, height, row, 10, 2, ink);
             rawdraw::DrawRect(fb, width, {row.x + 6, row.y + item_h / 2 - 7, 3, 14},
                               selected_style.border);
         }

@@ -999,7 +999,9 @@ void CustomLcdDisplay::refresh_task_loop() {
             xSemaphoreTake(dirty_mutex, portMAX_DELAY);
             CompleteFullColorRefreshLocked();
             xSemaphoreGive(dirty_mutex);
-            ESP_LOGW(TAG, "[FULL_COLOR] complete in %u ms", refresh_elapsed_ms());
+            const bool adopted = AdoptFullColorFrameAsFastState();
+            ESP_LOGW(TAG, "[FULL_COLOR] complete in %u ms; fast cache %s", refresh_elapsed_ms(),
+                     adopted ? "adopted (no white)" : "invalid");
         } else if (IsFourColorPanel() && fast_bw) {
             stat_fast_bw++;
             const char *plan = "none";
@@ -1622,6 +1624,33 @@ bool CustomLcdDisplay::EPD_RunFastByWaveform(const uint8_t *new_mask, bool inver
         memcpy(fast_by_state_, new_mask, mask_bytes);
     }
     fast_by_last_waveform_ms_ = static_cast<uint32_t>(waveform_us / 1000);
+    return true;
+#endif
+}
+
+bool CustomLcdDisplay::AdoptFullColorFrameAsFastState() {
+#if !CONFIG_ZECTRIX_EPD_FAST_BW
+    return false;
+#else
+    if (!IsFourColorPanel()) return false;
+    // A full-colour frame with no white pixel is black, yellow and red only.
+    // Its black and yellow pixels are exactly the states the differential
+    // waveform expects, and they are the natively driven, deeper yellow, so
+    // keeping them (holding unchanged pixels) is better than any takeover.
+    // Red counts as black: it holds while it stays ink, and only the few red
+    // accents that turn to paper get a black->yellow drive from red. A frame
+    // with white cannot be described in black/yellow and stays invalid.
+    for (size_t i = 0; i < lcd_spi_data.buffer_len; ++i) {
+        const uint8_t b = tx_buf[i];
+        for (int shift = 0; shift < 8; shift += 2) {
+            if (((b >> shift) & 0x03) == 0x01) {
+                return false;
+            }
+        }
+    }
+    BuildFastByMask(tx_buf, fast_by_state_);
+    fast_by_singles_since_pair_ = 0;
+    fast_by_cache_valid_.store(true, std::memory_order_release);
     return true;
 #endif
 }
