@@ -58,6 +58,46 @@ void ApTransferRenderer::Init(int width, int height) {
     ESP_LOGI(kTag, "ApTransferRenderer initialized: %dx%d", width, height);
 }
 
+namespace {
+// Page geometry below the 28 px status bar. The page shows two numbered steps
+// (join the hotspot, open the browser), a status line and the exit hint.
+constexpr int kMarginX = 12;
+constexpr int kCardRadius = 10;
+constexpr int kStep1Top = Style::kStatusBarHeight + 8;
+constexpr int kStep1H = 88;
+constexpr int kStep2Top = kStep1Top + kStep1H + 8;
+constexpr int kStep2H = 64;
+constexpr int kFooterH = 24;
+
+void DottedHLine(uint8_t* fb, int width, int y, int x1, int x2, Color color) {
+    for (int x = x1; x <= x2; x += 2) set_pixel(fb, width, x, y, color);
+}
+
+// Numbered step marker: an accent disc with a paper-coloured digit. The fast
+// refresh shows it as a black disc, which keeps the digit readable.
+void DrawStepBadge(uint8_t* fb, int width, int cx, int cy, const char* digit,
+                   const lv_font_t* font, Color accent, Color paper) {
+    DrawCircle(fb, width, {cx, cy}, 10, accent);
+    const int w = MeasureTextWidth(digit, font);
+    DrawText(fb, width, cx - w / 2 + 1, InkCenteredTextTopY(font, digit, cy, 0), digit, font,
+             paper);
+}
+
+void DrawCheckMark(uint8_t* fb, int width, int cx, int cy, Color color) {
+    for (int t = -1; t <= 1; ++t) {
+        DrawLine(fb, width, {cx - 10, cy + t}, {cx - 3, cy + 7 + t}, color);
+        DrawLine(fb, width, {cx - 3, cy + 7 + t}, {cx + 11, cy - 7 + t}, color);
+    }
+}
+
+void DrawCrossMark(uint8_t* fb, int width, int cx, int cy, Color color) {
+    for (int t = -1; t <= 1; ++t) {
+        DrawLine(fb, width, {cx - 8 + t, cy - 8}, {cx + 8 + t, cy + 8}, color);
+        DrawLine(fb, width, {cx + 8 + t, cy - 8}, {cx - 8 + t, cy + 8}, color);
+    }
+}
+}  // namespace
+
 void ApTransferRenderer::Render(uint8_t* fb, int width, int height) {
     if (!fb) return;
     // SetState() arrives from the HTTP and AP-start tasks while the UI task
@@ -65,31 +105,8 @@ void ApTransferRenderer::Render(uint8_t* fb, int width, int height) {
     // small-string limit, so an unguarded read could use freed memory.
     std::lock_guard<std::mutex> lock(state_mutex_);
     const auto& theme = ThemeManager::Get();
-    const PaintStyle bg_style = theme.Style(ThemeToken::BackgroundPrimary);
-    const PaintStyle title_style = theme.Style(ThemeToken::BackgroundSecondary);
-    const Color text = theme.ColorFor(ThemeToken::TextPrimary);
-    const Color border = theme.ColorFor(ThemeToken::Border);
+    DrawStyledRect(fb, width, {0, 0, width, height}, theme.Style(ThemeToken::BackgroundPrimary));
 
-    // Clear to white
-    DrawStyledRect(fb, width, {0, 0, width, height}, bg_style);
-
-    // Draw outer frame (Macintosh style)
-    DrawRoundRectBorder(fb, width, height, {1, 1, width - 2, height - 2},
-                         Style::kBorderRadiusMD, 1, border);
-
-    // Title bar area
-    const int titlebar_h = 28;
-    DrawStyledRect(fb, width, {1, 1, width - 2, titlebar_h}, title_style);
-    DrawHLine(fb, width, titlebar_h, 1, width - 2, border);
-
-    // Title
-    const char* title = title_text_.empty() ? "WiFi 传图" : title_text_.c_str();
-    const int title_w = MeasureTextWidth(title, title_font_);
-    DrawText(fb, width, (width - title_w) / 2,
-             InkCenteredTextTopYInBox(title_font_, title, 1, titlebar_h, 0),
-             title, title_font_, text);
-
-    // Content based on state
     switch (state_) {
         case kWaitingForConnection:
             RenderInstructions(fb, width, height);
@@ -98,35 +115,27 @@ void ApTransferRenderer::Render(uint8_t* fb, int width, int height) {
             RenderStatus(fb, width, height);
             break;
     }
+
+    // Footer: how to leave, and which mode this is (the status bar title is
+    // the same for transfer and Wi-Fi setup).
+    const Color ink = theme.Style(ThemeToken::TextPrimary).fg;
+    const int top = height - kFooterH - 2;
+    DottedHLine(fb, width, top, kMarginX + 4, width - kMarginX - 4, ink);
+    const char* exit_hint = exit_hint_text_.empty() ? "长按 BOOT 退出" : exit_hint_text_.c_str();
+    const int hint_y = InkCenteredTextTopYInBox(font_, exit_hint, top + 1, kFooterH, 0);
+    DrawText(fb, width, kMarginX + 4, hint_y, exit_hint, font_, ink, height);
+    const char* mode = title_text_.empty() ? "WiFi 传图" : title_text_.c_str();
+    const int mode_w = MeasureTextWidth(mode, font_);
+    DrawText(fb, width, width - kMarginX - 4 - mode_w, hint_y, mode, font_, ink, height);
 }
 
 void ApTransferRenderer::RenderInstructions(uint8_t* fb, int width, int height) {
     const auto& theme = ThemeManager::Get();
-    const Color text = theme.ColorFor(ThemeToken::TextPrimary);
-    const Color secondary = theme.ColorFor(ThemeToken::TextSecondary);
-    const Color accent = theme.ColorFor(ThemeToken::Accent);
-    const Color border = theme.ColorFor(ThemeToken::Border);
-    const int content_top = 35;
-    const int line_spacing = 28;
-    const int left_margin = 20;
-
-    int y = content_top;
-
-    // WiFi icon area
-    DrawRectBorder(fb, width, {left_margin, y, 60, 60}, 2, accent);
-    
-    // WiFi signal bars inside
-    const int bar_x = left_margin + 10;
-    const int bar_y = y + 30;
-    const int bar_w = 8;
-    const int bar_gap = 4;
-    const int heights[] = {8, 16, 24, 32};
-    for (int i = 0; i < 4; i++) {
-        DrawRect(fb, width, {bar_x + i * (bar_w + bar_gap), bar_y - heights[i], bar_w, heights[i]}, accent);
-    }
-
-    // Instructions text
-    y += 70;
+    const Color paper = theme.Style(ThemeToken::BackgroundPrimary).bg;
+    const Color ink = theme.Style(ThemeToken::TextPrimary).fg;
+    const Color accent = theme.Style(ThemeToken::Accent).bg;
+    const int card_w = width - kMarginX * 2;
+    const int text_x = kMarginX + 40;
 
     // Always show the browser URL. The AP/HTTP startup callback can arrive
     // while the e-paper is busy, so relying on status_message_ made the
@@ -140,115 +149,110 @@ void ApTransferRenderer::RenderInstructions(uint8_t* fb, int width, int height) 
         : (status_message_.empty() || LooksLikeIpv4(status_message_)
         ? "启动中，可先连接热点"
         : status_message_);
-    const std::string ssid_line = "连接 " + (ssid_text_.empty() ? std::string("InkScreen-AP") : ssid_text_);
-    const std::string pwd_line = password_text_.empty()
-        ? std::string("密码: 无")
-        : ("密码: " + password_text_);
-    const char* lines[] = {
-        ssid_line.c_str(),
-        pwd_line.c_str(),
-        "",
-        "浏览器访问",
-        url.c_str(),
-        state_hint.c_str(),
-    };
+    const std::string ssid = ssid_text_.empty() ? std::string("InkScreen-AP") : ssid_text_;
+    const std::string password = password_text_.empty() ? std::string("无") : password_text_;
 
-    for (const auto* line : lines) {
-        if (line[0] != '\0') {
-            // Highlight URL
-            bool is_url = (strncmp(line, "http://", 7) == 0);
-            const lv_font_t* use_font = is_url ? title_font_ : font_;
-            
-            DrawText(fb, width, left_margin + 75,
-                     InkCenteredTextTopY(use_font, line, y, 0),
-                     line, use_font, is_url ? accent : text);
-        }
-        y += line_spacing;
-    }
+    // Step 1: join the hotspot. Headings use the medium face, which only
+    // carries CJK and digits; Latin text (SSID, URL) stays in the regular one.
+    DrawRoundRectBorder(fb, width, height, {kMarginX, kStep1Top, card_w, kStep1H}, kCardRadius, 1,
+                        ink);
+    const int head1_y = kStep1Top + 20;
+    DrawStepBadge(fb, width, kMarginX + 20, head1_y, "1", font_, accent, paper);
+    DrawText(fb, width, text_x, InkCenteredTextTopY(title_font_, "连接热点", head1_y, 0),
+             "连接热点", title_font_, ink, height);
+    const int row1_y = kStep1Top + 48;
+    const int row2_y = kStep1Top + 70;
+    const int value_x = text_x + 44;
+    DrawText(fb, width, text_x, InkCenteredTextTopY(font_, "名称", row1_y, 0), "名称", font_, ink,
+             height);
+    DrawText(fb, width, value_x, InkCenteredTextTopY(font_, ssid.c_str(), row1_y, 0),
+             ssid.c_str(), font_, ink, height);
+    DrawText(fb, width, text_x, InkCenteredTextTopY(font_, "密码", row2_y, 0), "密码", font_, ink,
+             height);
+    DrawText(fb, width, value_x, InkCenteredTextTopY(font_, password.c_str(), row2_y, 0),
+             password.c_str(), font_, ink, height);
 
-    // Bottom hint
-    const int bottom_y = height - 30;
-    DrawHLine(fb, width, bottom_y - 10, 20, width - 20, border);
-    const char* exit_hint = exit_hint_text_.empty() ? "长按 BOOT 退出" : exit_hint_text_.c_str();
-    DrawText(fb, width, 20,
-             InkCenteredTextTopYInBox(font_, exit_hint, bottom_y, 24, 0),
-             exit_hint, font_, secondary);
+    // Step 2: open the page. The address is the one thing to read off the
+    // screen, so it gets an accent underline.
+    DrawRoundRectBorder(fb, width, height, {kMarginX, kStep2Top, card_w, kStep2H}, kCardRadius, 1,
+                        ink);
+    const int head2_y = kStep2Top + 20;
+    DrawStepBadge(fb, width, kMarginX + 20, head2_y, "2", font_, accent, paper);
+    DrawText(fb, width, text_x, InkCenteredTextTopY(title_font_, "浏览器打开", head2_y, 0),
+             "浏览器打开", title_font_, ink, height);
+    const int url_y = kStep2Top + 46;
+    const int url_w = MeasureTextWidth(url.c_str(), font_);
+    DrawText(fb, width, text_x, InkCenteredTextTopY(font_, url.c_str(), url_y, 0), url.c_str(),
+             font_, ink, height);
+    DrawRect(fb, width, {text_x, url_y + 10, url_w, 2}, accent);
+
+    // Status line.
+    const int status_y = kStep2Top + kStep2H + 18;
+    DrawCircle(fb, width, {kMarginX + 10, status_y}, 4, accent);
+    DrawText(fb, width, kMarginX + 22, InkCenteredTextTopY(font_, state_hint.c_str(), status_y, 0),
+             state_hint.c_str(), font_, ink, height);
 }
 
 void ApTransferRenderer::RenderStatus(uint8_t* fb, int width, int height) {
     const auto& theme = ThemeManager::Get();
-    const Color secondary = theme.ColorFor(ThemeToken::TextSecondary);
-    const Color danger = theme.ColorFor(ThemeToken::Danger);
-    const Color accent = theme.ColorFor(ThemeToken::Accent);
-    const Color border = theme.ColorFor(ThemeToken::Border);
-    const int center_y = height / 2;
+    const Color paper = theme.Style(ThemeToken::BackgroundPrimary).bg;
+    const Color ink = theme.Style(ThemeToken::TextPrimary).fg;
+    const Color accent = theme.Style(ThemeToken::Accent).bg;
 
-    // Status based on state
     const char* status_text = "";
     const char* detail_text = status_message_.empty() ? "" : status_message_.c_str();
-
     switch (state_) {
-        case kClientConnected:
-            status_text = "设备已连接";
-            break;
-        case kUploading:
-            status_text = "上传中...";
-            break;
-        case kProcessing:
-            status_text = "处理图片...";
-            break;
-        case kComplete:
-            status_text = "传输完成!";
-            break;
-        case kError:
-            status_text = "传输失败";
-            break;
-        default:
-            break;
+        case kClientConnected: status_text = "设备已连接"; break;
+        case kUploading: status_text = "正在上传"; break;
+        case kProcessing: status_text = "正在处理图片"; break;
+        case kComplete: status_text = "传输完成"; break;
+        case kError: status_text = "传输失败"; break;
+        default: break;
     }
 
-    // Draw status
+    // One large mark, the state in the medium face, the detail below it.
+    const int mark_cy = Style::kStatusBarHeight + 62;
+    const int cx = width / 2;
+    if (state_ == kComplete) {
+        DrawCircle(fb, width, {cx, mark_cy}, 24, accent);
+        DrawCheckMark(fb, width, cx, mark_cy, paper);
+    } else if (state_ == kError) {
+        DrawCircle(fb, width, {cx, mark_cy}, 24, ink);
+        DrawCrossMark(fb, width, cx, mark_cy, paper);
+    } else {
+        DrawCircleBorder(fb, width, {cx, mark_cy}, 24, 3, ink);
+        DrawCircle(fb, width, {cx, mark_cy}, 8, accent);
+    }
+
+    const int status_y = mark_cy + 48;
     if (status_text[0] != '\0') {
         const int status_w = MeasureTextWidth(status_text, title_font_);
-        DrawText(fb, width, (width - status_w) / 2,
-                 InkCenteredTextTopY(title_font_, status_text, center_y - 20, 0),
-                 status_text, title_font_, state_ == kError ? danger : accent);
+        DrawText(fb, width, cx - status_w / 2,
+                 InkCenteredTextTopY(title_font_, status_text, status_y, 0), status_text,
+                 title_font_, ink, height);
     }
-
-    // Draw detail
     if (detail_text[0] != '\0') {
         const int detail_w = MeasureTextWidth(detail_text, font_);
-        DrawText(fb, width, (width - detail_w) / 2,
-                 InkCenteredTextTopY(font_, detail_text, center_y + 20, 0),
-                 detail_text, font_, secondary);
+        DrawText(fb, width, cx - detail_w / 2,
+                 InkCenteredTextTopY(font_, detail_text, status_y + 28, 0), detail_text, font_,
+                 ink, height);
     }
 
-    // Progress bar for uploading/processing
     if (state_ == kUploading || state_ == kProcessing) {
-        const int bar_w = width - 60;
-        const int bar_h = 8;
-        const int bar_x = 30;
-        const int bar_y = center_y + 50;
-        
-        DrawRectBorder(fb, width, {bar_x, bar_y, bar_w, bar_h}, 1, border);
-        // Animated portion would be added later
-        DrawRect(fb, width, {bar_x + 2, bar_y + 2, bar_w / 4, bar_h - 4}, accent);
+        // Indeterminate: the transfer reports no byte count, so the bar only
+        // shows that work is in progress.
+        const Rect bar{kMarginX + 40, status_y + 46, width - (kMarginX + 40) * 2, 10};
+        DrawRoundRectBorder(fb, width, height, bar, 5, 1, ink);
+        DrawRoundRect(fb, width, height, {bar.x + 2, bar.y + 2, bar.w / 3, bar.h - 4}, 3, accent,
+                      accent, 1);
     }
 
     const std::string ip = LooksLikeIpv4(status_message_) ? status_message_ : kDefaultApIp;
     const std::string url = url_text_.empty() ? ("http://" + ip) : url_text_;
     const int url_w = MeasureTextWidth(url.c_str(), font_);
-    DrawText(fb, width, (width - url_w) / 2,
-             InkCenteredTextTopY(font_, url.c_str(), height - 62, 0),
-             url.c_str(), font_, accent);
-
-    // Bottom hint
-    const int bottom_y = height - 30;
-    DrawHLine(fb, width, bottom_y - 10, 20, width - 20, border);
-    const char* exit_hint = exit_hint_text_.empty() ? "长按 BOOT 退出" : exit_hint_text_.c_str();
-    DrawText(fb, width, 20,
-             InkCenteredTextTopYInBox(font_, exit_hint, bottom_y, 24, 0),
-             exit_hint, font_, secondary);
+    const int url_y = height - kFooterH - 18;
+    DrawText(fb, width, cx - url_w / 2, InkCenteredTextTopY(font_, url.c_str(), url_y, 0),
+             url.c_str(), font_, ink, height);
 }
 
 bool ApTransferRenderer::HandleInput(const ButtonEvent& event) {

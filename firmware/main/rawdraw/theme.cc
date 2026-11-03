@@ -46,6 +46,12 @@ ThemeDefinition MakeTheme(ThemeId id, const char* key, const char* name,
     t.tokens[static_cast<int>(ThemeToken::Focus)] = focus;
     t.tokens[static_cast<int>(ThemeToken::Badge)] = badge;
     t.tokens[static_cast<int>(ThemeToken::ProgressFill)] = progress;
+    t.status_bar = MakePaint(text_primary.fg, bg_primary.bg, danger.border);
+    return t;
+}
+
+ThemeDefinition WithStatusBar(ThemeDefinition t, PaintStyle status_bar) {
+    t.status_bar = status_bar;
     return t;
 }
 
@@ -152,6 +158,27 @@ const ThemeDefinition kThemes[] = {
         MakePaint(BLACK, YELLOW, RED, DitherToken::None, 2),
         MakePaint(BLACK, YELLOW, RED),
         MakePaint(WHITE, RED, RED)),
+    // Every surface is yellow paper or black ink. Red is reserved for small
+    // accents that sit on yellow or black and stay legible when the fast
+    // refresh draws them black: the cursor stripe, ON switches, action chips.
+    WithStatusBar(MakeTheme(
+        ThemeId::InkSignal, "ink_signal", "Ink Signal",
+        MakePaint(BLACK, YELLOW, BLACK),                              // TextPrimary
+        MakePaint(BLACK, YELLOW, BLACK),                              // TextSecondary
+        MakePaint(BLACK, YELLOW, BLACK),                              // BackgroundPrimary
+        MakePaint(BLACK, YELLOW, BLACK),                              // BackgroundSecondary
+        MakePaint(YELLOW, RED, RED, DitherToken::None, 1, RefreshCost::SmallAccent),     // Accent
+        MakePaint(BLACK, YELLOW, BLACK, DitherToken::None, 2),       // Warning
+        MakePaint(YELLOW, RED, RED, DitherToken::None, 1, RefreshCost::SmallAccent),     // Danger
+        MakePaint(BLACK, YELLOW, BLACK),                              // SuccessLike
+        MakePaint(YELLOW, BLACK, RED),                                // Selected
+        MakePaint(BLACK, YELLOW, BLACK, DitherToken::DitherLightGray),  // Disabled
+        MakePaint(BLACK, YELLOW, BLACK),                              // Border
+        MakePaint(BLACK, BLACK, BLACK),                               // Shadow
+        MakePaint(RED, YELLOW, RED),                                  // Focus
+        MakePaint(YELLOW, BLACK, BLACK),                              // Badge
+        MakePaint(YELLOW, RED, BLACK)),                               // ProgressFill
+        MakePaint(BLACK, YELLOW, RED)),                               // status bar
 };
 
 const ThemeDefinition& ThemeById(ThemeId id) {
@@ -250,6 +277,13 @@ ThemeManager& ThemeManager::Get() {
 }
 
 const ThemeDefinition& ThemeManager::Current() const {
+#if CONFIG_ZECTRIX_EPD_PANEL_4COLOR_SSD2683
+    if (surface_ == ThemeSurface::Interactive) {
+        return ThemeById(ThemeId::InkSignal);
+    }
+#endif
+    // A black/white panel draws yellow as black; it keeps the runtime theme
+    // and its monochrome degradation everywhere.
     return ThemeById(current_);
 }
 
@@ -307,6 +341,10 @@ PaintStyle ThemeManager::Component(ComponentRole role) const {
         default:
             return Style(ThemeToken::BackgroundPrimary);
     }
+}
+
+PaintStyle ThemeManager::StatusBar() const {
+    return NormalizeForPanel(Current().status_bar);
 }
 
 Color ThemeManager::ColorFor(ThemeToken token) const {

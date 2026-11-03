@@ -22,6 +22,7 @@
 extern const lv_font_t SourceHanSansSC_Regular_slim;
 extern const lv_font_t SourceHanSansSC_Medium_slim;
 extern const lv_font_t font_zectrix_16_1;
+extern const lv_font_t fa_settings_16;
 
 namespace rawdraw {
 
@@ -638,75 +639,64 @@ void PhotoGalleryRenderer::RenderFullscreenMode(uint8_t* fb, int width, int heig
 
 void PhotoGalleryRenderer::RenderDeleteDialog(uint8_t* fb, int width, int height) {
     if (!fb) return;
+    // A dialog is interactive even over a full-screen photo: draw it on the
+    // yellow-paper palette so the fast preview matches the colour frame.
+    ScopedThemeSurface surface(ThemeSurface::Interactive);
     const auto& theme = ThemeManager::Get();
-    const PaintStyle bg_style = theme.Style(ThemeToken::BackgroundPrimary);
-    const PaintStyle modal_style = theme.Component(ComponentRole::Modal);
-    const PaintStyle shadow_style = theme.Style(ThemeToken::Shadow);
+    const Color paper = theme.Style(ThemeToken::BackgroundPrimary).bg;
+    const Color ink = theme.Style(ThemeToken::TextPrimary).fg;
+    const Color accent = theme.Style(ThemeToken::Danger).bg;
     const PaintStyle selected_style = theme.Component(ComponentRole::ButtonSelected);
-    const PaintStyle danger_style = theme.Component(ComponentRole::ButtonDanger);
-    const Color text = theme.ColorFor(ThemeToken::TextPrimary);
-    const Color secondary = theme.ColorFor(ThemeToken::TextSecondary);
-    const Color border = theme.ColorFor(ThemeToken::Border);
-    const Color danger = theme.ColorFor(ThemeToken::Danger);
 
     const int dialog_w = 292;
     const int dialog_h = 156;
     const int dialog_x = (width - dialog_w) / 2;
     const int dialog_y = (height - dialog_h) / 2;
-    const int titlebar_h = 28;
-    const int shadow_offset = 2;
 
-    DrawStyledRoundRect(fb, width, height, {dialog_x - 4, dialog_y - 4, dialog_w + 10, dialog_h + 10},
-                        Style::kBorderRadiusMD, bg_style);
-    DrawStyledRoundRect(fb, width, height, {dialog_x + shadow_offset, dialog_y + shadow_offset, dialog_w, dialog_h},
-                        Style::kBorderRadiusMD, shadow_style);
-    DrawStyledRoundRect(fb, width, height, {dialog_x, dialog_y, dialog_w, dialog_h},
-                        Style::kBorderRadiusMD, modal_style);
-    DrawHLine(fb, width, dialog_y + titlebar_h, dialog_x + 1, dialog_x + dialog_w - 2, border);
-    DrawRectBorder(fb, width, {dialog_x + 8, dialog_y + 8, 12, 12}, 1, danger);
-    DrawLine(fb, width, {dialog_x + 10, dialog_y + 10}, {dialog_x + 18, dialog_y + 18}, danger);
-    DrawLine(fb, width, {dialog_x + 18, dialog_y + 10}, {dialog_x + 10, dialog_y + 18}, danger);
+    DrawRoundRect(fb, width, height, {dialog_x - 4, dialog_y - 4, dialog_w + 8, dialog_h + 8}, 16,
+                  paper, paper, 1);
+    DrawRoundRect(fb, width, height, {dialog_x, dialog_y, dialog_w, dialog_h}, 12, paper, ink, 2);
 
-    const char* title = "删除照片";
-    const int title_w = MeasureTextWidth(title, font_);
-    DrawText(fb, width, dialog_x + (dialog_w - title_w) / 2,
-             InkCenteredTextTopYInBox(font_, title, dialog_y, titlebar_h, 0),
-             title, font_, danger, height);
-    for (int yy = dialog_y + 6; yy < dialog_y + titlebar_h - 5; yy += 4) {
-        DrawHLine(fb, width, yy, dialog_x + 28, dialog_x + (dialog_w - title_w) / 2 - 8, border);
-        DrawHLine(fb, width, yy, dialog_x + (dialog_w + title_w) / 2 + 8, dialog_x + dialog_w - 12, border);
-    }
+    // Title with a trash glyph in the danger accent.
+    const char* trash = "\xef\x80\x94";  // U+F014
+    const int title_cy = dialog_y + 26;
+    DrawText(fb, width, dialog_x + 18, InkCenteredTextTopY(&fa_settings_16, trash, title_cy, 0),
+             trash, &fa_settings_16, accent, height);
+    DrawText(fb, width, dialog_x + 42, InkCenteredTextTopY(title_font_, "删除照片", title_cy, 0),
+             "删除照片", title_font_, ink, height);
+    DrawText(fb, width, dialog_x + 18,
+             InkCenteredTextTopY(font_, "照片删除后无法恢复。", title_cy + 30, 0),
+             "照片删除后无法恢复。", font_, ink, height);
 
-    const char* body = "确认删除当前照片？";
-    const int body_w = MeasureTextWidth(body, title_font_);
-    DrawText(fb, width, dialog_x + (dialog_w - body_w) / 2,
-             InkCenteredTextTopYInBox(title_font_, body, dialog_y + titlebar_h + 18, 28, 0),
-             body, title_font_, text, height);
-
+    // Buttons: the focused one is filled -- the danger accent for 删除, ink for
+    // 取消 -- the other is an outline.
     const char* labels[] = {"删除", "取消"};
-    const int button_y = dialog_y + 94;
-    const int button_w = 92;
-    const int button_h = 30;
-    const int gap = 18;
+    const int button_w = 120;
+    const int button_h = 32;
+    const int gap = 16;
+    const int button_y = dialog_y + 86;
     const int start_x = dialog_x + (dialog_w - button_w * 2 - gap) / 2;
     for (int i = 0; i < 2; ++i) {
-        const int x = start_x + i * (button_w + gap);
+        const Rect r{start_x + i * (button_w + gap), button_y, button_w, button_h};
         const bool selected = delete_dialog_selected_ == i;
-        const PaintStyle style = selected ? (i == 0 ? danger_style : selected_style)
-                                         : modal_style;
-        DrawStyledRoundRect(fb, width, height, {x, button_y, button_w, button_h},
-                            Style::kBorderRadiusSM, style);
+        Color fill = paper;
+        Color text = ink;
+        if (selected) {
+            fill = i == 0 ? accent : selected_style.bg;
+            text = paper;
+        }
+        DrawRoundRect(fb, width, height, r, button_h / 2, fill, selected ? fill : ink, 2);
         const int label_w = MeasureTextWidth(labels[i], font_);
-        DrawText(fb, width, x + (button_w - label_w) / 2,
-                 InkCenteredTextTopYInBox(font_, labels[i], button_y, button_h, 0),
-                 labels[i], font_, style.fg, height);
+        DrawText(fb, width, r.x + (r.w - label_w) / 2,
+                 InkCenteredTextTopYInBox(font_, labels[i], r.y, r.h, 0), labels[i], font_, text,
+                 height);
     }
 
     const char* hint = "UP/DN 切换  BOOT 确认";
     const int hint_w = MeasureTextWidth(hint, font_);
     DrawText(fb, width, dialog_x + (dialog_w - hint_w) / 2,
-             InkCenteredTextTopYInBox(font_, hint, dialog_y + dialog_h - 24, 20, 0),
-             hint, font_, secondary, height);
+             InkCenteredTextTopYInBox(font_, hint, dialog_y + dialog_h - 30, 22, 0), hint, font_,
+             ink, height);
 }
 
 bool PhotoGalleryRenderer::LoadPhotoData(int index) {

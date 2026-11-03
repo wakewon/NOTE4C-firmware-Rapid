@@ -526,6 +526,7 @@ public:
     void PumpClockRefresh();
 
 private:
+    void SetCurrentPageId(RawDrawPageId page);
     struct QuickSwitchItem {
         RawDrawPageId page;
         const char* label;
@@ -538,6 +539,7 @@ private:
     int height_ = 300;
 
     // Current page
+    // Only SetCurrentPageId() assigns this: it also selects the theme surface.
     RawDrawPageId current_page_ = RawDrawPageId::Gallery;
 
     // Status bar

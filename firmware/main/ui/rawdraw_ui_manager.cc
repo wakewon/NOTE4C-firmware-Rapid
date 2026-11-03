@@ -37,6 +37,8 @@ static constexpr bool kEnableMinuteClockRefresh = false;
 // The render task holds the framebuffer mutex only for a dirty-rect merge or a
 // 30 KB snapshot, never across a waveform. Anything longer is a wedged task.
 static constexpr uint32_t kFramebufferLockTimeoutMs = 500;
+// Rows the quick-switch overlay shows at once; its scrolling uses the same.
+static constexpr int kQuickSwitchVisibleRows = 3;
 
 namespace ui {
 
@@ -99,11 +101,10 @@ bool IsNavigationClick(const rawdraw::ButtonEvent& event) {
            event.type == rawdraw::ButtonEvent::kBootClick;
 }
 
-void DrawBatteryIcon(uint8_t* fb, int width, int x, int y, int level, bool vertical) {
+void DrawBatteryIcon(uint8_t* fb, int width, int x, int y, int level, bool vertical,
+                     rawdraw::Color ink, rawdraw::Color alert) {
     level = std::max(0, std::min(100, level));
-    const rawdraw::Color battery_color = level <= 15
-        ? rawdraw::ThemeManager::Get().Style(rawdraw::ThemeToken::Danger).border
-        : rawdraw::ThemeManager::Get().Style(rawdraw::ThemeToken::TextPrimary).fg;
+    const rawdraw::Color battery_color = level <= 15 ? alert : ink;
     if (vertical) {
         const int body_w = 9;
         const int body_h = 14;
@@ -133,10 +134,11 @@ void DrawBatteryIcon(uint8_t* fb, int width, int x, int y, int level, bool verti
     }
 }
 
-void DrawServerStatusMarker(uint8_t* fb, int width, int x, int center_y, bool server_connected, bool wifi_connected) {
+void DrawServerStatusMarker(uint8_t* fb, int width, int x, int center_y, bool server_connected,
+                            bool wifi_connected, rawdraw::Color ink) {
     if (!fb || width <= 0) return;
-    const rawdraw::Color success = rawdraw::ThemeManager::Get().Style(rawdraw::ThemeToken::SuccessLike).fg;
-    const rawdraw::Color warning = rawdraw::ThemeManager::Get().Style(rawdraw::ThemeToken::Warning).border;
+    const rawdraw::Color success = ink;
+    const rawdraw::Color warning = ink;
     if (server_connected) {
         // Draw the service-online marker as pixels instead of a font glyph.
         // This keeps the independent "*" visible on the 1bpp status bar even
@@ -182,7 +184,7 @@ int MiniTimeWidth(const char* text) {
     return 32;  // "HH:MM": 4 digits * 6px + colon 2px + gaps.
 }
 
-void DrawMiniTimeText(uint8_t* fb, int width, int x, int y, const char* text, rawdraw::Color color) {
+[[maybe_unused]] void DrawMiniTimeText(uint8_t* fb, int width, int x, int y, const char* text, rawdraw::Color color) {
     if (!fb || !text || std::strlen(text) < 5) return;
     int cursor_x = x;
     for (int i = 0; i < 5; ++i) {
@@ -497,7 +499,7 @@ void RawDrawUiManager::SwitchPage(RawDrawPageId page) {
     InitRenderer(page);
 
     // Switch current page
-    current_page_ = page;
+    SetCurrentPageId(page);
     if (page == RawDrawPageId::Gallery) {
         // A photo becoming visible is a new dwell interval. Without resetting
         // here, returning to a fullscreen gallery inherits whatever fraction
@@ -553,7 +555,7 @@ void RawDrawUiManager::SetCurrentPageWithoutRender(RawDrawPageId page) {
     // Initialize the new page renderer
     InitRenderer(page);
     // Switch current page
-    current_page_ = page;
+    SetCurrentPageId(page);
     // Update status bar title
     {
         std::lock_guard<std::mutex> lock(ui_state_mutex_);
@@ -586,6 +588,20 @@ rawdraw::PageRenderer* RawDrawUiManager::GetRendererForPage(RawDrawPageId page) 
 
 rawdraw::PageRenderer* RawDrawUiManager::GetActiveRenderer() const {
     return GetRendererForPage(current_page_);
+}
+
+void RawDrawUiManager::SetCurrentPageId(RawDrawPageId page) {
+    current_page_ = page;
+    // Menus and service pages are what the black/yellow fast refresh redraws,
+    // so they are drawn on yellow paper; photos keep the runtime theme. Every
+    // assignment of current_page_ goes through here so a page can never be
+    // drawn on the other page's palette.
+    const bool interactive = page == RawDrawPageId::Settings ||
+                             page == RawDrawPageId::APTransfer ||
+                             page == RawDrawPageId::Wifi;
+    rawdraw::ThemeManager::Get().SetSurface(interactive
+                                                ? rawdraw::ThemeSurface::Interactive
+                                                : rawdraw::ThemeSurface::Display);
 }
 
 bool RawDrawUiManager::HasGlobalChrome() const {
@@ -807,7 +823,7 @@ bool RawDrawUiManager::RestoreRetainedGalleryState(int retained_index,
     if (!photo_gallery_renderer_) {
         return false;
     }
-    current_page_ = RawDrawPageId::Gallery;
+    SetCurrentPageId(RawDrawPageId::Gallery);
     photo_gallery_renderer_->SetSelectedIndex(retained_index);
     if (retained_fullscreen && !photo_gallery_renderer_->EnterFullscreenMode()) {
         ESP_LOGW(kTag, "Could not restore retained fullscreen photo");
@@ -1064,7 +1080,7 @@ bool RawDrawUiManager::HandleInput(const rawdraw::ButtonEvent& event) {
                 }
             }
             // Clamp first_visible so selected is in view
-            const int kVisibleCount = 5;
+            const int kVisibleCount = kQuickSwitchVisibleRows;
             const int total = static_cast<int>(items.size());
             if (quick_switch_index_ >= kVisibleCount) {
                 quick_switch_first_visible_ = quick_switch_index_ - kVisibleCount + 1;
@@ -1240,6 +1256,9 @@ bool RawDrawUiManager::EnsureFramebufferHoldsPage() {
 
 void RawDrawUiManager::DrawGlobalPageFrame(uint8_t* fb, int width, int height) {
     if (!fb || width <= 4 || height <= 4) return;
+    // Interactive pages are flat yellow paper edge to edge; the window frame
+    // belongs to the display pages' original style.
+    if (rawdraw::ThemeManager::Get().Surface() == rawdraw::ThemeSurface::Interactive) return;
     const auto border = rawdraw::ThemeManager::Get().Style(rawdraw::ThemeToken::Border);
     rawdraw::DrawRoundRectBorder(fb, width, height, {1, 1, width - 2, height - 2},
                                  Style::kBorderRadiusMD, border.border_width, border.border);
@@ -1252,11 +1271,15 @@ void RawDrawUiManager::DrawStatusBar(uint8_t* fb, int width, int height) {
     int padding = Style::kStatusBarPadding;
     const lv_font_t* title_font = &SourceHanSansSC_Regular_slim;
     const auto& theme = ThemeManager::Get();
-    const PaintStyle bg_style = theme.Style(ThemeToken::BackgroundPrimary);
-    const PaintStyle text_style = theme.Style(ThemeToken::TextPrimary);
-    const PaintStyle accent_style = theme.Style(ThemeToken::Accent);
+    // The bar has its own palette: black on white on display pages, yellow on
+    // black on interactive ones. Every glyph and icon in it uses the bar ink,
+    // and only the alert marks (Wi-Fi off, low battery) use the alert ink.
+    const PaintStyle bar_style = theme.StatusBar();
+    const PaintStyle bg_style = MakePaint(bar_style.fg, bar_style.bg, bar_style.fg);
+    const PaintStyle text_style = bg_style;
     const PaintStyle border_style = theme.Style(ThemeToken::Border);
-    const PaintStyle danger_style = theme.Style(ThemeToken::Danger);
+    const Color bar_ink = bar_style.fg;
+    const Color alert_ink = bar_style.border;
 
     DrawStyledRect(fb, width, {0, 0, width, bar_height}, bg_style);
     DrawRect(fb, width, {1, bar_height - Style::kShellDividerThickness,
@@ -1273,7 +1296,7 @@ void RawDrawUiManager::DrawStatusBar(uint8_t* fb, int width, int height) {
         for (int i = 0; i < 4; ++i) {
             int bx = x + i * (sig_bar_w + sig_bar_gap);
             int by = center_y + 7 - sig_bar_heights[i];
-            DrawRect(fb, width, {bx, by, sig_bar_w, sig_bar_heights[i]}, theme.Style(ThemeToken::SuccessLike).fg);
+            DrawRect(fb, width, {bx, by, sig_bar_w, sig_bar_heights[i]}, bar_ink);
         }
     } else {
         for (int i = 0; i < 4; ++i) {
@@ -1285,17 +1308,17 @@ void RawDrawUiManager::DrawStatusBar(uint8_t* fb, int width, int height) {
         int slash_y1 = center_y - 6;
         int slash_x2 = x + wifi_group_w;
         int slash_y2 = center_y + 7;
-        DrawLine(fb, width, {slash_x1, slash_y1}, {slash_x2, slash_y2}, danger_style.border);
+        DrawLine(fb, width, {slash_x1, slash_y1}, {slash_x2, slash_y2}, alert_ink);
     }
 
     const int marker_x = x + wifi_group_w + 10;
     DrawServerStatusMarker(fb, width, marker_x, center_y, status_bar_data_.server_connected,
-                           status_bar_data_.wifi_connected);
+                           status_bar_data_.wifi_connected, bar_ink);
     int left_content_x = marker_x + 14;
     if (status_bar_data_.bluetooth_enabled) {
         const char* bt_icon = FA_SETTINGS_BLUETOOTH;
         const int bt_y = InkCenteredTextTopY(&fa_settings_16, bt_icon, center_y, 0);
-        DrawStyledText(fb, width, left_content_x, bt_y, bt_icon, &fa_settings_16, accent_style, height);
+        DrawStyledText(fb, width, left_content_x, bt_y, bt_icon, &fa_settings_16, text_style, height);
         left_content_x += MeasureTextWidth(bt_icon, &fa_settings_16) + 8;
     }
 
@@ -1340,13 +1363,15 @@ void RawDrawUiManager::DrawStatusBar(uint8_t* fb, int width, int height) {
         const int battery_x = width - padding - battery_slot_w + (battery_slot_w - battery_w);
         const int battery_y = center_y - battery_h / 2;
         DrawBatteryIcon(fb, width, battery_x, battery_y, status_bar_data_.battery_level,
-                        status_bar_data_.battery_vertical);
+                        status_bar_data_.battery_vertical, bar_ink, alert_ink);
         right_x = battery_x - 8;
     }
 
-    // Time on right side
+    // The clock keeps its slot but is not drawn. Minute refreshes are off
+    // (kEnableMinuteClockRefresh), so a visible time would be stale from the
+    // first minute on; it used to be drawn in the accent token's white text
+    // colour, which made it invisible on the white bar anyway.
     const int clock_w = MiniTimeWidth(time_str);
-    DrawMiniTimeText(fb, width, right_x - clock_w, center_y - 5, time_str, accent_style.fg);
     right_x = right_x - clock_w - 6;
 
     const char* title = !status_bar_data_.central_text.empty()
@@ -1400,7 +1425,7 @@ void RawDrawUiManager::DrawStatusBar(uint8_t* fb, int width, int height) {
 bool RawDrawUiManager::HandleQuickSwitchInput(const rawdraw::ButtonEvent& event) {
     if (!quick_switch_open_) return false;
     const auto& items = GetQuickSwitchItems();
-    const int kVisibleCount = 5;
+    const int kVisibleCount = kQuickSwitchVisibleRows;
     const int total = static_cast<int>(items.size());
     switch (event.type) {
         case rawdraw::ButtonEvent::kUpClick:
@@ -1441,117 +1466,91 @@ bool RawDrawUiManager::HandleQuickSwitchInput(const rawdraw::ButtonEvent& event)
 }
 
 void RawDrawUiManager::DrawQuickSwitchOverlay(uint8_t* fb, int width, int height) {
+    // The overlay is a menu even when it opens over a photo, so it always uses
+    // the interactive palette: it reads the same in the fast preview.
+    rawdraw::ScopedThemeSurface surface(rawdraw::ThemeSurface::Interactive);
     const auto& items = GetQuickSwitchItems();
     const rawdraw::Rect overlay = GetQuickSwitchBounds();
-    const int overlay_x = overlay.x;
-    const int overlay_y = overlay.y;
-    const int overlay_w = overlay.w;
-    const int overlay_h = overlay.h;
-    const int titlebar_h = 28;
-    const int shadow_offset = 2;
-    const int item_h = 24;
-    const int item_gap = 3;
+    const int titlebar_h = 40;
+    const int item_h = 36;
+    const int item_gap = 4;
+    const int footer_h = 28;
     const lv_font_t* font = &SourceHanSansSC_Regular_slim;
-    const lv_font_t* title_font = &SourceHanSansSC_Regular_slim;
+    const lv_font_t* title_font = &SourceHanSansSC_Medium_slim;
     const auto& theme = rawdraw::ThemeManager::Get();
-    const rawdraw::PaintStyle modal_style = theme.Component(rawdraw::ComponentRole::Modal);
+    const rawdraw::Color paper = theme.Style(rawdraw::ThemeToken::BackgroundPrimary).bg;
+    const rawdraw::Color ink = theme.Style(rawdraw::ThemeToken::TextPrimary).fg;
     const rawdraw::PaintStyle selected_style = theme.Component(rawdraw::ComponentRole::QuickSwitchRow);
-    const rawdraw::PaintStyle text_style = theme.Style(rawdraw::ThemeToken::TextPrimary);
-    const rawdraw::PaintStyle border_style = theme.Style(rawdraw::ThemeToken::Border);
-    const rawdraw::PaintStyle shadow_style = theme.Style(rawdraw::ThemeToken::Shadow);
 
-    // Macintosh-style modal: solid offset shadow first, then a clean white
-    // surface. This mirrors the Settings/About dialog and leaves only a 2px
-    // right/bottom shadow visible, with no white gap between layers.
-    rawdraw::DrawStyledRoundRect(fb, width, height,
-                                 {overlay_x + shadow_offset, overlay_y + shadow_offset, overlay_w, overlay_h},
-                                 Style::kBorderRadiusMD, shadow_style);
-    rawdraw::DrawStyledRoundRect(fb, width, height, {overlay_x, overlay_y, overlay_w, overlay_h},
-                                 Style::kBorderRadiusMD, modal_style);
+    // A paper margin keeps photo pixels off the card edge, then one 2 px edge.
+    rawdraw::DrawRoundRect(fb, width, height,
+                           {overlay.x - 4, overlay.y - 4, overlay.w + 8, overlay.h + 8}, 16,
+                           paper, paper, 1);
+    rawdraw::DrawRoundRect(fb, width, height, overlay, 12, paper, ink, 2);
+
     const char* title = "快速切换";
-    const int title_w = rawdraw::MeasureTextWidth(title, title_font);
-    rawdraw::DrawStyledText(fb, width, overlay_x + (overlay_w - title_w) / 2,
-                            rawdraw::InkCenteredTextTopYInBox(title_font, title, overlay_y, titlebar_h, 0),
-                            title, title_font, text_style, height);
-    rawdraw::DrawHLine(fb, width, overlay_y + titlebar_h, overlay_x + 1, overlay_x + overlay_w - 2, border_style.border);
-    for (int yy = overlay_y + 6; yy < overlay_y + titlebar_h - 5; yy += 4) {
-        rawdraw::DrawHLine(fb, width, yy, overlay_x + 14, overlay_x + (overlay_w - title_w) / 2 - 8, border_style.border);
-        rawdraw::DrawHLine(fb, width, yy, overlay_x + (overlay_w + title_w) / 2 + 8, overlay_x + overlay_w - 14, border_style.border);
-    }
+    rawdraw::DrawText(fb, width, overlay.x + 16,
+                      rawdraw::InkCenteredTextTopYInBox(title_font, title, overlay.y + 4,
+                                                        titlebar_h - 4, 0),
+                      title, title_font, ink, height);
 
-    int y = overlay_y + titlebar_h + 10;
-    const int kVisibleCount = 5;
+    int y = overlay.y + titlebar_h + 4;
+    const int kVisibleCount = kQuickSwitchVisibleRows;
     const int total = static_cast<int>(items.size());
-    // Render only visible items
     for (int vi = 0; vi < kVisibleCount; ++vi) {
-        int i = quick_switch_first_visible_ + vi;
+        const int i = quick_switch_first_visible_ + vi;
         if (i >= total) break;
         const bool selected = i == quick_switch_index_;
-        const int row_x = overlay_x + 12;
-        const int row_w = overlay_w - 24 - 10;  // Leave space for scrollbar
-        const rawdraw::PaintStyle row_style = selected ? selected_style : modal_style;
+        const rawdraw::Rect row{overlay.x + 10, y, overlay.w - 20, item_h};
+        const rawdraw::Color fg = selected ? selected_style.fg : ink;
         if (selected) {
-            rawdraw::DrawStyledRoundRect(fb, width, height, {row_x, y, row_w, item_h},
-                                         Style::kBorderRadiusMD, row_style);
-            rawdraw::DrawRect(fb, width, {row_x + 5, y + 6, 3, item_h - 12}, row_style.border);
-        } else {
-            rawdraw::DrawStyledRoundRect(fb, width, height, {row_x, y, row_w, item_h},
-                                         Style::kBorderRadiusMD, row_style);
+            rawdraw::DrawRoundRect(fb, width, height, row, 10, selected_style.bg,
+                                   selected_style.bg, 1);
+            rawdraw::DrawRect(fb, width, {row.x + 6, row.y + item_h / 2 - 7, 3, 14},
+                              selected_style.border);
         }
-        // Draw icon (if present) + label
-        const lv_font_t* icon_font = &fa_settings_16;
-        const int icon_gap = 6;
-        const int text_start_x = row_x + 18;
-        const rawdraw::Color text_color = row_style.fg;
-        
+        const int center_y = row.y + item_h / 2;
+        int label_x = row.x + 18;
         if (items[i].icon && items[i].icon[0] != '\0') {
-            // Draw icon first
-            const int icon_x = text_start_x;
-            const int icon_y = rawdraw::InkCenteredTextTopYInBox(icon_font, items[i].icon, y, item_h, 0);
-            rawdraw::DrawText(fb, width, icon_x, icon_y, items[i].icon, icon_font, text_color, height);
-            
-            // Draw label after icon with gap
-            const int icon_w = rawdraw::MeasureTextWidth(items[i].icon, icon_font);
-            const int label_x = icon_x + icon_w + icon_gap;
-            const int label_y = rawdraw::InkCenteredTextTopYInBox(font, items[i].label, y, item_h, 0);
-            rawdraw::DrawText(fb, width, label_x, label_y, items[i].label, font, text_color, height);
-        } else {
-            // No icon, draw label directly
-            rawdraw::DrawText(fb, width, text_start_x,
-                              rawdraw::InkCenteredTextTopYInBox(font, items[i].label, y, item_h, 0),
-                              items[i].label, font, text_color, height);
+            rawdraw::DrawText(fb, width, label_x,
+                              rawdraw::InkCenteredTextTopY(&fa_settings_16, items[i].icon,
+                                                           center_y, 0),
+                              items[i].icon, &fa_settings_16, fg, height);
+            label_x += 26;
         }
+        rawdraw::DrawText(fb, width, label_x,
+                          rawdraw::InkCenteredTextTopY(font, items[i].label, center_y, 0),
+                          items[i].label, font, fg, height);
         y += item_h + item_gap;
     }
 
-    // Scrollbar (only when items exceed visible count)
     if (total > kVisibleCount) {
-        const int sb_w = 4;
-        const int sb_x = overlay_x + overlay_w - 14;
-        const int sb_top = overlay_y + titlebar_h + 10;
-        const int sb_bottom = overlay_y + overlay_h - 28;
-        const int sb_track_h = sb_bottom - sb_top;
-
-        // Track
-        rawdraw::DrawStyledRect(fb, width, {sb_x, sb_top, sb_w, sb_track_h}, modal_style);
-        rawdraw::DrawRectBorder(fb, width, {sb_x, sb_top, sb_w, sb_track_h}, 1, border_style.border);
-
-        // Thumb
-        const int thumb_h = std::max(8, sb_track_h * kVisibleCount / total);
+        const int sb_top = overlay.y + titlebar_h + 4;
+        const int sb_h = kVisibleCount * (item_h + item_gap) - item_gap;
+        const int thumb_h = std::max(8, sb_h * kVisibleCount / total);
         const int max_scroll = std::max(1, total - kVisibleCount);
-        const int thumb_y = sb_top + (sb_track_h - thumb_h) * quick_switch_first_visible_ / max_scroll;
-        rawdraw::DrawRect(fb, width, {sb_x, thumb_y, sb_w, thumb_h}, selected_style.border);
+        const int thumb_y = sb_top + (sb_h - thumb_h) * quick_switch_first_visible_ / max_scroll;
+        rawdraw::DrawRect(fb, width, {overlay.x + overlay.w - 6, thumb_y, 2, thumb_h}, ink);
     }
 
-    rawdraw::DrawHLine(fb, width, overlay_y + overlay_h - 24, overlay_x + 14, overlay_x + overlay_w - 14, border_style.border);
-    rawdraw::DrawStyledText(fb, width, overlay_x + 18,
-                            rawdraw::InkCenteredTextTopYInBox(font, "UP/DN 选择  BOOT 进入", overlay_y + overlay_h - 24, 24, 0),
-                            "UP/DN 选择  BOOT 进入", font, text_style, height);
+    const int footer_top = overlay.y + overlay.h - footer_h;
+    for (int x = overlay.x + 12; x <= overlay.x + overlay.w - 12; x += 2) {
+        rawdraw::set_pixel(fb, width, x, footer_top, ink);
+    }
+    const char* hint = "UP/DN 选择  BOOT 进入";
+    rawdraw::DrawText(fb, width, overlay.x + 16,
+                      rawdraw::InkCenteredTextTopYInBox(font, hint, footer_top + 1, footer_h - 3, 0),
+                      hint, font, ink, height);
 }
 
 rawdraw::Rect RawDrawUiManager::GetQuickSwitchBounds() const {
+    // Sized to its rows (title 44 + rows of 40 + footer 32), so two entries
+    // do not leave half the card empty. DrawQuickSwitchOverlay() uses the
+    // same metrics.
+    const int rows = std::min<int>(kQuickSwitchVisibleRows,
+                                   static_cast<int>(GetQuickSwitchItems().size()));
     const int overlay_w = 224;
-    const int overlay_h = 204;
+    const int overlay_h = 44 + rows * 40 + 32;
     return {(width_ - overlay_w) / 2, Style::kStatusBarHeight + 26, overlay_w, overlay_h};
 }
 
@@ -1685,7 +1684,7 @@ bool RawDrawUiManager::PrepareGallerySlideshowFrame(int retained_index, bool adv
         ESP_LOGI(kTag, "Slideshow has nothing to advance to; frame left as is");
         return false;
     }
-    current_page_ = RawDrawPageId::Gallery;
+    SetCurrentPageId(RawDrawPageId::Gallery);
     current_state_matches_display_ = true;
     // Select the photo to show before entering fullscreen. Entering on the
     // retained photo loaded it from SPIFFS -- a name scan plus a 30 KB read,
@@ -1720,7 +1719,7 @@ bool RawDrawUiManager::PrepareGalleryInteractiveWakeFrame(
     if (!photo_gallery_renderer_) {
         return false;
     }
-    current_page_ = RawDrawPageId::Gallery;
+    SetCurrentPageId(RawDrawPageId::Gallery);
     current_state_matches_display_ = true;
     photo_gallery_renderer_->SetSelectedIndex(retained_index);
     if (retained_fullscreen &&

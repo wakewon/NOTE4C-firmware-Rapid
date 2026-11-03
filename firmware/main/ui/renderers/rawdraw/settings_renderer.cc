@@ -46,48 +46,80 @@ namespace rawdraw {
 
 namespace {
 
-constexpr const char* kIconSync = "\xee\xa4\x93";
-constexpr const char* kIconWifi = "\xee\xa4\x8e";
-constexpr const char* kIconSetting = "\xee\xa4\x8d";
-constexpr const char* kIconSpeaker = "\xee\xa4\x89";
-constexpr const char* kIconBluetooth = "\xef\x8a\x93";  // U+F293 Bluetooth-b
-
 // ---------------------------------------------------------------------------
-// Settings page layout tuning (single source of truth)
-// Adjust these values first when fine-tuning visual density/alignment.
+// Settings page layout (400x300): status bar, a tab strip with one tab per
+// section, full-width option rows, and a key-hint footer. One source of truth
+// for the geometry; the dialogs below keep their own.
 // ---------------------------------------------------------------------------
-constexpr int kCardHeightShrinkPx = 7;      // Smaller cards: subtract from slot height
-constexpr int kCardBodyTopInset = 4;        // Content safe inset from card top
-constexpr int kCardBodyBottomInset = 4;     // Content safe inset from card bottom
-constexpr int kTextOpticalNudgeY = 0;       // Extra text nudge after ink-box centering
-constexpr int kIconOpticalNudgeY = 0;       // Extra icon nudge after baseline compensation
-constexpr int kValueOpticalNudgeY = 0;      // Extra value nudge after baseline compensation
+constexpr int kPageMarginX = 12;
+constexpr int kTabTop = Style::kStatusBarHeight + 4;
+constexpr int kTabH = 32;
+constexpr int kTabRuleY = kTabTop + kTabH;      // hairline under the tabs
+constexpr int kListTop = kTabRuleY + 7;
+constexpr int kRowH = 44;
+constexpr int kRowRadius = 10;
+constexpr int kInfoRowH = 30;
+constexpr int kFooterH = 24;
+constexpr int kToggleW = 40;
+constexpr int kToggleH = 22;
 constexpr int kVolumeDialogClearPad = 0;    // Clear mask tightly follows dialog border
 constexpr int kAboutRowHeight = 24;         // About dialog info row height
 constexpr int kAboutRowGap = 8;             // About dialog row spacing
 constexpr int kDialogClearPad = 0;          // Local clear pad around modal dialogs
 constexpr int kDialogClearRadiusBoost = 0;  // Clear radius equals dialog radius
 constexpr int kCategoryHintDurationUs = 2 * 1000 * 1000;
-constexpr int kSettingsNavDividerX = 90;
-constexpr int kSettingsNavItemH = 44;
-constexpr int kSettingsTableRowH = 34;
-// Settings content starts immediately below the global status/menu bar.
-// Keep this small so the 400x300 screen can show five compact rows without
-// visually drifting into the bottom shell area.
-constexpr int kSettingsContentTopGap = 8;
-constexpr int kSettingsTableTop = Style::kStatusBarHeight + kSettingsContentTopGap;
-// Diagnostic overlay for real-device layout calibration.
-// Set to false, or comment out the DrawSettingsLayoutDebugOverlay() call near
-// the end of SettingsRenderer::Render(), to remove this extra top layer.
-constexpr bool kSettingsLayoutDebugOverlayEnabled = false;
+
+// Fontawesome glyphs present in fa_settings_16. Spelled out rather than taken
+// from fa_settings.h, whose FA_SETTINGS_LINK encodes U+F301 instead of U+F0C1.
+constexpr const char* kFaGear = "\xef\x80\x93";       // U+F013
+constexpr const char* kFaImage = "\xef\x80\xbe";      // U+F03E
+constexpr const char* kFaWifi = "\xef\x87\xab";       // U+F1EB
+constexpr const char* kFaInfo = "\xef\x81\x9a";       // U+F05A
+constexpr const char* kFaPower = "\xef\x80\x91";      // U+F011
+constexpr const char* kFaClock = "\xef\x80\x97";      // U+F017
+constexpr const char* kFaSync = "\xef\x80\xa1";       // U+F021
+constexpr const char* kFaServer = "\xef\x88\xb3";     // U+F233
+constexpr const char* kFaMarker = "\xef\x81\x81";     // U+F041
+constexpr const char* kFaVolume = "\xef\x80\xa8";     // U+F028
+constexpr const char* kFaBattery = "\xef\x89\x80";    // U+F240
+constexpr const char* kFaDatabase = "\xef\x87\x80";   // U+F1C0
+constexpr const char* kFaCalendar = "\xef\x81\xb3";   // U+F073
+constexpr const char* kFaComment = "\xef\x81\xb5";    // U+F075
+constexpr const char* kFaWrench = "\xef\x82\xad";     // U+F0AD
+
+const char* SettingsIconFor(const std::string& label) {
+    struct Entry { const char* label; const char* icon; };
+    static const Entry kIcons[] = {
+        {"系统", kFaGear},       {"相册", kFaImage},      {"网络", kFaWifi},
+        {"关于", kFaInfo},       {"重启", kFaPower},      {"关机", kFaPower},
+        {"轮播间隔", kFaClock},  {"定时联网", kFaSync},   {"Wi-Fi", kFaWifi},
+        {"局域网服务", kFaServer}, {"局域网IP", kFaMarker}, {"固件", kFaInfo},
+        {"音量", kFaVolume},     {"电池方向", kFaBattery}, {"存储", kFaDatabase},
+        {"存储空间", kFaDatabase}, {"日期格式", kFaCalendar}, {"同步间隔", kFaSync},
+        {"AI对话长度", kFaComment}, {"服务", kFaServer},   {"服务地址", kFaMarker},
+        {"功能", kFaWrench},     {"时钟显示", kFaClock},
+    };
+    for (const auto& e : kIcons) {
+        if (label == e.label) return e.icon;
+    }
+    return kFaInfo;
+}
+
+bool IsDangerAction(const std::string& label) {
+    return label == "重启" || label == "关机";
+}
+
+// Interactive pages are yellow paper; display pages white. Semantic ink is
+// whatever part of the style differs from the paper.
+Color PaperColor() {
+    return ThemeManager::Get().Style(ThemeToken::BackgroundPrimary).bg;
+}
 
 Color TokenInkOnPaper(ThemeToken token) {
     const PaintStyle style = ThemeManager::Get().Style(token);
-    // Accent/Danger/Progress tokens are full paint styles: fg is intended for
-    // text drawn on their colored bg. On white paper, the visible semantic ink
-    // is the colored bg/border instead.
-    if (style.bg != WHITE) return style.bg;
-    if (style.border != WHITE) return style.border;
+    const Color paper = PaperColor();
+    if (style.bg != paper) return style.bg;
+    if (style.border != paper) return style.border;
     return style.fg;
 }
 
@@ -118,20 +150,6 @@ std::string FitTextToWidth(const std::string& text, const lv_font_t* font, int m
     return fitted;
 }
 
-[[maybe_unused]] int CalcTextBaselineY(const lv_font_t* font, int center_y, int visual_offset = 0) {
-    if (!font) return center_y;
-    return center_y +
-           (static_cast<int>(font->base_line) - static_cast<int>(font->line_height) / 2) +
-           Style::kSettingsContentOffsetY +
-           Style::kVisualTextOffset +
-           visual_offset;
-}
-
-[[maybe_unused]] int TopYFromBaseline(const lv_font_t* font, int baseline_y) {
-    if (!font) return baseline_y;
-    return baseline_y - static_cast<int>(font->base_line);
-}
-
 void ClearDialogRegionRounded(uint8_t* fb, int width, int height,
                               int x, int y, int w, int h, int radius, int pad) {
     DrawStyledRoundRect(fb, width, height,
@@ -140,124 +158,56 @@ void ClearDialogRegionRounded(uint8_t* fb, int width, int height,
                         ThemeManager::Get().Style(ThemeToken::BackgroundPrimary));
 }
 
-[[maybe_unused]] void DrawSettingsVectorIcon(uint8_t* fb, int width, const std::string& label,
-                                             int x, int center_y, Color color) {
-    // FontAwesome 16px icons from fa_settings_16 font
-    // Map label to FA Unicode character
-    const char* icon_char = nullptr;
-    
-    if (label == "系统") {
-        icon_char = "\xef\x80\x93";  // U+F013 gear
-    } else if (label == "网络" || label == "Wi-Fi") {
-        icon_char = "\xef\x87\xab";  // U+F1EB wifi
-    } else if (label == "功能" || label == "语音唤醒") {
-        icon_char = "\xef\x82\xad";  // U+F0AD wrench
-    } else if (label == "时钟显示") {
-        icon_char = "\xef\x80\x97";  // U+F017 clock
-    } else if (label == "存储" || label == "存储空间") {
-        icon_char = "\xef\x87\x80";  // U+F1C0 database
-    } else if (label == "关于") {
-        icon_char = "\xef\x81\x9a";  // U+F05A info-circle
-    } else if (label == "音量") {
-        icon_char = "\xef\x80\xa8";  // U+F028 volume-up
-    } else if (label == "电池方向") {
-        icon_char = "\xef\x89\x80";  // U+F240 battery-full
-    } else if (label == "重启") {
-        icon_char = "\xef\x80\xa1";  // U+F021 sync/refresh (旋转)
-    } else if (label == "关机") {
-        icon_char = "\xef\x80\x91";  // U+F011 power-off
-    } else if (label == "日期格式") {
-        icon_char = "\xef\x81\xb3";  // U+F073 calendar
-    } else if (label == "AI对话长度") {
-        icon_char = "\xef\x81\xb5";  // U+F075 comment
-    } else if (label == "同步间隔" || label == "同步记录") {
-        icon_char = "\xef\x80\xa1";  // U+F021 sync/refresh
-    } else if (label == "服务") {
-        icon_char = "\xef\x88\xb3";  // U+F233 server
-    } else if (label == "服务地址") {
-        icon_char = "\xef\x81\x81";  // U+F041 map-marker (定位)
-    } else if (label == "蓝牙") {
-        icon_char = kIconBluetooth;
+void DrawIconCentered(uint8_t* fb, int width, int x, int center_y, const char* icon,
+                      Color color) {
+    DrawText(fb, width, x, InkCenteredTextTopY(&fa_settings_16, icon, center_y, 0), icon,
+             &fa_settings_16, color);
+}
+
+// Every other pixel: a separator that reads as a hairline rather than a rule.
+void DrawDottedHLine(uint8_t* fb, int width, int y, int x1, int x2, Color color) {
+    for (int x = x1; x <= x2; x += 2) {
+        set_pixel(fb, width, x, y, color);
+    }
+}
+
+// Toggle switch. ON fills the track with the accent; on a selected (ink) row
+// the track keeps a paper-coloured outline so it stays readable when the fast
+// refresh draws the accent as black on the black row.
+void DrawToggle(uint8_t* fb, int width, int height, int x, int center_y, bool on,
+                Color ink, Color row_bg, Color accent) {
+    const Rect track{x, center_y - kToggleH / 2, kToggleW, kToggleH};
+    const int radius = kToggleH / 2;
+    const int knob_r = radius - 4;
+    if (on) {
+        DrawRoundRect(fb, width, height, track, radius, accent,
+                      row_bg == PaperColor() ? accent : ink, 2);
+        DrawCircle(fb, width, {track.x + track.w - radius, center_y}, knob_r,
+                   row_bg == PaperColor() ? row_bg : ink);
     } else {
-        icon_char = "\xef\x81\x9a";  // fallback: info-circle
-    }
-    
-    // Use ink-box centering (baseline math) for icon positioning
-    // Same as text - icon glyphs have box_h/ofs_y that differ from line_height
-    const int top_y = InkCenteredTextTopY(&fa_settings_16, icon_char, center_y, 0);
-    DrawText(fb, width, x, top_y, icon_char, &fa_settings_16, color);
-}
-
-void DrawDebugDashedHLine(uint8_t* fb, int width, int y, int x1, int x2, Color color) {
-    for (int x = x1; x <= x2; x += 4) {
-        set_pixel(fb, width, x, y, color);
-        if (x + 1 <= x2) set_pixel(fb, width, x + 1, y, color);
+        DrawRoundRect(fb, width, height, track, radius, row_bg, ink, 2);
+        DrawCircle(fb, width, {track.x + radius, center_y}, knob_r, ink);
     }
 }
 
-void DrawDebugDashedVLine(uint8_t* fb, int width, int x, int y1, int y2, Color color) {
-    for (int y = y1; y <= y2; y += 4) {
-        set_pixel(fb, width, x, y, color);
-        if (y + 1 <= y2) set_pixel(fb, width, x, y + 1, color);
+// Two-pixel chevron, 5 px wide and 9 px tall, with its tip at (x + 4, cy).
+void DrawChevronMark(uint8_t* fb, int width, int x, int center_y, Color color) {
+    for (int t = 0; t < 2; ++t) {
+        DrawLine(fb, width, {x + t, center_y - 4}, {x + 4 + t, center_y}, color);
+        DrawLine(fb, width, {x + 4 + t, center_y}, {x + t, center_y + 4}, color);
     }
 }
 
-void DrawSettingsLayoutDebugOverlay(uint8_t* fb,
-                                    int width,
-                                    int height,
-                                    const lv_font_t* font,
-                                    int body_top,
-                                    int body_bottom,
-                                    int nav_top,
-                                    int current_section_pos,
-                                    int content_x,
-                                    int content_right,
-                                    int row_h,
-                                    int visible_row_count) {
-    if (!fb || !font || width <= 0 || height <= 0) return;
-    const Color debug_color = ThemeManager::Get().ColorFor(ThemeToken::Focus);
-
-    // Extra top layer only: this does not change layout inputs.
-    // H-- labels show computed heights. Dashed lines show expected centerlines.
-    const int value_x = content_x + 112;
-    const int nav_pill_x = 16;
-    const int nav_pill_w = kSettingsNavDividerX - 26;
-    const int nav_pill_h = 28;
-    const int selected_nav_y = nav_top + current_section_pos * kSettingsNavItemH;
-    const int selected_pill_y = selected_nav_y + (kSettingsNavItemH - nav_pill_h) / 2;
-
-    DrawRectBorder(fb, width, {nav_pill_x, selected_pill_y, nav_pill_w, nav_pill_h}, 1, debug_color);
-    DrawDebugDashedHLine(fb, width, selected_nav_y + kSettingsNavItemH / 2,
-                         nav_pill_x, kSettingsNavDividerX - 6, debug_color);
-    DrawText(fb, width, 2, selected_nav_y + 2, "H=44", font, debug_color, height);
-    DrawText(fb, width, 2, selected_pill_y + nav_pill_h + 1, "P=28", font, debug_color, height);
-
-    DrawDebugDashedVLine(fb, width, kSettingsNavDividerX, body_top + 28, body_bottom, debug_color);
-    DrawText(fb, width, kSettingsNavDividerX + 2, body_top + 24, "x=90", font, debug_color, height);
-
-    DrawDebugDashedVLine(fb, width, content_x, body_top + 28, body_bottom, debug_color);
-    DrawDebugDashedVLine(fb, width, value_x, body_top + 28, body_bottom, debug_color);
-    DrawDebugDashedVLine(fb, width, content_right, body_top + 28, body_bottom, debug_color);
-    DrawText(fb, width, content_x + 2, body_top + 24, "label", font, debug_color, height);
-    DrawText(fb, width, value_x + 2, body_top + 24, "value", font, debug_color, height);
-
-    const int rows = std::max(1, visible_row_count);
-    for (int i = 0; i < rows; ++i) {
-        const int row_y = kSettingsTableTop + i * row_h;
-        const int center_y = row_y + row_h / 2;
-        DrawRectBorder(fb, width, {content_x - 4, row_y, content_right - content_x + 4, row_h}, 1, debug_color);
-        DrawDebugDashedHLine(fb, width, center_y, content_x - 6, content_right, debug_color);
-        if (i == 0) {
-            char buf[32];
-            snprintf(buf, sizeof(buf), "H=%d row", row_h);
-            DrawText(fb, width, content_right - 62, row_y + 2, buf, font, debug_color, height);
-        }
+void DrawKeyHints(uint8_t* fb, int width, int height, const lv_font_t* font,
+                  const char* left, const char* right, Color ink) {
+    const int top = height - kFooterH - 2;
+    DrawDottedHLine(fb, width, top, kPageMarginX + 4, width - kPageMarginX - 4, ink);
+    const int y = InkCenteredTextTopYInBox(font, left, top + 1, kFooterH, 0);
+    DrawText(fb, width, kPageMarginX + 4, y, left, font, ink, height);
+    if (right && right[0]) {
+        const int rw = MeasureTextWidth(right, font);
+        DrawText(fb, width, width - kPageMarginX - 4 - rw, y, right, font, ink, height);
     }
-
-    char calc_buf[64];
-    snprintf(calc_buf, sizeof(calc_buf), "rowY=%d+i*%d center=rowY+%d",
-             kSettingsTableTop, row_h, row_h / 2);
-    DrawText(fb, width, 94, body_bottom - 18, calc_buf, font, debug_color, height);
 }
 
 }  // namespace
@@ -446,18 +396,12 @@ void SettingsRenderer::Render(uint8_t* fb, int width, int height) {
     EnsureSelectionVisible();
     const auto& theme = ThemeManager::Get();
     const PaintStyle bg_style = theme.Style(ThemeToken::BackgroundPrimary);
-    const PaintStyle text_style = theme.Style(ThemeToken::TextPrimary);
-    const PaintStyle border_style = theme.Style(ThemeToken::Border);
     const PaintStyle selected_style = theme.Component(ComponentRole::SettingsSelected);
+    const Color ink = theme.Style(ThemeToken::TextPrimary).fg;
+    const Color accent = TokenInkOnPaper(ThemeToken::Accent);
     const int body_top = Style::kStatusBarHeight;
-    const int body_bottom = height - 3;
-    const int content_x = kSettingsNavDividerX + 16;
-    const int content_right = width - 20;
-    const int row_h = kSettingsTableRowH;
 
-    DrawStyledRect(fb, width, {0, body_top, width, body_bottom - body_top}, bg_style);
-    DrawVLine(fb, width, kSettingsNavDividerX,
-              body_top + kSettingsContentTopGap, body_bottom - 1, border_style.border);
+    DrawStyledRect(fb, width, {0, body_top, width, height - body_top}, bg_style);
 
     std::vector<int> section_indices;
     for (int i = 0; i < static_cast<int>(items_.size()); ++i) {
@@ -469,54 +413,55 @@ void SettingsRenderer::Render(uint8_t* fb, int width, int height) {
     for (int i = 0; i < static_cast<int>(section_indices.size()); ++i) {
         if (section_indices[i] <= selected_index_) current_section_pos = i;
     }
+    auto section_label = [&](int pos) -> const char* {
+        return section_indices[pos] >= 0 ? items_[section_indices[pos]].label.c_str() : "系统";
+    };
+    const char* current_section = section_label(current_section_pos);
 
-    const char* current_section = (section_indices[current_section_pos] >= 0)
-        ? items_[section_indices[current_section_pos]].label.c_str()
-        : "系统";
-
-    const int nav_top = body_top + kSettingsContentTopGap;
-    for (int i = 0; i < static_cast<int>(section_indices.size()); ++i) {
-        const int sy = nav_top + i * kSettingsNavItemH;
-        const bool selected = (i == current_section_pos);
-        const char* label = (section_indices[i] >= 0) ? items_[section_indices[i]].label.c_str() : "系统";
-        const int nav_pill_x = 16;
-        const int nav_pill_w = kSettingsNavDividerX - 26;
-        const int nav_pill_h = 28;
-        const int nav_pill_y = sy + (kSettingsNavItemH - nav_pill_h) / 2;
-        const int icon_x = nav_pill_x + 7;
-        const int icon_center_y = sy + kSettingsNavItemH / 2;  // Same center as label
-        const int label_x = nav_pill_x + 27;
-        const int label_y = InkCenteredTextTopY(font_, label, icon_center_y, kTextOpticalNudgeY);
-        if (selected) {
-            DrawStyledRoundRect(fb, width, height, {nav_pill_x, nav_pill_y, nav_pill_w, nav_pill_h},
-                                Style::kBorderRadiusMD, selected_style);
+    // --- Tab strip: icon + label per section, the current one underlined in
+    // the accent. The underline turns black in the fast preview, which still
+    // marks the tab; there is no filled tab, so the strip stays light.
+    const int tab_count = static_cast<int>(section_indices.size());
+    const int strip_w = width - kPageMarginX * 2;
+    const int tab_w = strip_w / std::max(1, tab_count);
+    const int tab_center_y = kTabTop + kTabH / 2 - 1;
+    for (int i = 0; i < tab_count; ++i) {
+        const char* label = section_label(i);
+        const char* icon = SettingsIconFor(label);
+        const int icon_w = MeasureTextWidth(icon, &fa_settings_16);
+        const int label_w = MeasureTextWidth(label, font_);
+        const int content_w = icon_w + 6 + label_w;
+        const int tab_x = kPageMarginX + i * tab_w;
+        const int cx = tab_x + (tab_w - content_w) / 2;
+        DrawIconCentered(fb, width, cx, tab_center_y, icon, ink);
+        DrawText(fb, width, cx + icon_w + 6,
+                 InkCenteredTextTopY(font_, label, tab_center_y, 0), label, font_, ink);
+        if (i == current_section_pos) {
+            DrawRect(fb, width, {cx - 4, kTabRuleY - 3, content_w + 8, 4}, accent);
         }
-        const Color nav_fg = selected ? selected_style.fg : text_style.fg;
-        DrawSettingsVectorIcon(fb, width, label, icon_x, icon_center_y, nav_fg);
-        DrawText(fb, width, std::max(2, label_x), std::max(body_top + 2, label_y),
-                 label, font_, nav_fg);
     }
+    DrawHLine(fb, width, kTabRuleY, kPageMarginX, width - kPageMarginX - 1, ink);
 
     const int section_start = section_indices[current_section_pos] + 1;
-    const int section_end = (current_section_pos + 1 < static_cast<int>(section_indices.size()))
+    const int section_end = (current_section_pos + 1 < tab_count)
         ? section_indices[current_section_pos + 1]
         : static_cast<int>(items_.size());
-
     std::vector<int> option_indices;
     for (int i = section_start; i < section_end; ++i) {
         if (items_[i].type != SettingsItemType::Section) option_indices.push_back(i);
     }
 
+    const int list_bottom = height - kFooterH - 6;
     const bool about_section = std::string(current_section) == "关于";
-    int debug_visible_row_count = 0;
     if (about_section) {
+        const std::string version = firmware_version_.empty() ? "未知" : firmware_version_;
+        const std::string serial = mac_address_.empty() ? "未读取" : mac_address_;
+        int y = kListTop;
         struct InfoRow {
             const char* label;
             std::string value;
         };
-        const std::string version = firmware_version_.empty() ? "未知" : firmware_version_;
-        const std::string serial = mac_address_.empty() ? "未读取" : mac_address_;
-        const std::vector<InfoRow> rows = {
+        const InfoRow rows[] = {
             {"设备名称", "notellm"},
             {"型号", "Youn-Beta1.0"},
             {"固件版本", version},
@@ -524,56 +469,65 @@ void SettingsRenderer::Render(uint8_t* fb, int width, int height) {
             {"序列号", serial},
             {"官方网站", "blog.lazyyoun.xyz"},
         };
-        debug_visible_row_count = static_cast<int>(rows.size());
-        int y = kSettingsTableTop;
+        bool first = true;
         for (const auto& row : rows) {
-            const int center_y = y + row_h / 2;
-            const int label_x = content_x;
-            DrawStyledText(fb, width, label_x, InkCenteredTextTopY(font_, row.label, center_y, kTextOpticalNudgeY),
-                           row.label, font_, text_style);
-            const std::string value = FitTextToWidth(row.value, value_font_,
-                std::max(0, content_right - (label_x + 112)));
+            if (y + kInfoRowH > list_bottom) break;
+            if (!first) {
+                DrawDottedHLine(fb, width, y, kPageMarginX + 4, width - kPageMarginX - 4, ink);
+            }
+            first = false;
+            const int center_y = y + kInfoRowH / 2;
+            DrawText(fb, width, kPageMarginX + 4,
+                     InkCenteredTextTopY(font_, row.label, center_y, 0), row.label, font_, ink);
+            const std::string value = FitTextToWidth(row.value, value_font_, width / 2);
             const int value_w = MeasureTextWidth(value.c_str(), value_font_);
-            DrawStyledText(fb, width, content_right - value_w,
-                           InkCenteredTextTopY(value_font_, value.c_str(), center_y, kValueOpticalNudgeY),
-                           value.c_str(), value_font_, text_style);
-            y += row_h;
+            DrawText(fb, width, width - kPageMarginX - 4 - value_w,
+                     InkCenteredTextTopY(value_font_, value.c_str(), center_y, 0),
+                     value.c_str(), value_font_, ink);
+            y += kInfoRowH;
         }
     } else {
         int selected_pos = 0;
         for (int i = 0; i < static_cast<int>(option_indices.size()); ++i) {
             if (option_indices[i] == selected_index_) selected_pos = i;
         }
-        const int visible_count = std::min(kVisibleOptionCount, static_cast<int>(option_indices.size()));
+        const int total = static_cast<int>(option_indices.size());
+        const int visible_count = std::min(kVisibleOptionCount, total);
         int window_start = std::max(0, selected_pos - visible_count / 2);
-        if (window_start + visible_count > static_cast<int>(option_indices.size())) {
-            window_start = std::max(0, static_cast<int>(option_indices.size()) - visible_count);
+        if (window_start + visible_count > total) {
+            window_start = std::max(0, total - visible_count);
         }
-        debug_visible_row_count = visible_count;
-        int y = kSettingsTableTop;
-        const int available_h = std::max(row_h, body_bottom - kSettingsTableTop - 2);
-        // Right-side settings rows are intentionally denser than the historical
-        // five-row layout. 8 rows fit by sharing the available pane height, and
-        // scrolling only starts once a section has more than eight options.
-        const int option_row_h = std::min(row_h, std::max(28, available_h / std::max(1, visible_count)));
+        int y = kListTop;
         for (int i = 0; i < visible_count; ++i) {
             const int item_index = option_indices[window_start + i];
-            RenderItem(fb, width, y, content_x, item_index, item_index == selected_index_, option_row_h);
-            y += option_row_h;
+            const bool selected = item_index == selected_index_;
+            const bool next_selected = (i + 1 < visible_count) &&
+                                       option_indices[window_start + i + 1] == selected_index_;
+            RenderItem(fb, width, y, kPageMarginX, item_index, selected, kRowH);
+            // Separators only between two unselected rows: the cursor pill
+            // carries its own edge.
+            if (i + 1 < visible_count && !selected && !next_selected) {
+                DrawDottedHLine(fb, width, y + kRowH, kPageMarginX + 42,
+                                width - kPageMarginX - 4, ink);
+            }
+            y += kRowH;
         }
 
-        if (static_cast<int>(option_indices.size()) > kVisibleOptionCount) {
-            const int track_x = width - 10;
-            const int track_y = kSettingsTableTop + 2;
-            const int track_h = std::max(24, option_row_h * visible_count - 4);
-            DrawVLine(fb, width, track_x, track_y, track_y + track_h, border_style.border);
-            const int total = static_cast<int>(option_indices.size());
-            const int thumb_h = std::max(10, track_h * visible_count / total);
+        if (total > visible_count) {
+            const int track_x = width - 5;
+            const int track_h = kRowH * visible_count - 8;
+            const int thumb_h = std::max(12, track_h * visible_count / total);
             const int max_start = std::max(1, total - visible_count);
-            const int thumb_y = track_y + (track_h - thumb_h) * window_start / max_start;
-            DrawRect(fb, width, {track_x - 2, thumb_y, 4, thumb_h}, selected_style.border);
+            const int thumb_y = kListTop + 4 + (track_h - thumb_h) * window_start / max_start;
+            DrawRect(fb, width, {track_x - 1, thumb_y, 3, thumb_h}, selected_style.bg);
         }
     }
+
+    char page_counter[24];
+    snprintf(page_counter, sizeof(page_counter), "%d/%d", current_section_pos + 1, tab_count);
+    DrawKeyHints(fb, width, height, font_, "UP/DN 选择   BOOT 确认   长按UP 返回",
+                 page_counter, ink);
+
     const int64_t now = esp_timer_get_time();
 
     // === About dialog overlay (if active) ===
@@ -619,30 +573,6 @@ void SettingsRenderer::Render(uint8_t* fb, int width, int height) {
         needs_full_refresh_ = true;
     }
 
-    // ---------------------------------------------------------------------
-    // Settings layout debug overlay.
-    //
-    // This is intentionally the last base-page drawing layer. It marks the
-    // renderer's expected geometry on top of the real settings UI:
-    // - left selected category pill: P=28, parent slot H=44
-    // - right option/info rows: H=kSettingsTableRowH
-    // - dashed horizontal centerlines: where text/icon baselines are derived
-    // - dashed vertical guides: divider, label column, value column, right edge
-    //
-    // To disable after diagnosis, change kSettingsLayoutDebugOverlayEnabled to
-    // false above, or comment out this call.
-    // ---------------------------------------------------------------------
-    if (kSettingsLayoutDebugOverlayEnabled &&
-        !showing_about_dialog_ &&
-        !showing_volume_dialog_ &&
-        !showing_ota_dialog_) {
-        DrawSettingsLayoutDebugOverlay(fb, width, height, font_,
-                                       body_top, body_bottom, nav_top,
-                                       current_section_pos,
-                                       content_x, content_right, row_h,
-                                       debug_visible_row_count);
-    }
-
     needs_full_refresh_ = false;
 }
 
@@ -650,81 +580,68 @@ void SettingsRenderer::RenderItem(uint8_t* fb, int width, int y,
                                    int content_left, int index, bool selected,
                                    int row_h) {
     const SettingsItemDef& item = items_[index];
-    const int content_right = width - 20;
     const auto& theme = ThemeManager::Get();
-    const PaintStyle text_style = theme.Style(ThemeToken::TextPrimary);
     const PaintStyle selected_style = theme.Component(ComponentRole::SettingsSelected);
-    const Color action_color = TokenInkOnPaper(item.label == "关机" ? ThemeToken::Danger : ThemeToken::Accent);
-    // The selected setting row uses a compact left rail instead of a full
-    // filled background, so row content must stay readable on white paper.
-    const Color fg_color = text_style.fg;
-    const int row_center_y = y + row_h / 2;
-    const int right_margin = 0;
-    const int icon_x = content_left;
-    const int label_x = icon_x + 16 + Style::kSpacingSM;  // 16 is icon width
-    const int label_y = InkCenteredTextTopY(font_, item.label.c_str(), row_center_y, kTextOpticalNudgeY);
+    const Color paper = PaperColor();
+    const Color accent = TokenInkOnPaper(ThemeToken::Accent);
+    // The cursor is the page's one solid element: an ink pill with paper-
+    // coloured content and a short accent stripe. The fast refresh shows the
+    // stripe black on black, which loses nothing.
+    const Color row_bg = selected ? selected_style.bg : paper;
+    const Color fg = selected ? selected_style.fg : theme.Style(ThemeToken::TextPrimary).fg;
+    const int left = content_left;
+    const int right = width - content_left;
+    const int center_y = y + row_h / 2;
 
     if (selected) {
-        // 1bpp fallback turns selected surfaces into light paper, so keep the
-        // compact focus rail as solid ink for a clear cursor.
-        DrawRect(fb, width, {content_left - 8, row_center_y - 8, 3, 16}, selected_style.border);
+        DrawRoundRect(fb, width, height_, {left, y + 2, right - left, row_h - 4}, kRowRadius,
+                      row_bg, row_bg, 1);
+        DrawRect(fb, width, {left + 6, center_y - 8, 3, 16}, selected_style.border);
     }
 
-    DrawSettingsVectorIcon(fb, width, item.label, icon_x, row_center_y, fg_color);
-
-    int label_right = content_right - right_margin;
+    const int icon_x = left + 16;
+    DrawIconCentered(fb, width, icon_x, center_y, SettingsIconFor(item.label), fg);
+    const int label_x = icon_x + 26;
+    int value_right = right - 14;
 
     if (item.type == SettingsItemType::Checkbox) {
-        const int track_w = 52;
-        const int track_h = 20;
-        const int knob = 16;
-        const int track_x = content_right - track_w;
-        const int track_y = row_center_y - track_h / 2;
-        label_right = track_x - Style::kSpacingLG;
-        const PaintStyle switch_style = item.checked ? theme.Style(ThemeToken::Accent)
-                                                     : theme.Style(ThemeToken::Disabled);
-        DrawStyledRoundRect(fb, width, 300, {track_x, track_y, track_w, track_h},
-                            Style::kBorderRadiusPill, switch_style);
-        const char* switch_text = item.checked ? "ON" : "OFF";
-        const int text_w = MeasureTextWidth(switch_text, value_font_);
-        const int text_x = item.checked ? (track_x + 7) : (track_x + track_w - text_w - 6);
-        DrawText(fb, width, text_x,
-                 InkCenteredTextTopY(value_font_, switch_text, row_center_y, kValueOpticalNudgeY),
-                 switch_text, value_font_, switch_style.fg);
-        const int knob_x = item.checked ? (track_x + track_w - knob - 2) : (track_x + 2);
-        const int knob_cx = knob_x + knob / 2;
-        // Use a true circle rather than a rounded square. Hardware screenshots
-        // showed square border pixels on the previous RectBorder-based knob.
-        DrawCircle(fb, width, {knob_cx, row_center_y - 1}, knob / 2, theme.Style(ThemeToken::BackgroundPrimary).bg);
-        DrawCircleBorder(fb, width, {knob_cx, row_center_y - 1}, knob / 2, 1, text_style.fg);
-    } else if (!item.value.empty()) {
-        const int value_right = content_right - right_margin;
-        const int max_val_w = std::max(0, value_right - (content_left + 88));
-        std::string display_value = FitTextToWidth(item.value, value_font_, max_val_w);
-        const int value_w = MeasureTextWidth(display_value.c_str(), value_font_);
-        const int val_x = value_right - value_w;
-        label_right = val_x - Style::kSpacingLG;
+        const int toggle_x = value_right - kToggleW;
+        DrawToggle(fb, width, height_, toggle_x, center_y, item.checked, fg, row_bg, accent);
+        value_right = toggle_x - 10;
+    } else if (item.type == SettingsItemType::Action && !IsDangerAction(item.label)) {
+        // Something BOOT changes: a chevron after the current value.
+        DrawChevronMark(fb, width, value_right - 5, center_y, selected ? fg : accent);
+        value_right -= 14;
+    }
 
-        if (!display_value.empty()) {
-            DrawText(fb, width, val_x, InkCenteredTextTopY(value_font_, display_value.c_str(), row_center_y, kValueOpticalNudgeY), display_value.c_str(),
-                     value_font_, text_style.fg);
+    const int label_w = MeasureTextWidth(item.label.c_str(), font_);
+    const int value_max_w = std::max(0, value_right - (label_x + label_w + 12));
+    std::string value = item.value;
+    if (item.type == SettingsItemType::Action && value.empty()) value = "执行";
+    value = FitTextToWidth(value, value_font_, value_max_w);
+    if (!value.empty()) {
+        const int value_w = MeasureTextWidth(value.c_str(), value_font_);
+        if (item.type == SettingsItemType::Action && IsDangerAction(item.label)) {
+            // Destructive actions read as a button: an accent chip.
+            const int chip_h = 24;
+            const Rect chip{value_right - value_w - 20, center_y - chip_h / 2, value_w + 20, chip_h};
+            DrawRoundRect(fb, width, height_, chip, chip_h / 2, accent,
+                          selected ? fg : accent, 1);
+            DrawText(fb, width, chip.x + 10,
+                     InkCenteredTextTopY(value_font_, value.c_str(), center_y, 0),
+                     value.c_str(), value_font_, selected ? fg : paper);
+        } else {
+            DrawText(fb, width, value_right - value_w,
+                     InkCenteredTextTopY(value_font_, value.c_str(), center_y, 0),
+                     value.c_str(), value_font_, fg);
         }
-    } else if (item.type == SettingsItemType::Action) {
-        const char* action_text = item.value.empty() ? "执行" : item.value.c_str();
-        const int action_w = MeasureTextWidth(action_text, value_font_);
-        const int act_x = content_right - right_margin - action_w;
-        label_right = act_x - Style::kSpacingLG;
-
-        DrawText(fb, width, act_x, InkCenteredTextTopY(value_font_, action_text, row_center_y, kValueOpticalNudgeY),
-                 action_text, value_font_, item.type == SettingsItemType::Action ? action_color : fg_color);
     }
 
-    int label_max_w = std::max(0, label_right - label_x);
-    std::string display_label = FitTextToWidth(item.label, font_, label_max_w);
-    if (!display_label.empty()) {
-        DrawText(fb, width, label_x, label_y, display_label.c_str(), font_, fg_color);
+    const std::string label = FitTextToWidth(item.label, font_, std::max(0, value_right - label_x));
+    if (!label.empty()) {
+        DrawText(fb, width, label_x, InkCenteredTextTopY(font_, label.c_str(), center_y, 0),
+                 label.c_str(), font_, fg);
     }
-    DrawHLine(fb, width, y + row_h - 1, content_left, content_right, theme.Style(ThemeToken::Border).border);
 }
 
 void SettingsRenderer::DrawChevron(uint8_t* fb, int width, int x, int y,
@@ -1389,7 +1306,7 @@ void SettingsRenderer::RenderVolumeDialog(uint8_t* fb, int width, int height) {
     const char* title = "音量调整";
     const int title_w = MeasureTextWidth(title, font_);
     DrawText(fb, width, dialog_x + (dialog_w - title_w) / 2,
-             InkCenteredTextTopY(font_, title, dialog_y + 24, kTextOpticalNudgeY),
+             InkCenteredTextTopY(font_, title, dialog_y + 24, 0),
              title, font_, text, height);
     DrawHLine(fb, width, dialog_y + 42, dialog_x + 14, dialog_x + dialog_w - 14, border);
 
@@ -1402,7 +1319,7 @@ void SettingsRenderer::RenderVolumeDialog(uint8_t* fb, int width, int height) {
 
     const int speaker_x = inner_x + 12;
     const int speaker_y = dialog_y + 60;
-    DrawSettingsVectorIcon(fb, width, "音量", speaker_x, speaker_y, accent);
+    DrawIconCentered(fb, width, speaker_x, speaker_y, SettingsIconFor("音量"), accent);
 
     const int track_x = inner_x;
     const int track_y = dialog_y + 102;
@@ -1422,7 +1339,7 @@ void SettingsRenderer::RenderVolumeDialog(uint8_t* fb, int width, int height) {
     }
 
     const int hint_center_y = dialog_y + dialog_h - 20;
-    DrawText(fb, width, inner_x + 6, InkCenteredTextTopY(font_, "UP/DN 调整  BOOT 保存", hint_center_y, kTextOpticalNudgeY),
+    DrawText(fb, width, inner_x + 6, InkCenteredTextTopY(font_, "UP/DN 调整  BOOT 保存", hint_center_y, 0),
              "UP/DN 调整  BOOT 保存", font_, secondary, height);
 }
 

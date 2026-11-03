@@ -294,10 +294,10 @@ private:
     static constexpr int kItemPadding = Style::kSpacingXS + 1;
     static constexpr int kIconSize = Style::kFontSizeSM;       // 16px
     static constexpr int kItemMinHeight = 30;
-    // Right pane capacity: 8 compact option rows fit the 400x300 e-paper page.
-    // Keep this as the only scroll-window threshold so future settings rows
-    // can be added without hunting through the renderer.
-    static constexpr int kVisibleOptionCount = 8;
+    // Option rows that fit between the tab strip and the key hints (44 px
+    // each). Keep this as the only scroll-window threshold so future settings
+    // rows can be added without hunting through the renderer.
+    static constexpr int kVisibleOptionCount = 4;
 };
 
 }  // namespace rawdraw

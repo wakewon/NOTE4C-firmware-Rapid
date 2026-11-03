@@ -19,6 +19,20 @@ enum class ThemeId : uint8_t {
     PeachPaper,
     Sticker,
     CandyPop,
+    // Yellow paper, black ink, red accents. Interactive pages only (see
+    // ThemeSurface); never offered as a user-selectable theme.
+    InkSignal,
+};
+
+// Which kind of page is being drawn. Interactive pages (menus, settings, the
+// AP transfer page) are redrawn by the black/yellow fast refresh, which shows
+// black and red as black and white and yellow as yellow. They are drawn on a
+// yellow-paper theme so the fast preview and the full-colour frame look the
+// same: only the red accents change to black and back. Display pages (photos,
+// the gallery) keep the runtime theme.
+enum class ThemeSurface : uint8_t {
+    Display,
+    Interactive,
 };
 
 enum class ThemeToken : uint8_t {
@@ -94,6 +108,9 @@ struct ThemeDefinition {
     const char* key;
     const char* display_name;
     PaintStyle tokens[static_cast<int>(ThemeToken::Count)];
+    // Status bar: fg = icons and text, bg = bar, border = alert ink (Wi-Fi
+    // off slash, low battery).
+    PaintStyle status_bar;
 };
 
 class ThemeManager {
@@ -106,7 +123,13 @@ public:
     bool SetTheme(ThemeId id);
     bool SetThemeByKey(const char* key);
 
+    // Set by the UI manager whenever the active page changes; selects the
+    // theme that Current() returns.
+    void SetSurface(ThemeSurface surface) { surface_ = surface; }
+    ThemeSurface Surface() const { return surface_; }
+
     PaintStyle Style(ThemeToken token) const;
+    PaintStyle StatusBar() const;
     PaintStyle Component(ComponentRole role) const;
     Color ColorFor(ThemeToken token) const;
 
@@ -119,6 +142,22 @@ public:
 private:
     ThemeManager() = default;
     ThemeId current_ = ThemeId::Industrial;
+    ThemeSurface surface_ = ThemeSurface::Display;
+};
+
+// Draws one element (an overlay over a display page, say) on another surface.
+class ScopedThemeSurface {
+public:
+    explicit ScopedThemeSurface(ThemeSurface surface)
+        : previous_(ThemeManager::Get().Surface()) {
+        ThemeManager::Get().SetSurface(surface);
+    }
+    ~ScopedThemeSurface() { ThemeManager::Get().SetSurface(previous_); }
+    ScopedThemeSurface(const ScopedThemeSurface&) = delete;
+    ScopedThemeSurface& operator=(const ScopedThemeSurface&) = delete;
+
+private:
+    ThemeSurface previous_;
 };
 
 PaintStyle MakePaint(Color fg, Color bg, Color border,
