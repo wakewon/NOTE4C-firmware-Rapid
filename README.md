@@ -301,27 +301,29 @@ ZECTRIX_EPD_PANEL_1BPP            黑白 1bpp 屏
 
 如果要刷回旧黑白屏，先在 `idf.py menuconfig` 中切到 `1bpp black/white EPD`，再重新构建烧录。RawDraw 主题层会把红/黄语义色降级成黑白可读样式。
 
-### SSD2683 ULTRA_BW 交互预览
+### SSD2683 黑黄快刷（官方 RAM 波形）
 
-Note4C 四色屏默认启用独立的 `ULTRA_BW` 路径。菜单切换、按钮、光标和
-连续 UI 操作都会将语义 framebuffer 临时映射为黑白（红/黄映射为黑），
-并调用 SSD2683/同类面板厂商示例中的 OTP fast-waveform 选择序列。针对实测
-仍需约 12 秒的问题，默认实验时序把厂商的动态 12.5 Hz/20 ms blanking 改为
-芯片手册范围内的固定 120 Hz/2 ms blanking，以画质、对比度和残影换取秒级
-响应；原厂 12 秒时序以及 120 Hz/20 ms 中间档均可在 menuconfig 中回退。连续操作
-期间不会按刷新次数插入四色全刷；最后一次交互后 60 秒无新操作，才执行一次
-原有 `FULL_COLOR` 全局刷新来恢复颜色和清理残影。新的交互会取消并重新计时。
+Note4C 四色屏默认启用面板厂商 `epaper_refresh_demo` 提供的黑/黄快刷方案。菜单、
+按钮、光标和手动换图时，语义 framebuffer 临时映射为黑/黄（黑、红→黑；白、黄→黄），
+再用 535 字节的 RAM 波形按“旧像素→新像素”的差分方式刷新，单次波形约 0.96 秒，
+未变化的像素保持不动。驱动在内存里跟踪玻璃上每个像素的真实黑/黄状态：
 
-相关配置为 `CONFIG_ZECTRIX_EPD_FAST_BW` 和
-`CONFIG_ZECTRIX_EPD_FAST_BW_TIMING_*`、
-`CONFIG_ZECTRIX_EPD_FAST_BW_IDLE_FULL_SECONDS`。标准四色路径保持独立，若某批次
-面板与极速时序不兼容，可先切回 `TIMING_VENDOR`，或关闭 FAST_BW。驱动还提供
-默认关闭的只读 `CONFIG_ZECTRIX_EPD_SSD2683_MTP_DUMP`，可导出 3840-byte OTP/MTP
-内容用于继续逆向；固件绝不会调用不可逆的 MTP 编程命令。控制器、
-waveform 证据、像素映射、限制与硬件验证步骤见
-[`docs/SSD2683_FAST_BW_RESEARCH.md`](docs/SSD2683_FAST_BW_RESEARCH.md)。120 Hz/2 ms
-按相同 LUT 帧数理论上可把扫描阶段缩短约 9.7 倍，但 1–3 秒仍须在 Note4C 真机
-上以 `[ULTRA_BW] waveform BUSY=` 日志验证，README 不把估算当成实测指标。
+- 小范围变化（默认少于 30% 像素）：一次差分刷新。
+- 整页变化、连续 10 次差分之后、或刚做过四色全刷（缓存失效）：先把旧画面整屏反相，
+  再从反相状态画出新画面，即官方的 inverse/restore 一对刷新，每个像素正反各驱动一次。
+- 两次 RAM 波形之间至少间隔 4 秒（官方要求，一对刷新的两半也算），期间的新操作会合并到下一次。
+- 最后一次交互后 10 秒（换图）/ 30 秒（菜单）执行一次标准 `FULL_COLOR` 四色全刷恢复颜色；
+  进入深睡前若仍有快刷欠账，也会先补一次全刷。
+
+相关配置：`CONFIG_ZECTRIX_EPD_FAST_BW`（总开关，沿用旧名）、
+`CONFIG_ZECTRIX_EPD_FAST_BW_{IDLE,QUALITY}_FULL_SECONDS`、
+`CONFIG_ZECTRIX_EPD_FAST_BY_MIN_PERIOD_MS`、
+`CONFIG_ZECTRIX_EPD_FAST_BY_PAGE_CHANGE_PERCENT`、
+`CONFIG_ZECTRIX_EPD_FAST_BY_CLEANUP_INTERVAL`。波形只写入控制器易失 RAM，每次刷新前重新加载；
+固件绝不会调用不可逆的 MTP 编程命令。每次快刷输出一行
+`[FAST_BY] complete plan=… waveform=… ms`，波形超过 1.5 秒（说明控制器没接受 RAM 波形）
+会复位控制器并改走一次四色全刷。旧的 OTP 截断方案与调研记录见
+[`docs/SSD2683_FAST_BW_RESEARCH.md`](docs/SSD2683_FAST_BW_RESEARCH.md)。
 
 ## UI 说明
 

@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <cstring>
 #include <algorithm>
+#include <vector>
 
 #include <esp_log.h>
 #include <esp_heap_caps.h>
@@ -17,6 +18,7 @@
 #include "settings.h"
 #include "custom_lcd_display.h"
 #include "ssd2683_fast_bw.h"
+#include "ssd2683_fast_by_lut.h"
 #include "rawdraw/rawdraw.h"
 #include "rawdraw/framebuffer.h"
 #include "common/sleep_manager.h"
@@ -35,48 +37,27 @@ static constexpr uint32_t kDisplayKickMs = 1000;
 static constexpr uint32_t kLowPowerBusyFastPollMs = 50;
 static constexpr uint32_t kLowPowerBusyPollMs = 500;
 static constexpr int kFourColorSampleIntervalMs = 12000;
-// The 12 s interval above was sized for the 23 s full-color waveform. A
-// truncated fast refresh takes about 550 ms, and throttling one by 12 s was
-// what made a key press sit for several seconds before anything happened.
+// The 12 s interval above was sized for the 23 s full-color waveform. A fast
+// black/yellow refresh takes about 1.3 s, and throttling one by 12 s was what
+// made a key press sit for several seconds before anything happened. The
+// vendor's own spacing between RAM waveforms is enforced where they run.
 static constexpr int kFourColorFastBwSampleIntervalMs = 500;
 #if CONFIG_ZECTRIX_EPD_FAST_BW
 static constexpr uint32_t kFastBwDeferredIdleFullMs =
     CONFIG_ZECTRIX_EPD_FAST_BW_IDLE_FULL_SECONDS * 1000U;
 static constexpr uint32_t kFastBwQualityIdleFullMs =
     CONFIG_ZECTRIX_EPD_FAST_BW_QUALITY_FULL_SECONDS * 1000U;
-
-#if CONFIG_ZECTRIX_EPD_FAST_BW_TIMING_VENDOR
-static constexpr uint8_t kFastBwPll = 0x08;  // dynamic, 12.5 Hz
-static constexpr uint8_t kFastBwCdi = 0x37;  // white border, 20 ms blanking
-static constexpr const char *kFastBwTimingName = "vendor-12.5Hz-20ms";
-#elif CONFIG_ZECTRIX_EPD_FAST_BW_TIMING_120HZ
-static constexpr uint8_t kFastBwPll = 0x07;  // fixed, 120 Hz
-static constexpr uint8_t kFastBwCdi = 0x37;  // white border, 20 ms blanking
-static constexpr const char *kFastBwTimingName = "fixed-120Hz-20ms";
-#else
-static constexpr uint8_t kFastBwPll = 0x07;  // fixed, 120 Hz
-static constexpr uint8_t kFastBwCdi = 0x30;  // white border, 2 ms blanking
-static constexpr const char *kFastBwTimingName = "ultra-fixed-120Hz-2ms";
-#endif
-
-// Consecutive truncated waveforms since the last complete one. Truncation
-// leaves net DC on the pixels, so this bounds how much can accumulate.
-static uint32_t g_fast_bw_truncations_since_complete = 0;
-
-// Measured on hardware at PLL=0x07: 0x00 23550 ms, 0x0A 22700 ms, 0x19
-// 11500 ms, 0x28 14100 ms, 0x32 14100 ms and the vendor demo's 0x5A 14050 ms.
-// The 25 C section is the shortest waveform the OTP contains.
-static constexpr uint8_t kFastBwTsset =
-    static_cast<uint8_t>(CONFIG_ZECTRIX_EPD_FAST_BW_TSSET);
-
-// PSR byte 2. B[7] is LUT_EN, which only redirects the analog settings and was
-// measured to leave the waveform duration unchanged, so it stays at the
-// MTP-loading default.
-static constexpr uint8_t kFastBwPsr1 = 0x69;
-
-#else
-// Keep the common refresh-loop logging buildable when FAST_BW is disabled.
-static constexpr const char *kFastBwTimingName = "disabled";
+static constexpr int64_t kFastByMinPeriodUs =
+    static_cast<int64_t>(CONFIG_ZECTRIX_EPD_FAST_BY_MIN_PERIOD_MS) * 1000;
+// The RAM waveform runs about 0.96 s. The vendor driver rejects anything at or
+// above 1 s, because a waveform that long means the controller did not take
+// the RAM table and is playing its 12-23 s OTP four-colour one instead. The
+// hard limit leaves room for the 10 ms BUSY poll; past it the controller is
+// stopped with a reset rather than left to run the wrong waveform.
+static constexpr int64_t kFastByExpectedWaveformUs = 1000000;
+static constexpr uint32_t kFastByWaveformLimitMs = 1500;
+static constexpr uint32_t kFastByBusyAssertMs = 500;
+static constexpr uint32_t kFastByControlBusyMs = 10000;
 #endif
 
 #ifndef EXAMPLE_LCD_WIDTH
@@ -274,6 +255,13 @@ CustomLcdDisplay::CustomLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_p
     tx_buf = (uint8_t *)heap_caps_malloc(lcd_spi_data.buffer_len, MALLOC_CAP_SPIRAM);
     assert(tx_buf);
     memset(tx_buf, WhiteFillByte(), lcd_spi_data.buffer_len);
+
+    if (IsFourColorPanel()) {
+        const size_t mask_bytes = static_cast<size_t>(width) * height / 8;
+        fast_by_state_ = (uint8_t *)heap_caps_calloc(1, mask_bytes, MALLOC_CAP_SPIRAM);
+        fast_by_target_ = (uint8_t *)heap_caps_calloc(1, mask_bytes, MALLOC_CAP_SPIRAM);
+        assert(fast_by_state_ && fast_by_target_);
+    }
 
 #ifdef HAVE_LVGL
     display_ = lv_display_create(width, height);
@@ -550,12 +538,13 @@ void CustomLcdDisplay::CompleteFullColorRefreshLocked() {
     // A standard waveform clears every kind of FAST_BW debt. Drop both an
     // armed deadline and a callback that became pending while the controller
     // was busy; a later queued FAST_BW request will establish a fresh one when
-    // it actually completes. The truncation streak is DC debt too: a full
-    // waveform is balanced, so truncations from before it must not carry
-    // forward and count against the next streak's cap.
+    // it actually completes. The glass now holds white and red as well, so
+    // the black/yellow differential cache no longer describes it; the next
+    // fast update takes the frame over with an inverse/restore pair.
     idle_full_refresh_armed_ = false;
     idle_full_refresh_pending_ = false;
-    g_fast_bw_truncations_since_complete = 0;
+    fast_by_cache_valid_.store(false, std::memory_order_release);
+    fast_by_singles_since_pair_ = 0;
 }
 
 void CustomLcdDisplay::RequestFastBwRefresh(
@@ -590,7 +579,7 @@ void CustomLcdDisplay::RequestFastBwRefresh(
     fast_bw_refresh_requested_ = true;
     refresh_in_progress = true;
     ArmIdleFullRefreshLocked(xTaskGetTickCount(), recovery_mode);
-    ESP_LOGI(TAG, "[ULTRA_BW] request recovery=%s delay_after_complete=%us",
+    ESP_LOGI(TAG, "[FAST_BY] request recovery=%s delay_after_complete=%us",
              recovery_mode == ssd2683_fast_bw::RecoveryMode::DeferredInteraction
                  ? "deferred_interaction" : "quality",
              static_cast<unsigned>(ssd2683_fast_bw::RecoveryDelayMs(
@@ -1013,26 +1002,44 @@ void CustomLcdDisplay::refresh_task_loop() {
             ESP_LOGW(TAG, "[FULL_COLOR] complete in %u ms", refresh_elapsed_ms());
         } else if (IsFourColorPanel() && fast_bw) {
             stat_fast_bw++;
-            ESP_LOGD(TAG, "[ULTRA_BW] start timing=%s source=%s; colors mapped to black/white",
-                     kFastBwTimingName,
-                     fast_bw_promoted ? "promoted_dirty_rect" : "requested");
-            EPD_InitFastBw();
-            EPD_DisplayFastBw();
-            memcpy(prev_buffer, tx_buf, lcd_spi_data.buffer_len);
-            prev_buffer_synced = true;
-            const TickType_t fast_bw_completed = xTaskGetTickCount();
-            xSemaphoreTake(dirty_mutex, portMAX_DELAY);
-            CompleteFastBwRefreshLocked(fast_bw_completed);
-            xSemaphoreGive(dirty_mutex);
-            // One line per interactive refresh. The rest of the ULTRA_BW
-            // telemetry is at DEBUG: the secondary USB-Serial-JTAG console
-            // blocks the logging task while a host is attached but not
-            // draining, so volume here costs input responsiveness.
-            ESP_LOGI(TAG, "[ULTRA_BW] complete in %u ms; recovery=%s",
-                     refresh_elapsed_ms(),
-                     fast_bw_recovery_mode_ ==
-                             ssd2683_fast_bw::RecoveryMode::DeferredInteraction
-                         ? "deferred_30s" : "quality_10s");
+            const char *plan = "none";
+            uint32_t changed_pixels = 0;
+            const bool fast_ok = RunFastByRefresh(&plan, &changed_pixels);
+            if (fast_ok) {
+                memcpy(prev_buffer, tx_buf, lcd_spi_data.buffer_len);
+                prev_buffer_synced = true;
+                const TickType_t fast_bw_completed = xTaskGetTickCount();
+                xSemaphoreTake(dirty_mutex, portMAX_DELAY);
+                CompleteFastBwRefreshLocked(fast_bw_completed);
+                xSemaphoreGive(dirty_mutex);
+                // One line per interactive refresh, at WARN like the
+                // [FULL_COLOR] lines, because INFO is compiled out here.
+                ESP_LOGW(TAG,
+                         "[FAST_BY] complete plan=%s changed=%u px waveform=%u ms total=%u ms "
+                         "source=%s recovery=%s",
+                         plan, static_cast<unsigned>(changed_pixels),
+                         static_cast<unsigned>(fast_by_last_waveform_ms_),
+                         refresh_elapsed_ms(),
+                         fast_bw_promoted ? "promoted_dirty_rect" : "requested",
+                         fast_bw_recovery_mode_ ==
+                                 ssd2683_fast_bw::RecoveryMode::DeferredInteraction
+                             ? "deferred" : "quality");
+            } else {
+                // The glass is in an unknown, possibly half-driven state.
+                // Leave prev_buffer alone and put a full-colour refresh in
+                // front of everything; as fast debt it cannot be skipped as
+                // redundant, and the sleep path sees the debt as well.
+                xSemaphoreTake(dirty_mutex, portMAX_DELAY);
+                fast_bw_since_full_ = true;
+                force_full_refresh_ = true;
+                urgent_refresh = true;
+                idle_full_refresh_armed_ = false;
+                PublishRecoveryDebtLocked();
+                xSemaphoreGive(dirty_mutex);
+                ESP_LOGE(TAG,
+                         "[FAST_BY] failed plan=%s after %u ms; forcing a full-color refresh",
+                         plan, refresh_elapsed_ms());
+            }
         } else {
             stat_partial++;
             ESP_LOGI(TAG, "[REFRESH] Performing PARTIAL refresh");
@@ -1221,14 +1228,24 @@ void CustomLcdDisplay::read_busy() {
 
 bool CustomLcdDisplay::read_busy_until(uint32_t timeout_ms) {
     const int busy = lcd_spi_data.busy;
-    const TickType_t start = xTaskGetTickCount();
-    const TickType_t limit = pdMS_TO_TICKS(timeout_ms);
+    // esp_timer, not ticks: tickless idle runs the tick count slow across
+    // light-sleep periods, which would stretch the limit.
+    const int64_t start_us = esp_timer_get_time();
+    const int64_t limit_us = static_cast<int64_t>(timeout_ms) * 1000;
 
     while (gpio_get_level((gpio_num_t)busy) == 0) {
-        if ((xTaskGetTickCount() - start) >= limit) {
+        const int64_t elapsed_us = esp_timer_get_time() - start_us;
+        if (elapsed_us >= limit_us) {
             return false;
         }
-        vTaskDelay(pdMS_TO_TICKS(10));
+        // Same policy as read_busy(): one tick normally, and inside the
+        // low-power window a poll long enough for auto light sleep.
+        TickType_t poll = 1;
+        if (low_power_busy_wait_.load(std::memory_order_acquire)) {
+            poll = pdMS_TO_TICKS(elapsed_us < 1000000 ? kLowPowerBusyFastPollMs
+                                                      : kLowPowerBusyPollMs);
+        }
+        vTaskDelay(poll);
     }
     return true;
 }
@@ -1401,198 +1418,266 @@ void CustomLcdDisplay::EPD_Init() {
     read_busy();
 }
 
-void CustomLcdDisplay::EPD_InitFastBw() {
-#if !CONFIG_ZECTRIX_EPD_FAST_BW
-    EPD_Init();
-    return;
-#else
-    if (!IsFourColorPanel()) {
-        EPD_Init();
-        return;
+void CustomLcdDisplay::BuildFastByMask(const uint8_t *semantic, uint8_t *mask) const {
+    const size_t mask_bytes = static_cast<size_t>(Width) * Height / 8;
+    for (size_t i = 0; i < mask_bytes; ++i) {
+        mask[i] = static_cast<uint8_t>(
+            ssd2683_fast_bw::SemanticByteToBlackNibble(semantic[i * 2]) |
+            (ssd2683_fast_bw::SemanticByteToBlackNibble(semantic[i * 2 + 1]) >> 4));
     }
+}
 
-    // Dedicated SSD2683 fast-waveform path. This sequence is taken from the
-    // controller-matched GDEM042F86 400x300 vendor demo. Commands 0xEF, 0xF6
-    // and 0xA5 are vendor-reserved in the public SSD2683 Rev 0.20 command
-    // table, so keep the sequence exact and never use the MTP program commands
-    // (0x90/0x91) here.
+bool CustomLcdDisplay::EPD_InitFastBy() {
+#if !CONFIG_ZECTRIX_EPD_FAST_BW
+    return false;
+#else
+    // Register sequence of the vendor epaper_refresh_demo Init(lut). PSR
+    // B[7] (LUT_EN) makes the controller take the waveform written with 0x20
+    // instead of auto-loading its OTP one; 0x20 is absent from the public
+    // SSD2683 Rev 0.20 command table but is what the vendor driver uses. The
+    // table goes to volatile controller RAM only: a reset or a power cut
+    // forgets it, so it is reloaded before every waveform, and the MTP
+    // programming commands (0x90/0x91/0xA2) are never issued.
+    const uint8_t *lut = ssd2683_fast_by::kLut;
     EPD_PowerOn();
     vTaskDelay(pdMS_TO_TICKS(20));
     set_rst_0();
-    vTaskDelay(pdMS_TO_TICKS(40));
+    vTaskDelay(pdMS_TO_TICKS(20));
     set_rst_1();
-    vTaskDelay(pdMS_TO_TICKS(50));
-    read_busy();
+    vTaskDelay(pdMS_TO_TICKS(100));
+    if (!read_busy_until(kFastByControlBusyMs)) {
+        ESP_LOGE(TAG, "[FAST_BY] controller did not leave reset");
+        return false;
+    }
 
+    EPD_SendCommand(0x00);  // PSR: LUT_EN=1, waveform from RAM
+    EPD_SendData(0x2F);
+    EPD_SendData(0xA9);
+    EPD_SendCommand(0x01);  // PWR: VCOM calibration carried by the table
+    EPD_SendData(0x07);
+    for (int i = 0; i < 5; ++i) {
+        EPD_SendData(lut[i]);
+    }
+    EPD_SendCommand(0x30);  // PLL
+    EPD_SendData(lut[6]);
+    EPD_SendCommand(0x82);  // VDCS
+    EPD_SendData(lut[5]);
     EPD_SendCommand(0x06);  // BTST
     EPD_SendData(0x0F);
     EPD_SendData(0x8B);
     EPD_SendData(0x9C);
-    EPD_SendData(0x96);
-
-    EPD_SendCommand(0x00);  // PSR: LUT source, resolution, scan direction
-    EPD_SendData(0x2F);
-    EPD_SendData(kFastBwPsr1);
-
-    EPD_SendCommand(0x01);  // PWR (vendor fast-profile parameters)
-    EPD_SendData(0x07);
-    EPD_SendData(0xF0);
-
-    // The OTP waveform defines the number and polarity of frames. PLL/CDI
-    // define how long each of those frames takes. ULTRA_BW intentionally uses
-    // the documented maximum scan rate and minimum blanking interval; normal
-    // FULL_COLOR always resets the controller and does not inherit them.
-    EPD_SendCommand(0x50);  // CDI: border + gate/source blanking
-    EPD_SendData(kFastBwCdi);
-
+    EPD_SendData(0xA5);
+    EPD_SendCommand(0xE7);
+    EPD_SendData(0xA5);
+    EPD_SendCommand(0x50);  // CDI: floating border in black/yellow mode
+    EPD_SendData(0x97);
     EPD_SendCommand(0x61);  // TRES: 400x300
     EPD_SendData(static_cast<uint8_t>((Width >> 8) & 0x03));
     EPD_SendData(static_cast<uint8_t>(Width & 0xFF));
     EPD_SendData(static_cast<uint8_t>((Height >> 8) & 0x03));
     EPD_SendData(static_cast<uint8_t>(Height & 0xFF));
-
-    EPD_SendCommand(0x62);  // Vendor waveform timing/profile data
-    EPD_SendData(0x64);
-    EPD_SendData(0x53);
-
+    EPD_SendCommand(0x62);
+    EPD_SendData(0x62);
+    EPD_SendData(0x51);
     EPD_SendCommand(0x65);  // GSST
     EPD_SendData(0x00);
     EPD_SendData(0x00);
     EPD_SendData(0x00);
     EPD_SendData(0x00);
-
-    EPD_SendCommand(0x30);  // PLL: profile-specific scan clock
-    EPD_SendData(kFastBwPll);
     EPD_SendCommand(0xE9);
     EPD_SendData(0x01);
-
-    EPD_SendCommand(0x04);  // PON before selecting the fast OTP profile
-    read_busy();
-
-    EPD_SendCommand(0xEF);  // Enter vendor register bank
-    EPD_SendData(0x01);
-    EPD_SendCommand(0xF6);  // Select vendor fast waveform profile
-    EPD_SendData(0x15);
-    EPD_SendCommand(0xEF);  // Leave vendor register bank
-    EPD_SendData(0x00);
-
-    EPD_SendCommand(0xE0);  // CCSET: manual temperature input
-    EPD_SendData(0x02);
-    EPD_SendCommand(0xE6);  // TSSET: waveform temperature-section selector
-    EPD_SendData(kFastBwTsset);
-    EPD_SendCommand(0xA5);  // Load/apply selected OTP waveform
-    read_busy();
-
-    // 0xA5 loads the OTP waveform bank, and that bank carries its own frame
-    // timing. Measured on hardware: PLL/CDI written before 0xA5 had no effect
-    // on the waveform duration (BUSY stayed at ~14 s with PLL=0x07/CDI=0x30).
-    // Re-apply them after the load so the controller keeps our values instead
-    // of the bank's. If the waveform duration is still ~14 s after this, the
-    // frame *count* comes from the OTP bank and no register can shorten it.
-    EPD_SendCommand(0x30);  // PLL: profile-specific scan clock
-    EPD_SendData(kFastBwPll);
-    EPD_SendCommand(0x50);  // CDI: border + gate/source blanking
-    EPD_SendData(kFastBwCdi);
+    EPD_SendCommand(0x20);  // RAM waveform, header included
+    writeBytes(lut, static_cast<int>(sizeof(ssd2683_fast_by::kLut)));
+    return true;
 #endif
 }
 
-void CustomLcdDisplay::EPD_DisplayFastBw() {
+void CustomLcdDisplay::EPD_AbortFastBy() {
+    // POF is queued behind a running refresh, so it cannot stop one. Reset
+    // stops the driver where it stands; it stays asserted while the supply is
+    // off so nothing is driven into an unpowered chip. Both init paths power
+    // up and pulse reset themselves.
+    set_rst_0();
+    vTaskDelay(pdMS_TO_TICKS(20));
+    EPD_PowerOff();
+}
+
+bool CustomLcdDisplay::EPD_RunFastByWaveform(const uint8_t *new_mask, bool invert_new,
+                                             const char *step) {
 #if !CONFIG_ZECTRIX_EPD_FAST_BW
-    EPD_Display();
-    return;
+    (void)new_mask;
+    (void)invert_new;
+    (void)step;
+    return false;
 #else
-    if (!IsFourColorPanel()) {
-        EPD_Display();
-        return;
+    // RAM-waveform operations start at least this far apart, as in the vendor
+    // driver -- the two halves of a pair included. The wait is a plain task
+    // delay, so the chip may light-sleep through it, and the frame it draws
+    // was already snapshotted: later input is coalesced into the next update.
+    if (fast_by_last_start_us_ != 0) {
+        const int64_t wait_us =
+            kFastByMinPeriodUs - (esp_timer_get_time() - fast_by_last_start_us_);
+        if (wait_us > 0) {
+            const TickType_t ticks = pdMS_TO_TICKS((wait_us + 999) / 1000);
+            vTaskDelay(ticks > 0 ? ticks : 1);
+        }
+    }
+    fast_by_last_start_us_ = esp_timer_get_time();
+
+    if (!EPD_InitFastBy()) {
+        EPD_AbortFastBy();
+        return false;
     }
 
-    const int bytes_per_row = (Width * 2 + 7) >> 3;
-    std::vector<uint8_t> line(bytes_per_row);
-    const TickType_t transfer_started = xTaskGetTickCount();
-
-    EPD_SendCommand(0x10);  // DTM: target 2bpp pixels, not old/new transitions
-    read_busy();
+    const int mask_row_bytes = Width / 8;
+    const int frame_row_bytes = (Width * 2 + 7) >> 3;
+    std::vector<uint8_t> line(frame_row_bytes);
+    EPD_SendCommand(0x10);  // DTM: one transition code per pixel
     for (int y = 0; y < Height; ++y) {
-        const uint8_t* src = tx_buf + y * bytes_per_row;
-        for (int xb = 0; xb < bytes_per_row; ++xb) {
-            line[xb] = ssd2683_fast_bw::EncodeSemanticByte(src[xb]);
+        const uint8_t *old_row = fast_by_state_ + y * mask_row_bytes;
+        const uint8_t *new_row = new_mask + y * mask_row_bytes;
+        for (int xb = 0; xb < mask_row_bytes; ++xb) {
+            const uint8_t old_bits = old_row[xb];
+            const uint8_t new_bits = invert_new ? static_cast<uint8_t>(~new_row[xb])
+                                                : new_row[xb];
+            line[xb * 2] = ssd2683_fast_bw::EncodeTransitionByte(
+                old_bits & 0xF0, new_bits & 0xF0);
+            line[xb * 2 + 1] = ssd2683_fast_bw::EncodeTransitionByte(
+                static_cast<uint8_t>(old_bits << 4), static_cast<uint8_t>(new_bits << 4));
         }
-        writeBytes(line.data(), bytes_per_row);
-        // The payload is 30 KB at 40 MHz, about 6 ms of actual SPI time, so
-        // the reported 180 ms transfer was almost entirely this yield: 300
-        // rows yielding every 16 rows is 18 ticks, and a tick is 10 ms.
-        // Yielding every 100 rows keeps the task well inside the watchdog
-        // while cutting most of that cost.
+        writeBytes(line.data(), frame_row_bytes);
         if ((y % 100) == 99) {
             vTaskDelay(1);
         }
     }
 
-    const TickType_t waveform_started = xTaskGetTickCount();
-    ESP_LOGD(TAG,
-             "[ULTRA_BW] execute timing=%s PLL=0x%02X CDI=0x%02X transfer=%u ms",
-             kFastBwTimingName, kFastBwPll, kFastBwCdi,
-             static_cast<unsigned>((waveform_started - transfer_started) * portTICK_PERIOD_MS));
-    EPD_SendCommand(0x12);  // DRF: execute the selected fast OTP waveform
+    const uint16_t x1 = static_cast<uint16_t>(Width - 1);
+    const uint16_t y1 = static_cast<uint16_t>(Height - 1);
+    EPD_SendCommand(0x83);  // PTLW: full-screen window, as the vendor driver
     EPD_SendData(0x00);
+    EPD_SendData(0x00);
+    EPD_SendData(static_cast<uint8_t>(x1 >> 8));
+    EPD_SendData(static_cast<uint8_t>(x1 & 0xFF));
+    EPD_SendData(0x00);
+    EPD_SendData(0x00);
+    EPD_SendData(static_cast<uint8_t>(y1 >> 8));
+    EPD_SendData(static_cast<uint8_t>(y1 & 0xFF));
+    EPD_SendData(0x01);
 
-    bool truncated = false;
-    const uint32_t truncate_ms = CONFIG_ZECTRIX_EPD_FAST_BW_TRUNCATE_MS;
-    // The OTP waveform is a four-color one; its later phases exist to move the
-    // yellow and red pigment and contribute nothing to black-and-white
-    // content, which is already legible after the first drive. Cut the wait
-    // short and fall through to the normal power-off below.
-    //
-    // This deliberately breaks the waveform's DC balance, and accumulated DC
-    // bias is what causes permanent image sticking on e-paper. Two things
-    // bound it: the idle full-color recovery, and the consecutive-truncation
-    // cap that forces one complete waveform.
-    // Every TRUNCATE_MAX_STREAK-th refresh runs its waveform to completion,
-    // which is the only cleanup the ladder needs: an idle timer for this
-    // turned every isolated key press into a full waveform seconds later.
-    const bool forced_complete =
-        g_fast_bw_truncations_since_complete >=
-        CONFIG_ZECTRIX_EPD_FAST_BW_TRUNCATE_MAX_STREAK;
-    if (truncate_ms > 0 && !forced_complete) {
-        truncated = !read_busy_until(truncate_ms);
+    EPD_SendCommand(0x04);  // PON
+    vTaskDelay(pdMS_TO_TICKS(10));
+    if (!read_busy_until(kFastByControlBusyMs)) {
+        ESP_LOGE(TAG, "[FAST_BY] %s: power-on timed out", step);
+        EPD_AbortFastBy();
+        return false;
     }
-    if (!truncated) {
-        read_busy();
-        g_fast_bw_truncations_since_complete = 0;
-    } else {
-        g_fast_bw_truncations_since_complete++;
+
+    EPD_SendCommand(0x12);  // DRF
+    EPD_SendData(0x00);
+    const int64_t waveform_started = esp_timer_get_time();
+    // BUSY must assert before it can mean "done"; the vendor driver checks
+    // both edges. The waveform holds it low for ~1 s, so a tick poll cannot
+    // miss the assertion.
+    while (gpio_get_level(static_cast<gpio_num_t>(lcd_spi_data.busy)) != 0) {
+        if (esp_timer_get_time() - waveform_started > kFastByBusyAssertMs * 1000LL) {
+            ESP_LOGE(TAG, "[FAST_BY] %s: BUSY never asserted", step);
+            EPD_AbortFastBy();
+            return false;
+        }
+        vTaskDelay(1);
     }
-    const TickType_t waveform_finished = xTaskGetTickCount();
-    ESP_LOGD(TAG,
-             "[ULTRA_BW] waveform BUSY=%u ms cut_at=%u ms truncated=%d streak=%u "
-             "PSR1=0x%02X PLL=0x%02X TSSET=0x%02X",
-             static_cast<unsigned>((waveform_finished - waveform_started) * portTICK_PERIOD_MS),
-             static_cast<unsigned>(truncate_ms), truncated ? 1 : 0,
-             static_cast<unsigned>(g_fast_bw_truncations_since_complete),
-             kFastBwPsr1, kFastBwPll, kFastBwTsset);
-    if (truncated) {
-        // POF does not abort a running refresh: the controller finishes the
-        // waveform first and only then acts on it, which put the whole 10 s
-        // back into POF's own busy wait. Assert reset to stop the driver where
-        // it stands, then cut the panel supply. DSLP is skipped because it
-        // needs a controller that is still running a command queue; the next
-        // EPD_InitFastBw powers up and resets again anyway.
-        // Reset stays asserted while the supply is off so nothing is driven
-        // into an unpowered chip; both init paths begin by powering up and
-        // pulsing reset themselves.
-        set_rst_0();
-        vTaskDelay(pdMS_TO_TICKS(2));
-        EPD_PowerOff();
-        return;
+    if (!read_busy_until(kFastByWaveformLimitMs)) {
+        ESP_LOGE(TAG, "[FAST_BY] %s: waveform exceeded %u ms; RAM table not taken?",
+                 step, static_cast<unsigned>(kFastByWaveformLimitMs));
+        EPD_AbortFastBy();
+        return false;
+    }
+    const int64_t waveform_us = esp_timer_get_time() - waveform_started;
+    if (waveform_us >= kFastByExpectedWaveformUs) {
+        ESP_LOGW(TAG, "[FAST_BY] %s: waveform took %u ms, expected about 960",
+                 step, static_cast<unsigned>(waveform_us / 1000));
     }
 
     EPD_SendCommand(0x02);  // POF
     EPD_SendData(0x00);
-    read_busy();
     vTaskDelay(pdMS_TO_TICKS(20));
+    if (!read_busy_until(kFastByControlBusyMs)) {
+        ESP_LOGE(TAG, "[FAST_BY] %s: power-off timed out", step);
+        EPD_AbortFastBy();
+        return false;
+    }
     EPD_SendCommand(0x07);  // DSLP
     EPD_SendData(0xA5);
+    vTaskDelay(pdMS_TO_TICKS(20));
     EPD_PowerOff();
+
+    // The cache only moves on success: a failed waveform leaves the glass in
+    // an unknown state, which the caller turns into a full-colour refresh.
+    const size_t mask_bytes = static_cast<size_t>(mask_row_bytes) * Height;
+    if (invert_new) {
+        for (size_t i = 0; i < mask_bytes; ++i) {
+            fast_by_state_[i] = static_cast<uint8_t>(~new_mask[i]);
+        }
+    } else if (new_mask != fast_by_state_) {
+        memcpy(fast_by_state_, new_mask, mask_bytes);
+    }
+    fast_by_last_waveform_ms_ = static_cast<uint32_t>(waveform_us / 1000);
+    return true;
+#endif
+}
+
+bool CustomLcdDisplay::RunFastByRefresh(const char **plan_name, uint32_t *changed_pixels) {
+#if !CONFIG_ZECTRIX_EPD_FAST_BW
+    *plan_name = "disabled";
+    *changed_pixels = 0;
+    return false;
+#else
+    const size_t mask_bytes = static_cast<size_t>(Width) * Height / 8;
+    BuildFastByMask(tx_buf, fast_by_target_);
+    const bool cache_valid = fast_by_cache_valid_.load(std::memory_order_acquire);
+    if (!cache_valid) {
+        // The glass holds the last full-colour frame (prev_buffer is synced:
+        // an unsynced buffer never reaches this path). Its black/yellow
+        // reduction is only an assumption for white and red pixels, which is
+        // why an unknown state is always taken over with a pair: the pair
+        // drives every pixel once each way, whatever it really was.
+        BuildFastByMask(prev_buffer, fast_by_state_);
+    }
+    uint32_t changed = 0;
+    for (size_t i = 0; i < mask_bytes; ++i) {
+        changed += static_cast<uint32_t>(
+            __builtin_popcount(static_cast<unsigned>(fast_by_state_[i] ^ fast_by_target_[i])));
+    }
+    *changed_pixels = changed;
+    fast_by_last_waveform_ms_ = 0;
+
+    const auto plan = ssd2683_fast_bw::PlanFastByUpdate(
+        cache_valid, changed, static_cast<uint32_t>(Width) * Height,
+        CONFIG_ZECTRIX_EPD_FAST_BY_PAGE_CHANGE_PERCENT,
+        fast_by_singles_since_pair_, CONFIG_ZECTRIX_EPD_FAST_BY_CLEANUP_INTERVAL);
+    bool ok = true;
+    switch (plan) {
+        case ssd2683_fast_bw::FastByPlan::Skip:
+            *plan_name = "skip";
+            break;
+        case ssd2683_fast_bw::FastByPlan::Single:
+            *plan_name = "single";
+            ok = EPD_RunFastByWaveform(fast_by_target_, false, "single");
+            if (ok) {
+                fast_by_singles_since_pair_++;
+            }
+            break;
+        case ssd2683_fast_bw::FastByPlan::InverseRestore:
+            *plan_name = cache_valid ? "inverse_restore" : "takeover_pair";
+            ok = EPD_RunFastByWaveform(fast_by_state_, true, "inverse") &&
+                 EPD_RunFastByWaveform(fast_by_target_, false, "restore");
+            if (ok) {
+                fast_by_singles_since_pair_ = 0;
+            }
+            break;
+    }
+    fast_by_cache_valid_.store(ok, std::memory_order_release);
+    return ok;
 #endif
 }
 
@@ -1769,6 +1854,8 @@ bool CustomLcdDisplay::DisplayRaw4ColorImage(const uint8_t* data, size_t len, in
         xSemaphoreGive(dirty_mutex);
     }
 
+    // A full-colour image replaces whatever the black/yellow cache described.
+    fast_by_cache_valid_.store(false, std::memory_order_release);
     EPD_Init();
     EPD_SendCommand(0x10);   // DTM1 Write, raw SSD2683 2bpp stream
     read_busy();

@@ -1,5 +1,18 @@
 # SSD2683 FAST_BW research and implementation
 
+> **Superseded (2026-11-03).** The OTP fast-waveform path described below has
+> been replaced by the panel vendor's black/yellow RAM waveform
+> (`epaper_refresh_demo`): PSR `0x2F 0xA9` sets LUT_EN, command `0x20` uploads
+> a 535-byte table to controller RAM, and each pixel is sent as a differential
+> old->new black/yellow transition. That contradicts the conclusion below that
+> SSD2683 "has no register path for loading a waveform": `0x20` is simply not
+> in the public Rev 0.20 command table. Measured on this board, the RAM
+> waveform runs 949 ms. Implementation: `ssd2683_fast_bw.h` (mapping,
+> transition codes, single vs. inverse/restore planning) and
+> `CustomLcdDisplay::RunFastByRefresh()`. Truncation, TSSET and the PLL/CDI
+> timing profiles are gone. The rest of this file is kept as the record of
+> what the OTP path could and could not do.
+
 Date: 2026-08-12
 Target: ZecTrix Note4C, 400x300, SSD2683, BWRY (black/white/red/yellow)
 

@@ -73,8 +73,10 @@ public:
 
     // Immediate refresh without forcing a full e-paper update.
     void RequestUrgentRefresh() override;
-    // SSD2683 interaction path: use the OTP fast waveform with B/W-only data,
-    // then schedule a standard full-color recovery after the idle timeout.
+    // SSD2683 interaction path: draw a black/yellow reduction of the frame
+    // with the vendor RAM waveform, then schedule a standard full-color
+    // recovery after the idle timeout. (The name predates the black/yellow
+    // waveform; callers and intents keep it.)
     void RequestFastBwRefresh(
         ssd2683_fast_bw::RecoveryMode recovery_mode =
             ssd2683_fast_bw::RecoveryMode::Quality);
@@ -128,6 +130,15 @@ private:
     uint8_t *buffer      = nullptr;   // semantic 2bpp framebuffer
     uint8_t *prev_buffer = nullptr;   // last requested semantic frame
     uint8_t *tx_buf      = nullptr;   // snapshot buffer for async send (size = buffer_len)
+    // Black/yellow fast path, 1bpp, bit set = black. fast_by_state_ is what
+    // the glass holds when fast_by_cache_valid_ is set; the differential
+    // waveform is only correct against the real previous state.
+    uint8_t *fast_by_state_  = nullptr;
+    uint8_t *fast_by_target_ = nullptr;
+    std::atomic<bool> fast_by_cache_valid_{false};
+    uint32_t fast_by_singles_since_pair_ = 0;
+    int64_t fast_by_last_start_us_ = 0;
+    uint32_t fast_by_last_waveform_ms_ = 0;
 
     // LVGL (only compiled when HAVE_LVGL is defined)
 #ifdef HAVE_LVGL
@@ -165,8 +176,13 @@ private:
     void EPD_SetWindows(uint16_t Xstart, uint16_t Ystart, uint16_t Xend, uint16_t Yend);
     void EPD_SetCursor(uint16_t Xstart, uint16_t Ystart);
     void EPD_TurnOnDisplay();
-    void EPD_InitFastBw();
-    void EPD_DisplayFastBw();
+    // Black/yellow RAM-waveform fast path (vendor epaper_refresh_demo).
+    bool EPD_InitFastBy();
+    bool EPD_RunFastByWaveform(const uint8_t *new_mask, bool invert_new,
+                               const char *step);
+    void EPD_AbortFastBy();
+    bool RunFastByRefresh(const char **plan_name, uint32_t *changed_pixels);
+    void BuildFastByMask(const uint8_t *semantic, uint8_t *mask) const;
     void EPD_TurnOnDisplayPart();
     void EPD_SetFullWindowAndCounter(); // ***关键：恢复全屏窗口+计数器***
     bool IsFourColorPanel() const { return panel_type_ == EPD_PANEL_4COLOR_SSD2683; }

@@ -17,8 +17,9 @@ constexpr uint32_t RecoveryDelayMs(RecoveryMode mode,
 }
 
 // Recovery delays describe how long the completed FAST_BW result remains on
-// glass, not how long ago the request was queued. In particular, a periodic
-// complete B/W balance waveform can itself outlast the 10 s quality delay.
+// glass, not how long ago the request was queued. In particular, an
+// inverse/restore pair (two waveforms at least 4 s apart) takes a good part of
+// the 10 s quality delay by itself.
 constexpr uint32_t RecoveryDeadlineFromCompletion(uint32_t completed_tick,
                                                   RecoveryMode mode,
                                                   uint32_t quality_delay_ticks,
@@ -27,19 +28,81 @@ constexpr uint32_t RecoveryDeadlineFromCompletion(uint32_t completed_tick,
         mode, quality_delay_ticks, deferred_delay_ticks);
 }
 
-// RawDraw and SSD2683 both pack four 2-bit pixels MSB-first. RawDraw uses
-// 00=black, 01=white, 10=yellow, 11=red. FAST_BW keeps white and maps every
-// chromatic/non-white value to black.
-constexpr uint8_t EncodeSemanticByte(uint8_t packed) {
+// The fast path drives a black/yellow RAM waveform, so every semantic RawDraw
+// colour (00=black, 01=white, 10=yellow, 11=red) is reduced to one of those
+// two. Ink stays ink: black and red become black. Paper stays paper: white
+// and yellow become yellow. The theme's selection style (white on red) thus
+// reads as yellow on black, and its yellow cards keep their black text.
+constexpr bool SemanticIsFastBlack(uint8_t color) {
+    return color == 0x00 || color == 0x03;
+}
+
+// Four 2bpp semantic pixels -> the high nibble of a 1bpp "is black" mask
+// (bit set = black), MSB first like the framebuffer.
+constexpr uint8_t SemanticByteToBlackNibble(uint8_t packed) {
     uint8_t out = 0;
     for (int pixel = 0; pixel < 4; ++pixel) {
-        const uint8_t shift = static_cast<uint8_t>(6 - pixel * 2);
-        const uint8_t color = static_cast<uint8_t>((packed >> shift) & 0x03);
-        if (color == 0x01) {
-            out |= static_cast<uint8_t>(0x01U << shift);
+        const uint8_t color = static_cast<uint8_t>((packed >> (6 - pixel * 2)) & 0x03);
+        if (SemanticIsFastBlack(color)) {
+            out |= static_cast<uint8_t>(0x80U >> pixel);
         }
     }
     return out;
+}
+
+// The RAM waveform selects one of four transitions per pixel from the
+// previous and next physical state: bit 1 = previous was yellow, bit 0 = next
+// is yellow. Codes 0 (black->black) and 3 (yellow->yellow) are hold states;
+// only 1 and 2 drive the pixel. The previous state therefore has to be what
+// is really on the glass, which is why the driver tracks it explicitly.
+constexpr uint8_t TransitionCode(bool old_black, bool new_black) {
+    return static_cast<uint8_t>((old_black ? 0U : 2U) | (new_black ? 0U : 1U));
+}
+
+// Packs four transitions from the top nibbles of two black masks.
+constexpr uint8_t EncodeTransitionByte(uint8_t old_nibble, uint8_t new_nibble) {
+    uint8_t out = 0;
+    for (int pixel = 0; pixel < 4; ++pixel) {
+        const uint8_t bit = static_cast<uint8_t>(0x80U >> pixel);
+        out = static_cast<uint8_t>((out << 2) |
+                                   TransitionCode((old_nibble & bit) != 0,
+                                                  (new_nibble & bit) != 0));
+    }
+    return out;
+}
+
+enum class FastByPlan : uint8_t {
+    // Nothing changes in black/yellow terms: no waveform at all.
+    Skip,
+    // One differential waveform; unchanged pixels hold.
+    Single,
+    // Invert the current image, then draw the target from that state. Every
+    // pixel is driven once in each direction, so the pair is DC-balanced
+    // whatever was on the glass, and it is the only way to take over an image
+    // the differential cache does not describe (a full-colour frame).
+    InverseRestore,
+};
+
+constexpr FastByPlan PlanFastByUpdate(bool cache_valid,
+                                      uint32_t changed_pixels,
+                                      uint32_t total_pixels,
+                                      uint32_t page_change_percent,
+                                      uint32_t singles_since_pair,
+                                      uint32_t cleanup_interval) {
+    if (!cache_valid) {
+        return FastByPlan::InverseRestore;
+    }
+    if (changed_pixels == 0) {
+        return FastByPlan::Skip;
+    }
+    if (static_cast<uint64_t>(changed_pixels) * 100U >=
+        static_cast<uint64_t>(total_pixels) * page_change_percent) {
+        return FastByPlan::InverseRestore;
+    }
+    if (cleanup_interval > 0 && singles_since_pair >= cleanup_interval) {
+        return FastByPlan::InverseRestore;
+    }
+    return FastByPlan::Single;
 }
 
 // Wrap-safe for deadlines less than half the uint32_t tick range away.
@@ -59,11 +122,33 @@ constexpr bool FullColorHasWork(bool four_color_panel,
            framebuffer_changed || fast_bw_since_full;
 }
 
-static_assert(EncodeSemanticByte(0x00) == 0x00, "black must remain black");
-static_assert(EncodeSemanticByte(0x55) == 0x55, "white must remain white");
-static_assert(EncodeSemanticByte(0xAA) == 0x00, "yellow must map to black");
-static_assert(EncodeSemanticByte(0xFF) == 0x00, "red must map to black");
-static_assert(EncodeSemanticByte(0x6D) == 0x41, "mixed semantic pixels must map independently");
+static_assert(SemanticByteToBlackNibble(0x00) == 0xF0, "black must stay black");
+static_assert(SemanticByteToBlackNibble(0x55) == 0x00, "white must become yellow");
+static_assert(SemanticByteToBlackNibble(0xAA) == 0x00, "yellow must stay yellow");
+static_assert(SemanticByteToBlackNibble(0xFF) == 0xF0, "red must become black");
+static_assert(SemanticByteToBlackNibble(0x1B) == 0x90,
+              "black, white, yellow, red must map independently");
+static_assert(TransitionCode(true, true) == 0, "black hold");
+static_assert(TransitionCode(true, false) == 1, "black to yellow");
+static_assert(TransitionCode(false, true) == 2, "yellow to black");
+static_assert(TransitionCode(false, false) == 3, "yellow hold");
+static_assert(EncodeTransitionByte(0xF0, 0xF0) == 0x00, "all-black hold");
+static_assert(EncodeTransitionByte(0x00, 0x00) == 0xFF, "all-yellow hold");
+static_assert(EncodeTransitionByte(0x00, 0xF0) == 0xAA, "yellow to black everywhere");
+static_assert(EncodeTransitionByte(0xA0, 0x60) == 0x63,
+              "transitions must be packed MSB first per pixel");
+static_assert(PlanFastByUpdate(false, 0, 120000, 30, 0, 10) == FastByPlan::InverseRestore,
+              "an unknown glass state must be taken over with a pair");
+static_assert(PlanFastByUpdate(true, 0, 120000, 30, 0, 10) == FastByPlan::Skip,
+              "no black/yellow change must not run a waveform");
+static_assert(PlanFastByUpdate(true, 100, 120000, 30, 0, 10) == FastByPlan::Single,
+              "a small change is one differential waveform");
+static_assert(PlanFastByUpdate(true, 36000, 120000, 30, 0, 10) == FastByPlan::InverseRestore,
+              "a page change at the threshold uses a pair");
+static_assert(PlanFastByUpdate(true, 100, 120000, 30, 10, 10) == FastByPlan::InverseRestore,
+              "the cleanup interval forces a pair");
+static_assert(PlanFastByUpdate(true, 100, 120000, 30, 99, 0) == FastByPlan::Single,
+              "a cleanup interval of 0 disables the cleanup pair");
 static_assert(!DeadlineReached(99, 100), "deadline must not fire early");
 static_assert(DeadlineReached(100, 100), "deadline must fire on equality");
 static_assert(DeadlineReached(1, UINT32_MAX), "deadline comparison must handle tick wrap");
