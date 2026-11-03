@@ -829,8 +829,8 @@ void Application::Initialize(bool display_stall_recovery_boot,
                     : ssd2683_fast_bw::RecoveryMode::Quality;
             lcd->RequestFastBwRefresh(recovery_mode);
         } else {
-            // Background state changes have no interactive latency target.
-            // Render them correctly once instead of FAST_BW plus a recovery.
+            // Frames nobody is waiting on (slideshow, sleep, date rollover)
+            // and menu entry: render them correctly once.
             lcd->RequestUrgentFullRefresh();
         }
     }, defer_initial_refresh);
@@ -1302,7 +1302,7 @@ void Application::NoteButtonActivity() {
     // Fold a fresh battery/network sample into the button handler's one
     // already-planned render. This is opportunistic and never queues another
     // refresh of its own (fullscreen photos still have no such dependency).
-    UpdateStatusBarForUi(false, false);
+    UpdateStatusBarForUi(false);
     // The actual button handler renders the resulting UI state with its
     // explicit FAST_BW intent. Queueing an additional background redraw here
     // used to turn long presses into a same-content automatic refresh and,
@@ -1489,7 +1489,7 @@ void Application::ApplyPendingWifiDisableRequest() {
     DisableWifiAndPersist("remote request");
     // Monochrome status-bar/settings text only; never escalate a remote
     // request into a full-colour waveform.
-    UpdateStatusBarForUi(true, true);
+    UpdateStatusBarForUi();
 }
 
 void Application::EnsureNetworkInitialized() {
@@ -1571,7 +1571,7 @@ void Application::HandleNetworkEvent(NetworkEvent event, const std::string& data
                 ESP_LOGI(kTag, "WiFi connected while config page is visible, returning to gallery");
                 rawdraw_ui_manager_->SwitchPage(ui::RawDrawPageId::Gallery);
             }
-            UpdateStatusBarForUi(true, true);
+            UpdateStatusBarForUi();
             break;
         case NetworkEvent::Disconnected:
             ESP_LOGI(kTag, "WiFi disconnected");
@@ -1580,13 +1580,13 @@ void Application::HandleNetworkEvent(NetworkEvent event, const std::string& data
             if (rawdraw_ui_manager_ && rawdraw_ui_manager_->IsLanHttpServerRunning()) {
                 rawdraw_ui_manager_->StopLanHttpServer();
             }
-            UpdateStatusBarForUi(true, true);
+            UpdateStatusBarForUi();
             break;
         case NetworkEvent::Connecting:
         case NetworkEvent::Scanning:
             wifi_connected_.store(false, std::memory_order_release);
             if (!update_interactive_ui) break;
-            UpdateStatusBarForUi(false, false);
+            UpdateStatusBarForUi(false);
             if (rawdraw_ui_manager_) {
                 UpdateWifiSettingsItem(
                     rawdraw_ui_manager_->GetSettingsRenderer(),
@@ -1748,7 +1748,7 @@ void Application::EnterLowPowerSleep(const char* reason) {
     scheduled_network_jobs_pending_ = 0;
     network_sync_deadline_us_ = 0;
     wifi_connect_deadline_us_ = 0;
-    UpdateStatusBarForUi(false, false);
+    UpdateStatusBarForUi(false);
     // After the radio and the services are down, so the one frame drawn here
     // already carries the final status bar.
     if (quiet_recovery_) {
@@ -2082,7 +2082,7 @@ void Application::HandleSntpSynchronized() {
     } else if (!scheduler_timer_wake_ && sleep_phase_ == SleepPhase::Awake) {
         // Clock and status-bar text are monochrome. A successful sync must not
         // turn a background network event into an expensive color refresh.
-        UpdateStatusBarForUi(true, true);
+        UpdateStatusBarForUi();
     }
 }
 
@@ -2108,7 +2108,8 @@ void Application::Run() {
         if (requested_interval >= 0) {
             ApplySlideshowInterval(requested_interval);
             if (rawdraw_ui_manager_) {
-                rawdraw_ui_manager_->RequestActivePageRefresh();
+                rawdraw_ui_manager_->RequestActivePageRefresh(
+                    ui::RefreshIntent::FastBwDeferredInteraction);
             }
         }
         ApplyPendingWifiDisableRequest();
@@ -2369,12 +2370,7 @@ bool Application::CanEnterSleepMode() const {
            (lcd == nullptr || !lcd->IsRefreshPending());
 }
 
-void Application::UpdateStatusBarForUi() {
-    UpdateStatusBarForUi(true, false);
-}
-
-void Application::UpdateStatusBarForUi(bool request_refresh,
-                                       bool fast_refresh) {
+void Application::UpdateStatusBarForUi(bool request_refresh) {
     auto& board = Board::GetInstance();
     int battery_level = -1;
     bool charging = false;
@@ -2415,13 +2411,16 @@ void Application::UpdateStatusBarForUi(bool request_refresh,
         //     battery poll that landed on the same percentage).
         const auto visible_changes =
             rawdraw_ui_manager_->GetVisiblePersistentChanges();
+        // Status changes are information someone is waiting for (Wi-Fi
+        // connected, the config portal up), so they take the fast path like a
+        // key press, and the idle recovery draws them in full colour once
+        // things settle. Over a photo that is one waveform on the changed
+        // icon: the fast refresh holds every pixel that does not change.
         if (dirty && visible_changes != 0 && request_refresh &&
             !scheduler_timer_wake_ && sleep_phase_ == SleepPhase::Awake &&
             !InInputScope()) {
             rawdraw_ui_manager_->RequestActivePageRefresh(
-                fast_refresh
-                    ? ui::RefreshIntent::FastBwDeferredInteraction
-                    : ui::RefreshIntent::FullColor);
+                ui::RefreshIntent::FastBwDeferredInteraction);
         }
     }
     return;

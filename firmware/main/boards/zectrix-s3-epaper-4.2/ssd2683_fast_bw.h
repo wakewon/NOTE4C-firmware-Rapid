@@ -71,15 +71,44 @@ constexpr uint8_t EncodeTransitionByte(uint8_t old_nibble, uint8_t new_nibble) {
     return out;
 }
 
+// One pixel of a single differential update, planned from the exact colour on
+// the glass (any of the four, as left by a full-colour waveform) rather than
+// from its black/yellow reduction. A pixel whose colour does not change holds,
+// so a status-bar change over a photo leaves the photo's white and red exactly
+// as the full-colour waveform drew them. A pixel that already shows the fast
+// colour of the new value (yellow under a new white) also holds. Every other
+// pixel is driven by the transition into its target from the opposite state,
+// whatever it really was: from white or red that is the only way to make the
+// controller drive it at all.
+struct FastByPixelStep {
+    bool old_black;
+    bool new_black;
+    bool driven;
+    uint8_t glass_after;
+};
+
+constexpr FastByPixelStep PlanFastByPixel(uint8_t glass, uint8_t next) {
+    const bool target_black = SemanticIsFastBlack(next);
+    if (glass == next) {
+        return {target_black, target_black, false, glass};
+    }
+    const bool glass_black_or_yellow = glass == 0x00 || glass == 0x02;
+    if (glass_black_or_yellow && SemanticIsFastBlack(glass) == target_black) {
+        return {target_black, target_black, false, glass};
+    }
+    return {!target_black, target_black, true,
+            static_cast<uint8_t>(target_black ? 0x00 : 0x02)};
+}
+
 enum class FastByPlan : uint8_t {
     // Nothing changes in black/yellow terms: no waveform at all.
     Skip,
     // One differential waveform; unchanged pixels hold.
     Single,
     // Invert the current image, then draw the target from that state. Every
-    // pixel is driven once in each direction, so the pair is DC-balanced
-    // whatever was on the glass, and it is the only way to take over an image
-    // the differential cache does not describe (a full-colour frame).
+    // pixel is driven at least once, so the pair takes over glass whose state
+    // is unknown (boot, a failed waveform) and clears the ghosting a large
+    // page change or a long run of singles leaves.
     InverseRestore,
 };
 
@@ -137,6 +166,29 @@ static_assert(EncodeTransitionByte(0x00, 0x00) == 0xFF, "all-yellow hold");
 static_assert(EncodeTransitionByte(0x00, 0xF0) == 0xAA, "yellow to black everywhere");
 static_assert(EncodeTransitionByte(0xA0, 0x60) == 0x63,
               "transitions must be packed MSB first per pixel");
+static_assert(!PlanFastByPixel(0x01, 0x01).driven &&
+                  PlanFastByPixel(0x01, 0x01).glass_after == 0x01,
+              "unchanged white must hold and stay white");
+static_assert(!PlanFastByPixel(0x03, 0x03).driven &&
+                  PlanFastByPixel(0x03, 0x03).glass_after == 0x03,
+              "unchanged red must hold and stay red");
+static_assert(!PlanFastByPixel(0x02, 0x01).driven,
+              "fast yellow already shows a new white");
+static_assert(!PlanFastByPixel(0x00, 0x03).driven,
+              "fast black already shows a new red");
+static_assert(PlanFastByPixel(0x01, 0x00).driven &&
+                  !PlanFastByPixel(0x01, 0x00).old_black &&
+                  PlanFastByPixel(0x01, 0x00).new_black &&
+                  PlanFastByPixel(0x01, 0x00).glass_after == 0x00,
+              "white to black is a yellow-to-black drive");
+static_assert(PlanFastByPixel(0x03, 0x02).driven &&
+                  PlanFastByPixel(0x03, 0x02).old_black &&
+                  PlanFastByPixel(0x03, 0x02).glass_after == 0x02,
+              "red to yellow is a black-to-yellow drive");
+static_assert(PlanFastByPixel(0x03, 0x00).driven,
+              "red to black must be driven, or the red would stay");
+static_assert(PlanFastByPixel(0x01, 0x02).driven,
+              "white to yellow must be driven, or the white would stay");
 static_assert(PlanFastByUpdate(false, 0, 120000, 30, 0, 10) == FastByPlan::InverseRestore,
               "an unknown glass state must be taken over with a pair");
 static_assert(PlanFastByUpdate(true, 0, 120000, 30, 0, 10) == FastByPlan::Skip,

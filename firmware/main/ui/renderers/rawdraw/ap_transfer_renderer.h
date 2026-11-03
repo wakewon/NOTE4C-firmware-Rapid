@@ -72,6 +72,9 @@ private:
     mutable std::mutex state_mutex_;
     TransferState state_ = kWaitingForConnection;
     std::string status_message_;
+    // Photos saved since this transfer session opened; shown on the
+    // instructions page, which every upload returns to at once.
+    int received_count_ = 0;
     std::string title_text_ = "WiFi 传图";
     std::string ssid_text_ = "InkScreen-AP";
     std::string password_text_ = "12345678";

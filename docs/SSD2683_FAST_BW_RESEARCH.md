@@ -12,6 +12,15 @@
 > `CustomLcdDisplay::RunFastByRefresh()`. Truncation, TSSET and the PLL/CDI
 > timing profiles are gone. The rest of this file is kept as the record of
 > what the OTP path could and could not do.
+>
+> The driver plans each RAM-waveform update from the exact four-colour state
+> of the glass, adopted from every full-colour refresh: unchanged pixels hold,
+> so white and red survive small fast updates, and an inverse/restore pair is
+> only needed for unknown glass, large page changes and periodic cleanup. The
+> intent list below is also out of date: status changes now take the fast
+> path, and `FullColor` is kept for slideshow, sleep, date rollover, the
+> low-battery notice and menu entry from a display page. See `README.md` and
+> `CLAUDE.md`.
 
 Date: 2026-08-12
 Target: ZecTrix Note4C, 400x300, SSD2683, BWRY (black/white/red/yellow)

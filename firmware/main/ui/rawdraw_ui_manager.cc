@@ -307,8 +307,10 @@ RawDrawUiManager::RawDrawUiManager()
                 // AP/HTTP handlers run on their own task. Queue the actual EPD
                 // render for the main loop, and skip transient Receiving /
                 // Processing states so a fast upload does not leave the panel
-                // stuck showing an obsolete slow-refresh status.
-                RequestActivePageRefresh();
+                // stuck showing an obsolete status. Someone is watching this
+                // page for exactly these changes: fast path, full colour once
+                // it settles.
+                RequestActivePageRefresh(RefreshIntent::FastBwDeferredInteraction);
             }
         });
     ap_transfer_server_->SetImageReceivedCallback([this](const char* photo_id) {
@@ -435,12 +437,13 @@ void RawDrawUiManager::Init(CustomLcdDisplay* lcd, RefreshCallback refresh_cb,
 
         if (mutex) xSemaphoreGive(mutex);
 
-        // Establish a known full-color baseline at boot. Later page changes,
-        // cursor moves and button-driven updates go through the FAST_BW
-        // callback and arm the idle recovery timer.
-        RecordCurrentFrameAsDisplayed();
-        ESP_LOGI(kTag, "[FULL_COLOR] request source=boot_baseline");
-        lcd_->RequestUrgentFullRefresh();
+        // A cold boot or a restart: someone just switched the frame on and
+        // waits for a sign of life, and the Wi-Fi state changes a few seconds
+        // later. Take the unknown glass over with the fast pair (~6 s rather
+        // than 23 s), let the Wi-Fi update follow as one fast waveform, and
+        // leave full colour to the idle recovery.
+        ESP_LOGI(kTag, "[FAST_BY] request source=boot_baseline");
+        TriggerRefresh(RefreshIntent::FastBwDeferredInteraction);
     }
 
     ESP_LOGI(kTag, "RawDraw UI Manager initialized: %dx%d, page=%s",
@@ -499,13 +502,15 @@ void RawDrawUiManager::SwitchPage(RawDrawPageId page) {
     InitRenderer(page);
 
     // Entering a menu from a photo page is drawn with the full-colour
-    // waveform. The fast refresh can only take over a frame with white in it
-    // by driving every pixel, which leaves the whole menu in its paler fast
-    // yellow with a ghost of the photo; the vendor driver likewise starts its
-    // fast updates from a natively drawn yellow image. Once this frame is on
-    // glass (it holds no white), the driver keeps using it as the fast
-    // refresh's starting state, so navigation only redraws what changed.
-    const bool entering_menu = !IsInteractivePage(current_page_) && IsInteractivePage(page);
+    // waveform, a deliberate exception for the look of the menus: a fast
+    // takeover of a whole photo leaves the menu in the paler fast yellow with
+    // a ghost of the photo until the idle recovery. From the native frame the
+    // driver plans every fast update, so navigation only redraws what changed.
+    // AP transfer and the Wi-Fi portal are not menus: their status changes
+    // within seconds of opening, so they open with the fast takeover and the
+    // update follows as one fast waveform.
+    const bool entering_menu = !IsInteractivePage(current_page_) && IsInteractivePage(page) &&
+                               page != RawDrawPageId::APTransfer;
 
     // Switch current page
     SetCurrentPageId(page);
@@ -1741,15 +1746,17 @@ bool RawDrawUiManager::PrepareGalleryInteractiveWakeFrame(
     }
 
     // Apply the wake key to the state which was actually visible before
-    // sleeping, then issue one full-color baseline refresh for the final
-    // result. This avoids first drawing the default gallery and then making
-    // the wake key appear to merely repaint the same photo.
+    // sleeping, then draw the result once. This avoids first drawing the
+    // default gallery and then making the wake key appear to merely repaint
+    // the same photo. The press is answered with the fast takeover (the glass
+    // state did not survive deep sleep) rather than 23 s of full colour; the
+    // idle recovery repaints the photo properly 10 s later.
     const bool handled = photo_gallery_renderer_->HandleInput(wake_event);
     {
         std::lock_guard<std::mutex> lock(ui_state_mutex_);
         status_bar_data_.page_title = GetPageTitle(current_page_);
     }
-    RefreshActivePage(RefreshIntent::FullColor);
+    RefreshActivePage(RefreshIntent::FastBwQuality);
     NotifySlideshowDwellReset();
     ESP_LOGI(kTag,
              "Interactive wake frame: selected=%d retained_fullscreen=%d key=%d handled=%d",
@@ -1988,7 +1995,9 @@ void RawDrawUiManager::OnTransientRefreshTimer(void* arg) {
 
 void RawDrawUiManager::PumpClockRefresh() {
     bool gallery_page_changed = false;
-    RefreshIntent gallery_refresh_intent = RefreshIntent::FullColor;
+    // An upload or deletion over HTTP changes the visible gallery while
+    // someone is using the web page: show it now, recover the colours after.
+    RefreshIntent gallery_refresh_intent = RefreshIntent::FastBwQuality;
     if (gallery_storage_sync_pending_.exchange(false, std::memory_order_acq_rel)) {
         std::string preferred_id;
         std::string show_id;
@@ -2019,7 +2028,6 @@ void RawDrawUiManager::PumpClockRefresh() {
             if (photo_gallery_renderer_->SetSelectedById(show_id.c_str()) &&
                 photo_gallery_renderer_->EnterFullscreenMode()) {
                 gallery_page_changed = true;
-                gallery_refresh_intent = RefreshIntent::FastBwQuality;
                 ESP_LOGI(kTag, "Show photo fullscreen from HTTP: id=%s", show_id.c_str());
             } else {
                 ESP_LOGW(kTag, "Queued photo disappeared or became unreadable: id=%s",
@@ -2254,7 +2262,7 @@ void RawDrawUiManager::UpdateWifiStatus(const rawdraw::WifiStatus& status) {
 
                 if (mutex) xSemaphoreGive(mutex);
 
-                TriggerRefresh(RefreshIntent::FullColor);
+                TriggerRefresh(RefreshIntent::FastBwDeferredInteraction);
             }
         }
     }

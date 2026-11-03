@@ -130,9 +130,14 @@ private:
     uint8_t *buffer      = nullptr;   // semantic 2bpp framebuffer
     uint8_t *prev_buffer = nullptr;   // last requested semantic frame
     uint8_t *tx_buf      = nullptr;   // snapshot buffer for async send (size = buffer_len)
-    // Black/yellow fast path, 1bpp, bit set = black. fast_by_state_ is what
-    // the glass holds when fast_by_cache_valid_ is set; the differential
+    // Black/yellow fast path. fast_by_glass_ (semantic 2bpp) is the exact
+    // colour of every pixel on the glass when fast_by_cache_valid_ is set:
+    // the full-colour frame last drawn, with the pixels fast waveforms have
+    // driven since then replaced by black or yellow. The differential
     // waveform is only correct against the real previous state.
+    // fast_by_state_ / fast_by_target_ are the 1bpp (bit set = black) old and
+    // new labels sent for one waveform.
+    uint8_t *fast_by_glass_  = nullptr;
     uint8_t *fast_by_state_  = nullptr;
     uint8_t *fast_by_target_ = nullptr;
     std::atomic<bool> fast_by_cache_valid_{false};
@@ -178,13 +183,13 @@ private:
     void EPD_TurnOnDisplay();
     // Black/yellow RAM-waveform fast path (vendor epaper_refresh_demo).
     bool EPD_InitFastBy();
-    bool EPD_RunFastByWaveform(const uint8_t *new_mask, bool invert_new,
+    bool EPD_RunFastByWaveform(const uint8_t *old_mask, const uint8_t *new_mask,
                                const char *step);
     void EPD_AbortFastBy();
     bool RunFastByRefresh(const char **plan_name, uint32_t *changed_pixels);
     // After a full-colour waveform: make the frame the fast refresh's
-    // starting state when it holds no white. Returns whether it did.
-    bool AdoptFullColorFrameAsFastState();
+    // starting state, white and red included.
+    void AdoptFullColorFrameAsFastState();
     void BuildFastByMask(const uint8_t *semantic, uint8_t *mask) const;
     void EPD_TurnOnDisplayPart();
     void EPD_SetFullWindowAndCounter(); // ***关键：恢复全屏窗口+计数器***

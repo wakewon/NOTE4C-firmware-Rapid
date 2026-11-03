@@ -258,9 +258,10 @@ CustomLcdDisplay::CustomLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_p
 
     if (IsFourColorPanel()) {
         const size_t mask_bytes = static_cast<size_t>(width) * height / 8;
+        fast_by_glass_ = (uint8_t *)heap_caps_calloc(1, lcd_spi_data.buffer_len, MALLOC_CAP_SPIRAM);
         fast_by_state_ = (uint8_t *)heap_caps_calloc(1, mask_bytes, MALLOC_CAP_SPIRAM);
         fast_by_target_ = (uint8_t *)heap_caps_calloc(1, mask_bytes, MALLOC_CAP_SPIRAM);
-        assert(fast_by_state_ && fast_by_target_);
+        assert(fast_by_glass_ && fast_by_state_ && fast_by_target_);
     }
 
 #ifdef HAVE_LVGL
@@ -538,13 +539,10 @@ void CustomLcdDisplay::CompleteFullColorRefreshLocked() {
     // A standard waveform clears every kind of FAST_BW debt. Drop both an
     // armed deadline and a callback that became pending while the controller
     // was busy; a later queued FAST_BW request will establish a fresh one when
-    // it actually completes. The glass now holds white and red as well, so
-    // the black/yellow differential cache no longer describes it; the next
-    // fast update takes the frame over with an inverse/restore pair.
+    // it actually completes. The caller makes the new frame the fast
+    // refresh's starting state (AdoptFullColorFrameAsFastState()).
     idle_full_refresh_armed_ = false;
     idle_full_refresh_pending_ = false;
-    fast_by_cache_valid_.store(false, std::memory_order_release);
-    fast_by_singles_since_pair_ = 0;
 }
 
 void CustomLcdDisplay::RequestFastBwRefresh(
@@ -925,8 +923,12 @@ void CustomLcdDisplay::refresh_task_loop() {
         ESP_LOGI(TAG, "[STRATEGY] Diff analysis: bits=%u/%u (%.2f%%)",
                  (unsigned)result.diff_bits, (unsigned)total_bits, result.diff_ratio * 100.0f);
 
-        // Decide FULL vs PARTIAL
-        bool should_full = !prev_buffer_synced || !prev_buffer;
+        // Decide FULL vs PARTIAL. Unknown glass (the first frame of a boot)
+        // used to force full colour; an explicit fast request now takes it
+        // over with the fast pair instead -- a cold boot or a key that woke
+        // the frame is answered in ~6 s, and the idle recovery follows.
+        bool should_full = !prev_buffer ||
+                           (!prev_buffer_synced && !(IsFourColorPanel() && fast_bw));
         bool fast_bw_promoted = false;
         if (!should_full && (force_full || idle_full)) {
             should_full = true;
@@ -999,9 +1001,9 @@ void CustomLcdDisplay::refresh_task_loop() {
             xSemaphoreTake(dirty_mutex, portMAX_DELAY);
             CompleteFullColorRefreshLocked();
             xSemaphoreGive(dirty_mutex);
-            const bool adopted = AdoptFullColorFrameAsFastState();
-            ESP_LOGW(TAG, "[FULL_COLOR] complete in %u ms; fast cache %s", refresh_elapsed_ms(),
-                     adopted ? "adopted (no white)" : "invalid");
+            AdoptFullColorFrameAsFastState();
+            ESP_LOGW(TAG, "[FULL_COLOR] complete in %u ms; fast cache adopted",
+                     refresh_elapsed_ms());
         } else if (IsFourColorPanel() && fast_bw) {
             stat_fast_bw++;
             const char *plan = "none";
@@ -1504,11 +1506,11 @@ void CustomLcdDisplay::EPD_AbortFastBy() {
     EPD_PowerOff();
 }
 
-bool CustomLcdDisplay::EPD_RunFastByWaveform(const uint8_t *new_mask, bool invert_new,
+bool CustomLcdDisplay::EPD_RunFastByWaveform(const uint8_t *old_mask, const uint8_t *new_mask,
                                              const char *step) {
 #if !CONFIG_ZECTRIX_EPD_FAST_BW
+    (void)old_mask;
     (void)new_mask;
-    (void)invert_new;
     (void)step;
     return false;
 #else
@@ -1536,12 +1538,11 @@ bool CustomLcdDisplay::EPD_RunFastByWaveform(const uint8_t *new_mask, bool inver
     std::vector<uint8_t> line(frame_row_bytes);
     EPD_SendCommand(0x10);  // DTM: one transition code per pixel
     for (int y = 0; y < Height; ++y) {
-        const uint8_t *old_row = fast_by_state_ + y * mask_row_bytes;
+        const uint8_t *old_row = old_mask + y * mask_row_bytes;
         const uint8_t *new_row = new_mask + y * mask_row_bytes;
         for (int xb = 0; xb < mask_row_bytes; ++xb) {
             const uint8_t old_bits = old_row[xb];
-            const uint8_t new_bits = invert_new ? static_cast<uint8_t>(~new_row[xb])
-                                                : new_row[xb];
+            const uint8_t new_bits = new_row[xb];
             line[xb * 2] = ssd2683_fast_bw::EncodeTransitionByte(
                 old_bits & 0xF0, new_bits & 0xF0);
             line[xb * 2 + 1] = ssd2683_fast_bw::EncodeTransitionByte(
@@ -1613,45 +1614,22 @@ bool CustomLcdDisplay::EPD_RunFastByWaveform(const uint8_t *new_mask, bool inver
     vTaskDelay(pdMS_TO_TICKS(20));
     EPD_PowerOff();
 
-    // The cache only moves on success: a failed waveform leaves the glass in
-    // an unknown state, which the caller turns into a full-colour refresh.
-    const size_t mask_bytes = static_cast<size_t>(mask_row_bytes) * Height;
-    if (invert_new) {
-        for (size_t i = 0; i < mask_bytes; ++i) {
-            fast_by_state_[i] = static_cast<uint8_t>(~new_mask[i]);
-        }
-    } else if (new_mask != fast_by_state_) {
-        memcpy(fast_by_state_, new_mask, mask_bytes);
-    }
     fast_by_last_waveform_ms_ = static_cast<uint32_t>(waveform_us / 1000);
     return true;
 #endif
 }
 
-bool CustomLcdDisplay::AdoptFullColorFrameAsFastState() {
-#if !CONFIG_ZECTRIX_EPD_FAST_BW
-    return false;
-#else
-    if (!IsFourColorPanel()) return false;
-    // A full-colour frame with no white pixel is black, yellow and red only.
-    // Its black and yellow pixels are exactly the states the differential
-    // waveform expects, and they are the natively driven, deeper yellow, so
-    // keeping them (holding unchanged pixels) is better than any takeover.
-    // Red counts as black: it holds while it stays ink, and only the few red
-    // accents that turn to paper get a black->yellow drive from red. A frame
-    // with white cannot be described in black/yellow and stays invalid.
-    for (size_t i = 0; i < lcd_spi_data.buffer_len; ++i) {
-        const uint8_t b = tx_buf[i];
-        for (int shift = 0; shift < 8; shift += 2) {
-            if (((b >> shift) & 0x03) == 0x01) {
-                return false;
-            }
-        }
-    }
-    BuildFastByMask(tx_buf, fast_by_state_);
+void CustomLcdDisplay::AdoptFullColorFrameAsFastState() {
+#if CONFIG_ZECTRIX_EPD_FAST_BW
+    if (!IsFourColorPanel()) return;
+    // The glass now shows exactly this frame, in all four colours. The next
+    // fast update plans every pixel from it (PlanFastByPixel): what does not
+    // change holds -- natively drawn white, red and the deeper native yellow
+    // included -- so a small update after a full-colour refresh is one
+    // waveform over the changed pixels, never a takeover of the whole frame.
+    memcpy(fast_by_glass_, tx_buf, lcd_spi_data.buffer_len);
     fast_by_singles_since_pair_ = 0;
     fast_by_cache_valid_.store(true, std::memory_order_release);
-    return true;
 #endif
 }
 
@@ -1664,18 +1642,34 @@ bool CustomLcdDisplay::RunFastByRefresh(const char **plan_name, uint32_t *change
     const size_t mask_bytes = static_cast<size_t>(Width) * Height / 8;
     BuildFastByMask(tx_buf, fast_by_target_);
     const bool cache_valid = fast_by_cache_valid_.load(std::memory_order_acquire);
-    if (!cache_valid) {
-        // The glass holds the last full-colour frame (prev_buffer is synced:
-        // an unsynced buffer never reaches this path). Its black/yellow
-        // reduction is only an assumption for white and red pixels, which is
-        // why an unknown state is always taken over with a pair: the pair
-        // drives every pixel once each way, whatever it really was.
-        BuildFastByMask(prev_buffer, fast_by_state_);
-    }
     uint32_t changed = 0;
-    for (size_t i = 0; i < mask_bytes; ++i) {
-        changed += static_cast<uint32_t>(
-            __builtin_popcount(static_cast<unsigned>(fast_by_state_[i] ^ fast_by_target_[i])));
+    if (cache_valid) {
+        // Old labels for a single waveform, pixel by pixel from the exact
+        // glass colour. Eight pixels per mask byte, four per semantic byte.
+        for (size_t i = 0; i < mask_bytes; ++i) {
+            uint8_t old_bits = 0;
+            for (int half = 0; half < 2; ++half) {
+                const uint8_t glass = fast_by_glass_[i * 2 + half];
+                const uint8_t next = tx_buf[i * 2 + half];
+                for (int px = 0; px < 4; ++px) {
+                    const int shift = 6 - px * 2;
+                    const auto step = ssd2683_fast_bw::PlanFastByPixel(
+                        static_cast<uint8_t>((glass >> shift) & 0x03),
+                        static_cast<uint8_t>((next >> shift) & 0x03));
+                    if (step.old_black) {
+                        old_bits |= static_cast<uint8_t>(0x80U >> (half * 4 + px));
+                    }
+                    changed += step.driven ? 1U : 0U;
+                }
+            }
+            fast_by_state_[i] = old_bits;
+        }
+    } else {
+        // Unknown glass (boot, or a failed waveform): the pair below drives
+        // every pixel, so the labels only have to be a consistent guess. The
+        // last requested frame is the best one there is.
+        BuildFastByMask(prev_buffer, fast_by_state_);
+        changed = static_cast<uint32_t>(Width) * Height;
     }
     *changed_pixels = changed;
     fast_by_last_waveform_ms_ = 0;
@@ -1684,26 +1678,72 @@ bool CustomLcdDisplay::RunFastByRefresh(const char **plan_name, uint32_t *change
         cache_valid, changed, static_cast<uint32_t>(Width) * Height,
         CONFIG_ZECTRIX_EPD_FAST_BY_PAGE_CHANGE_PERCENT,
         fast_by_singles_since_pair_, CONFIG_ZECTRIX_EPD_FAST_BY_CLEANUP_INTERVAL);
+    if (plan == ssd2683_fast_bw::FastByPlan::InverseRestore && cache_valid) {
+        // A pair starts from the black/yellow reduction of the glass, like
+        // the vendor driver's.
+        BuildFastByMask(fast_by_glass_, fast_by_state_);
+    }
     bool ok = true;
+    bool glass_is_target = false;
     switch (plan) {
         case ssd2683_fast_bw::FastByPlan::Skip:
             *plan_name = "skip";
             break;
         case ssd2683_fast_bw::FastByPlan::Single:
             *plan_name = "single";
-            ok = EPD_RunFastByWaveform(fast_by_target_, false, "single");
+            ok = EPD_RunFastByWaveform(fast_by_state_, fast_by_target_, "single");
             if (ok) {
                 fast_by_singles_since_pair_++;
+                // Driven pixels now show their fast colour; held ones keep
+                // whatever they had.
+                for (size_t i = 0; i < lcd_spi_data.buffer_len; ++i) {
+                    const uint8_t glass = fast_by_glass_[i];
+                    const uint8_t next = tx_buf[i];
+                    uint8_t after = 0;
+                    for (int px = 0; px < 4; ++px) {
+                        const int shift = 6 - px * 2;
+                        after |= static_cast<uint8_t>(
+                            ssd2683_fast_bw::PlanFastByPixel(
+                                static_cast<uint8_t>((glass >> shift) & 0x03),
+                                static_cast<uint8_t>((next >> shift) & 0x03))
+                                .glass_after << shift);
+                    }
+                    fast_by_glass_[i] = after;
+                }
             }
             break;
         case ssd2683_fast_bw::FastByPlan::InverseRestore:
             *plan_name = cache_valid ? "inverse_restore" : "takeover_pair";
-            ok = EPD_RunFastByWaveform(fast_by_state_, true, "inverse") &&
-                 EPD_RunFastByWaveform(fast_by_target_, false, "restore");
+            // fast_by_target_ is reused as the inverted frame, then rebuilt.
+            for (size_t i = 0; i < mask_bytes; ++i) {
+                fast_by_target_[i] = static_cast<uint8_t>(~fast_by_target_[i]);
+            }
+            ok = EPD_RunFastByWaveform(fast_by_state_, fast_by_target_, "inverse");
+            if (ok) {
+                memcpy(fast_by_state_, fast_by_target_, mask_bytes);
+                BuildFastByMask(tx_buf, fast_by_target_);
+                ok = EPD_RunFastByWaveform(fast_by_state_, fast_by_target_, "restore");
+            }
             if (ok) {
                 fast_by_singles_since_pair_ = 0;
+                glass_is_target = true;
             }
             break;
+    }
+    if (glass_is_target) {
+        // Every pixel has been driven: the glass is the black/yellow
+        // reduction of the frame.
+        for (size_t i = 0; i < mask_bytes; ++i) {
+            const uint8_t mask = fast_by_target_[i];
+            for (int half = 0; half < 2; ++half) {
+                uint8_t packed = 0;
+                for (int px = 0; px < 4; ++px) {
+                    const bool black = (mask & (0x80U >> (half * 4 + px))) != 0;
+                    packed |= static_cast<uint8_t>((black ? 0x00 : 0x02) << (6 - px * 2));
+                }
+                fast_by_glass_[i * 2 + half] = packed;
+            }
+        }
     }
     fast_by_cache_valid_.store(ok, std::memory_order_release);
     return ok;

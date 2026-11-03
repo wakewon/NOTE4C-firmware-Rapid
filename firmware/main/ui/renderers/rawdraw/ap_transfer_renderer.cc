@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <string>
 
 extern const lv_font_t SourceHanSansSC_Regular_slim;
 extern const lv_font_t SourceHanSansSC_Medium_slim;
@@ -144,11 +145,19 @@ void ApTransferRenderer::RenderInstructions(uint8_t* fb, int width, int height) 
     const std::string url = url_text_.empty() ? ("http://" + ip) : url_text_;
     ESP_LOGI(kTag, "RenderInstructions ip=%s state=%d message='%s'",
              ip.c_str(), static_cast<int>(state_), status_message_.c_str());
-    const std::string state_hint = !hint_text_.empty()
-        ? hint_text_
-        : (status_message_.empty() || LooksLikeIpv4(status_message_)
-        ? "启动中，可先连接热点"
-        : status_message_);
+    // The server reports its address once the hotspot and HTTP server are
+    // up; until then the page says it is still starting. Every upload ends
+    // back here at once, so the count is the on-device receipt for it.
+    std::string state_hint;
+    if (!hint_text_.empty()) {
+        state_hint = hint_text_;
+    } else if (!LooksLikeIpv4(status_message_)) {
+        state_hint = status_message_.empty() ? "启动中，可先连接热点" : status_message_;
+    } else if (received_count_ > 0) {
+        state_hint = "已接收 " + std::to_string(received_count_) + " 张，可继续上传";
+    } else {
+        state_hint = "热点已开启，等待连接";
+    }
     const std::string ssid = ssid_text_.empty() ? std::string("InkScreen-AP") : ssid_text_;
     const std::string password = password_text_.empty() ? std::string("无") : password_text_;
 
@@ -270,12 +279,22 @@ bool ApTransferRenderer::HandleInput(const ButtonEvent& event) {
 
 void ApTransferRenderer::SetState(TransferState state, const std::string& message) {
     std::lock_guard<std::mutex> lock(state_mutex_);
+    if (state == kComplete) {
+        ++received_count_;
+    }
     state_ = state;
     status_message_ = message;
     ESP_LOGI(kTag, "SetState: %d, message='%s'", state, message.c_str());
 }
 
 void ApTransferRenderer::UseDefaultTransferInstructions() {
+    {
+        // A new session: "starting" until the server reports its address.
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        state_ = kWaitingForConnection;
+        status_message_.clear();
+        received_count_ = 0;
+    }
     SetInstructionContent("WiFi 传图",
                           "InkScreen-AP",
                           "12345678",

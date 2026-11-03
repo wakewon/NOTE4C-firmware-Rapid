@@ -55,7 +55,10 @@ public:
         return input_ready_.load(std::memory_order_acquire);
     }
 
-    void UpdateStatusBarForUi();
+    // Pushes battery/network state into the status bar and the settings
+    // items, and -- with request_refresh, outside a button handler, when
+    // something visible changed -- refreshes the page with the fast path.
+    void UpdateStatusBarForUi(bool request_refresh = true);
     void OnSntpSynchronized();
 
     // Cross-task request surface. Every one of these may be called from an
@@ -211,7 +214,6 @@ private:
     void DrainScheduledCallbacks();
     void HandleNetworkEvent(NetworkEvent event, const std::string& data);
     void HandleSntpSynchronized();
-    void UpdateStatusBarForUi(bool request_refresh, bool fast_refresh);
 
     // Held for the duration of a button handler. Every path reachable from one
     // ends by rendering the resulting state and refreshing it with the menu's
